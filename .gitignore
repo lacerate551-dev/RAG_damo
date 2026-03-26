@@ -1,0 +1,38 @@
+# 敏感配置文件
+config.py
+
+# 向量模型（需单独下载）
+bge-base-zh-v1.5/
+
+# 向量数据库
+chroma_db/
+
+# Python虚拟环境
+venv/
+.env/
+
+# Python缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE配置
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+
+# Claude Code计划文件
+.claude/
