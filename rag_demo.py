@@ -1,16 +1,22 @@
 """
 RAG Demo - 基于本地向量模型 + Chroma + Qwen API 的简单知识库问答系统
 支持格式: PDF, Word(.docx/.doc), Excel(.xlsx), TXT
+混合检索: 向量检索 + BM25关键词检索 + Rerank重排序
 """
 
 import os
-from sentence_transformers import SentenceTransformer
+import json
+import pickle
+from sentence_transformers import SentenceTransformer, CrossEncoder
 import chromadb
 from openai import OpenAI
 import pdfplumber
 from docx import Document
 from openpyxl import load_workbook
 import docx2txt
+import numpy as np
+from rank_bm25 import BM25Okapi
+import jieba
 
 # 导入配置
 try:
@@ -25,17 +31,109 @@ EMBEDDING_MODEL_PATH = "./bge-base-zh-v1.5"
 CHROMA_DB_PATH = "./chroma_db"
 DOCUMENTS_PATH = "./documents"
 
+# 混合检索配置 (P4优化)
+USE_HYBRID_SEARCH = True  # 是否启用混合检索
+BM25_INDEX_PATH = "./bm25_index.pkl"  # BM25索引存储路径
+VECTOR_WEIGHT = 0.5  # 向量检索权重
+BM25_WEIGHT = 0.5  # BM25检索权重
+
+# Rerank配置 (P3优化)
+USE_RERANK = True  # 是否启用重排序
+RERANK_MODEL_NAME = "BAAI/bge-reranker-base"  # 重排序模型
+RERANK_CANDIDATES = 20  # 重排序前的候选数量（混合检索后）
+RERANK_TOP_K = 5  # 重排序后返回的数量
+
+
+# ========== BM25索引管理器 ==========
+class BM25Index:
+    """BM25索引管理器，用于关键词检索"""
+
+    def __init__(self):
+        self.bm25 = None
+        self.documents = []  # 原始文档
+        self.metadatas = []  # 元数据
+        self.ids = []  # 文档ID
+
+    def tokenize(self, text):
+        """中文分词"""
+        return list(jieba.cut(text))
+
+    def add_documents(self, ids, documents, metadatas):
+        """添加文档到索引"""
+        self.ids = ids
+        self.documents = documents
+        self.metadatas = metadatas
+
+        # 分词并构建BM25索引
+        tokenized_docs = [self.tokenize(doc) for doc in documents]
+        self.bm25 = BM25Okapi(tokenized_docs)
+
+    def search(self, query, top_k=10):
+        """BM25检索"""
+        if not self.bm25:
+            return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+
+        tokenized_query = self.tokenize(query)
+        scores = self.bm25.get_scores(tokenized_query)
+
+        # 获取top_k个结果
+        top_indices = np.argsort(scores)[::-1][:top_k]
+
+        return {
+            'ids': [[self.ids[i] for i in top_indices]],
+            'documents': [[self.documents[i] for i in top_indices]],
+            'metadatas': [[self.metadatas[i] for i in top_indices]],
+            'distances': [[float(scores[i]) for i in top_indices]]
+        }
+
+    def save(self, path):
+        """保存索引到文件"""
+        data = {
+            'ids': self.ids,
+            'documents': self.documents,
+            'metadatas': self.metadatas
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(data, f)
+        print(f"      BM25索引已保存: {path}")
+
+    def load(self, path):
+        """从文件加载索引"""
+        if not os.path.exists(path):
+            return False
+
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+
+        self.ids = data['ids']
+        self.documents = data['documents']
+        self.metadatas = data['metadatas']
+
+        # 重建BM25索引
+        tokenized_docs = [self.tokenize(doc) for doc in self.documents]
+        self.bm25 = BM25Okapi(tokenized_docs)
+
+        print(f"      BM25索引已加载: {len(self.documents)} 个文档")
+        return True
+
+    def clear(self):
+        """清空索引"""
+        self.bm25 = None
+        self.documents = []
+        self.metadatas = []
+        self.ids = []
+
 
 # ========== 初始化组件 ==========
 print("=" * 50)
-print("RAG Demo 知识库问答系统")
+print("RAG Demo 知识库问答系统 (混合检索版)")
 print("=" * 50)
 
-print("\n[1/3] 加载本地向量模型...")
+print("\n[1/5] 加载本地向量模型...")
 embedding_model = SentenceTransformer(EMBEDDING_MODEL_PATH)
 print(f"      模型加载完成: {EMBEDDING_MODEL_PATH}")
 
-print("\n[2/3] 初始化向量数据库...")
+print("\n[2/5] 初始化向量数据库...")
 chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
 collection = chroma_client.get_or_create_collection(
     name="knowledge_base",
@@ -43,13 +141,34 @@ collection = chroma_client.get_or_create_collection(
 )
 print(f"      数据库路径: {CHROMA_DB_PATH}")
 
-print("\n[3/3] 初始化大模型客户端...")
+print("\n[3/5] 初始化BM25索引...")
+bm25_index = BM25Index()
+if USE_HYBRID_SEARCH:
+    bm25_index.load(BM25_INDEX_PATH)
+else:
+    print("      混合检索已禁用，跳过BM25索引加载")
+
+print("\n[4/5] 初始化大模型客户端...")
 llm_client = OpenAI(
     api_key=API_KEY,
     base_url=BASE_URL
 )
 print(f"      API地址: {BASE_URL}")
 print(f"      模型: {MODEL}")
+
+# 初始化Reranker模型 (P3优化)
+reranker = None
+if USE_RERANK:
+    print("\n[5/5] 加载重排序模型...")
+    try:
+        reranker = CrossEncoder(RERANK_MODEL_NAME)
+        print(f"      Rerank模型加载完成: {RERANK_MODEL_NAME}")
+    except Exception as e:
+        print(f"      Rerank模型加载失败: {e}")
+        print("      将使用纯向量检索模式")
+        USE_RERANK = False
+else:
+    print("\n[5/5] 跳过重排序模型加载 (已禁用)")
 
 
 # ========== 文件管理函数 ==========
@@ -375,31 +494,138 @@ def extract_text_from_docx(filepath):
 
 
 def extract_text_from_xlsx(filepath):
-    """从Excel提取文本，返回带行列信息的内容块列表"""
+    """
+    从Excel提取文本，智能分块存储
+
+    改进：将Excel中的数据块（由标题行+数据行组成）作为整体存储
+    而非逐行存储，提高检索效果
+    """
     content_blocks = []
     try:
         wb = load_workbook(filepath, data_only=True)
         for sheet_name in wb.sheetnames:
             sheet = wb[sheet_name]
 
-            # 获取表头（第一行）
-            header_row = None
-            first_row = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
-            if first_row:
-                header_row = " | ".join(str(cell) if cell is not None else "" for cell in first_row)
-
-            # 遍历所有行，记录行号
+            # 读取所有行
+            all_rows = []
             for row_idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-                row_text = " | ".join(str(cell) if cell is not None else "" for cell in row)
+                cells = [str(cell) if cell is not None else "" for cell in row]
+                first_col = cells[0].strip() if cells else ""
+                second_col = cells[1].strip() if len(cells) > 1 else ""
+                row_text = " | ".join(cells)
+
                 if row_text.strip(" |"):
-                    is_header = (row_idx == 1)
-                    content_blocks.append({
-                        'text': row_text,
-                        'sheet': sheet_name,
+                    all_rows.append({
                         'row': row_idx,
-                        'is_header': is_header,
-                        'header': header_row if not is_header else None
+                        'text': row_text,
+                        'cells': cells,
+                        'first_col': first_col,
+                        'second_col': second_col
                     })
+
+            if not all_rows:
+                continue
+
+            # 识别数据块：基于实际Excel结构
+            # 规则：如果第一列有值且第二列为空，则是新的分类块开始
+            blocks = []
+            current_block = None
+            header_row = None
+
+            for row_info in all_rows:
+                first_col = row_info['first_col']
+                second_col = row_info['second_col']
+                row_text = row_info['text']
+
+                # 判断是否为新块的开始
+                # 新块特征：第一列有实质内容，且(第二列为空 OR 是前两行)
+                is_new_block_start = (
+                    first_col and
+                    len(first_col) > 1 and
+                    (not second_col or row_info['row'] <= 2)
+                )
+
+                # 如果检测到新块开始，保存当前块并开始新块
+                if is_new_block_start:
+                    if current_block and current_block['rows']:
+                        blocks.append(current_block)
+                    current_block = {
+                        'title': first_col,
+                        'start_row': row_info['row'],
+                        'rows': [row_info]
+                    }
+                elif current_block:
+                    # 添加到当前块
+                    current_block['rows'].append(row_info)
+                    current_block['end_row'] = row_info['row']
+                else:
+                    # 还没有块，创建一个默认块
+                    current_block = {
+                        'title': sheet_name,
+                        'start_row': row_info['row'],
+                        'rows': [row_info]
+                    }
+
+            # 保存最后一个块
+            if current_block and current_block['rows']:
+                blocks.append(current_block)
+
+            # 如果没有识别出块，按简单方式处理（每行一个块）
+            if not blocks:
+                for row_info in all_rows:
+                    content_blocks.append({
+                        'text': row_info['text'],
+                        'sheet': sheet_name,
+                        'row': row_info['row'],
+                        'row_range': str(row_info['row']),
+                        'is_header': row_info['row'] == 1,
+                        'block_title': '',
+                        'is_block': False
+                    })
+            else:
+                # 将每个块转换为存储单元
+                for block in blocks:
+                    title = block['title']
+                    start_row = block['start_row']
+                    rows = block['rows']
+                    end_row = block.get('end_row', start_row)
+
+                    if len(rows) == 1:
+                        # 单行块
+                        content_blocks.append({
+                            'text': rows[0]['text'],
+                            'sheet': sheet_name,
+                            'row': start_row,
+                            'row_range': str(start_row),
+                            'is_header': start_row <= 2,
+                            'block_title': title,
+                            'is_block': False
+                        })
+                    else:
+                        # 多行块，组合存储
+                        # 格式：【分类名称】\n编码1 | 说明1\n编码2 | 说明2...
+                        rows_text = []
+                        for r in rows:
+                            # 跳过块标题行本身（已在标题中显示）
+                            if r['first_col'] == title and not r['second_col']:
+                                continue
+                            rows_text.append(r['text'])
+
+                        if rows_text:
+                            combined_text = f"【{title}】\n" + "\n".join(rows_text[:100])
+                            if len(rows_text) > 100:
+                                combined_text += f"\n... (共{len(rows_text)}条)"
+
+                            content_blocks.append({
+                                'text': combined_text,
+                                'sheet': sheet_name,
+                                'row': start_row,
+                                'row_range': f"{start_row}-{end_row}",
+                                'is_header': start_row <= 2,
+                                'block_title': title,
+                                'is_block': True
+                            })
+
     except Exception as e:
         print(f"      Excel解析错误 {filepath}: {e}")
     return content_blocks
@@ -468,15 +694,15 @@ def load_documents():
                     print(f"      加载文档: {rel_path} (Word, {len(blocks)}段落, {tables_count}表格)")
             elif ext == '.xlsx':
                 # Excel返回带行列信息的内容块列表
-                rows = extract_text_from_xlsx(filepath)
-                if rows:
+                blocks = extract_text_from_xlsx(filepath)
+                if blocks:
                     documents.append({
                         'filename': rel_path,
                         'type': 'xlsx',
-                        'rows': rows
+                        'rows': blocks  # 兼容原结构
                     })
-                    sheets = set(r['sheet'] for r in rows)
-                    print(f"      加载文档: {rel_path} (Excel, {len(sheets)}工作表, {len(rows)}行)")
+                    multi_block_count = sum(1 for b in blocks if b.get('is_block'))
+                    print(f"      加载文档: {rel_path} (Excel, {len(blocks)}个数据块, {multi_block_count}个多行块)")
             elif ext == '.txt':
                 content = extract_text_from_txt(filepath)
                 if content.strip():
@@ -520,7 +746,7 @@ def split_text(text, chunk_size=300, overlap=50):
 
 
 def build_knowledge_base(force=False):
-    """构建知识库"""
+    """构建知识库（向量索引 + BM25索引）"""
     print("\n" + "=" * 50)
     print("构建知识库")
     print("=" * 50)
@@ -537,6 +763,8 @@ def build_knowledge_base(force=False):
         if ids:
             collection.delete(ids=ids)
             print("已清空原有数据")
+        # 清空BM25索引
+        bm25_index.clear()
 
     # 加载文档
     print("\n加载文档...")
@@ -549,6 +777,11 @@ def build_knowledge_base(force=False):
     # 切分并向量化
     print("\n处理文档...")
     total_chunks = 0
+
+    # 收集所有文档用于BM25索引
+    all_ids = []
+    all_docs = []
+    all_metas = []
 
     for doc in documents:
         # PDF特殊处理，按页切分
@@ -567,18 +800,26 @@ def build_knowledge_base(force=False):
                     vector = embedding_model.encode(chunk).tolist()
                     chunk_id = f"{doc['filename']}_p{page_num}_{i}"
 
+                    meta = {
+                        'source': doc['filename'],
+                        'page': page_num,
+                        'chunk_index': i,
+                        'has_table': has_table,
+                        'section': section
+                    }
+
                     collection.add(
                         ids=[chunk_id],
                         embeddings=[vector],
                         documents=[chunk],
-                        metadatas=[{
-                            'source': doc['filename'],
-                            'page': page_num,
-                            'chunk_index': i,
-                            'has_table': has_table,
-                            'section': section
-                        }]
+                        metadatas=[meta]
                     )
+
+                    # 收集用于BM25
+                    all_ids.append(chunk_id)
+                    all_docs.append(chunk)
+                    all_metas.append(meta)
+
                     total_chunks += 1
             print(f"  {doc['filename']}: {doc_chunks} 个片段")
 
@@ -599,63 +840,77 @@ def build_knowledge_base(force=False):
                 else:
                     chunks = split_text(text)
 
-                doc_chunks += len(chunks)
-
                 for i, chunk in enumerate(chunks):
                     vector = embedding_model.encode(chunk).tolist()
                     chunk_id = f"{doc['filename']}_{doc_chunks}_{i}"
 
+                    meta = {
+                        'source': doc['filename'],
+                        'chunk_index': doc_chunks,
+                        'is_table': is_table,
+                        'section': section
+                    }
+
                     collection.add(
                         ids=[chunk_id],
                         embeddings=[vector],
                         documents=[chunk],
-                        metadatas=[{
-                            'source': doc['filename'],
-                            'chunk_index': doc_chunks,
-                            'is_table': is_table,
-                            'section': section
-                        }]
+                        metadatas=[meta]
                     )
+
+                    # 收集用于BM25
+                    all_ids.append(chunk_id)
+                    all_docs.append(chunk)
+                    all_metas.append(meta)
+
                     total_chunks += 1
+                    doc_chunks += 1
             print(f"  {doc['filename']}: {doc_chunks} 个片段")
 
-        # Excel处理，按行处理
+        # Excel处理，按块处理（P1优化：智能分块）
         elif doc['type'] == 'xlsx':
             doc_chunks = 0
-            for row_info in doc['rows']:
-                text = row_info['text']
-                if len(text.strip()) < 5:  # 跳过空行
+            for block_info in doc['rows']:
+                text = block_info['text']
+                if len(text.strip()) < 5:  # 跳过空内容
                     continue
 
-                sheet = row_info['sheet']
-                row_num = row_info['row']
-                is_header = row_info.get('is_header', False)
-                header = row_info.get('header', '')
+                sheet = block_info['sheet']
+                row_num = block_info['row']
+                row_range = block_info.get('row_range', str(row_num))
+                block_title = block_info.get('block_title', '')
+                is_block = block_info.get('is_block', False)
 
-                # 如果不是表头行，添加表头信息作为上下文
-                full_text = text
-                if header and not is_header:
-                    full_text = f"【表头: {header}】\n{text}"
+                # 直接使用组合后的文本
+                vector = embedding_model.encode(text).tolist()
 
-                chunks = [full_text]  # 每行作为一个单元
-                doc_chunks += len(chunks)
+                # 使用行范围作为ID的一部分
+                chunk_id = f"{doc['filename']}_{sheet}_{row_range}"
 
-                for i, chunk in enumerate(chunks):
-                    vector = embedding_model.encode(chunk).tolist()
-                    chunk_id = f"{doc['filename']}_{sheet}_{row_num}"
+                meta = {
+                    'source': doc['filename'],
+                    'sheet': sheet,
+                    'row': row_num,
+                    'row_range': row_range,
+                    'block_title': block_title,
+                    'is_block': is_block,
+                    'is_excel': True
+                }
 
-                    collection.add(
-                        ids=[chunk_id],
-                        embeddings=[vector],
-                        documents=[chunk],
-                        metadatas=[{
-                            'source': doc['filename'],
-                            'sheet': sheet,
-                            'row': row_num,
-                            'is_header': is_header
-                        }]
-                    )
-                    total_chunks += 1
+                collection.add(
+                    ids=[chunk_id],
+                    embeddings=[vector],
+                    documents=[text],
+                    metadatas=[meta]
+                )
+
+                # 收集用于BM25
+                all_ids.append(chunk_id)
+                all_docs.append(text)
+                all_metas.append(meta)
+
+                doc_chunks += 1
+                total_chunks += 1
             print(f"  {doc['filename']}: {doc_chunks} 个片段")
 
         # 其他文档类型处理（TXT等）
@@ -667,58 +922,308 @@ def build_knowledge_base(force=False):
                 vector = embedding_model.encode(chunk).tolist()
                 chunk_id = f"{doc['filename']}_{i}"
 
+                meta = {
+                    'source': doc['filename'],
+                    'chunk_index': i
+                }
+
                 collection.add(
                     ids=[chunk_id],
                     embeddings=[vector],
                     documents=[chunk],
-                    metadatas=[{
-                        'source': doc['filename'],
-                        'chunk_index': i
-                    }]
+                    metadatas=[meta]
                 )
+
+                # 收集用于BM25
+                all_ids.append(chunk_id)
+                all_docs.append(chunk)
+                all_metas.append(meta)
+
                 total_chunks += 1
+
+    # 构建BM25索引 (P4优化)
+    if USE_HYBRID_SEARCH and all_docs:
+        print("\n构建BM25索引...")
+        bm25_index.add_documents(all_ids, all_docs, all_metas)
+        bm25_index.save(BM25_INDEX_PATH)
+        print(f"      BM25索引构建完成: {len(all_docs)} 个文档")
 
     print(f"\n知识库构建完成，共 {total_chunks} 个片段")
 
 
 # ========== 检索函数 ==========
-def search_knowledge(query, top_k=3):
-    """检索相关知识片段"""
-    # 问题转向量
+def reciprocal_rank_fusion(results_list, weights=None, k=60):
+    """
+    RRF (Reciprocal Rank Fusion) 算法 - 融合多个检索结果
+
+    参数:
+        results_list: 多个检索结果的列表 [{'ids': [], 'documents': [], 'metadatas': [], 'distances': []}, ...]
+        weights: 每个检索器的权重，默认等权重
+        k: RRF参数，防止除零并平滑排名
+
+    返回:
+        融合后的结果
+    """
+    if not results_list:
+        return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+
+    if weights is None:
+        weights = [1.0] * len(results_list)
+
+    # 文档分数累加器
+    doc_scores = {}  # {doc_id: {'score': float, 'doc': str, 'meta': dict}}
+
+    for results, weight in zip(results_list, weights):
+        if not results['documents'][0]:
+            continue
+
+        for rank, (doc_id, doc, meta) in enumerate(zip(
+            results['ids'][0],
+            results['documents'][0],
+            results['metadatas'][0]
+        )):
+            # RRF公式: score += weight / (k + rank + 1)
+            rrf_score = weight / (k + rank + 1)
+
+            if doc_id not in doc_scores:
+                doc_scores[doc_id] = {
+                    'score': 0.0,
+                    'doc': doc,
+                    'meta': meta
+                }
+            doc_scores[doc_id]['score'] += rrf_score
+
+    # 按分数排序
+    sorted_items = sorted(doc_scores.items(), key=lambda x: x[1]['score'], reverse=True)
+
+    return {
+        'ids': [[item[0] for item in sorted_items]],
+        'documents': [[item[1]['doc'] for item in sorted_items]],
+        'metadatas': [[item[1]['meta'] for item in sorted_items]],
+        'distances': [[item[1]['score'] for item in sorted_items]]
+    }
+
+
+def rerank_results(query, results, top_k=5):
+    """
+    对检索结果进行重排序 (P3优化)
+
+    使用CrossEncoder模型计算query与每个文档的精确相关性分数，
+    重新排序后返回top_k个最相关的结果。
+    """
+    if not reranker or not results['documents'][0]:
+        return results
+
+    # 构建query-doc对
+    pairs = [(query, doc) for doc in results['documents'][0]]
+
+    # 计算重排序分数
+    scores = reranker.predict(pairs)
+
+    # 按分数排序
+    sorted_indices = np.argsort(scores)[::-1]  # 降序
+
+    # 重新组织结果
+    reranked_results = {
+        'ids': [[results['ids'][0][i] for i in sorted_indices[:top_k]]],
+        'documents': [[results['documents'][0][i] for i in sorted_indices[:top_k]]],
+        'metadatas': [[results['metadatas'][0][i] for i in sorted_indices[:top_k]]],
+        'distances': [[float(scores[i]) for i in sorted_indices[:top_k]]]
+    }
+
+    return reranked_results
+
+
+def search_knowledge(query, top_k=5):
+    """
+    混合检索 (P4优化: 向量检索 + BM25 + RRF融合 + Rerank)
+
+    检索流程:
+    1. 向量检索 - 语义相似度
+    2. BM25检索 - 关键词匹配
+    3. RRF融合 - 合并两种检索结果
+    4. Rerank精排 - 最终排序
+    """
+    results_list = []
+    weights = []
+
+    # 1. 向量检索
     query_vector = embedding_model.encode(query).tolist()
+    recall_k = RERANK_CANDIDATES if (USE_RERANK or USE_HYBRID_SEARCH) else top_k
 
-    # 向量检索
-    results = collection.query(
+    vector_results = collection.query(
         query_embeddings=[query_vector],
-        n_results=top_k
+        n_results=recall_k
     )
+    results_list.append(vector_results)
+    weights.append(VECTOR_WEIGHT)
 
-    return results
+    # 2. BM25检索 (如果启用混合检索)
+    if USE_HYBRID_SEARCH and bm25_index.bm25:
+        bm25_results = bm25_index.search(query, top_k=recall_k)
+        results_list.append(bm25_results)
+        weights.append(BM25_WEIGHT)
+
+    # 3. RRF融合
+    if len(results_list) > 1:
+        fused_results = reciprocal_rank_fusion(results_list, weights)
+    else:
+        fused_results = results_list[0]
+
+    # 4. Rerank精排
+    if USE_RERANK and reranker:
+        fused_results = rerank_results(query, fused_results, top_k)
+    else:
+        # 截取top_k
+        fused_results = {
+            'ids': [fused_results['ids'][0][:top_k]],
+            'documents': [fused_results['documents'][0][:top_k]],
+            'metadatas': [fused_results['metadatas'][0][:top_k]],
+            'distances': [fused_results['distances'][0][:top_k]]
+        }
+
+    return fused_results
+
+
+def aggregate_excel_rows(results, max_rows=10):
+    """
+    聚合Excel相邻行数据，形成更完整的表格上下文
+
+    当检索结果包含Excel数据时，将同一工作表的相邻行合并展示，
+    让大模型能看到完整的表格结构，而非碎片化的单行数据。
+    """
+    if not results['documents'][0]:
+        return results
+
+    # 按文件和工作表分组
+    excel_groups = {}  # {(source, sheet): [rows]}
+    other_docs = []    # 非Excel文档
+
+    for i, (doc, meta) in enumerate(zip(results['documents'][0], results['metadatas'][0])):
+        source = meta.get('source', '')
+
+        # 检查是否为Excel文件
+        if source.endswith('.xlsx') and 'sheet' in meta and 'row' in meta:
+            key = (source, meta['sheet'])
+            if key not in excel_groups:
+                excel_groups[key] = []
+            excel_groups[key].append({
+                'row': meta['row'],
+                'doc': doc,
+                'meta': meta,
+                'original_index': i
+            })
+        else:
+            other_docs.append({
+                'doc': doc,
+                'meta': meta,
+                'original_index': i
+            })
+
+    # 如果没有Excel数据，直接返回原结果
+    if not excel_groups:
+        return results
+
+    # 聚合Excel数据
+    aggregated_excel = []
+    for (source, sheet), rows in excel_groups.items():
+        # 按行号排序
+        rows.sort(key=lambda x: x['row'])
+
+        # 获取表头信息
+        header = None
+        for r in rows:
+            if r['meta'].get('is_header'):
+                header = r['doc']
+                break
+
+        # 构建聚合后的内容
+        if len(rows) == 1:
+            # 只有一行，直接使用
+            aggregated_doc = rows[0]['doc']
+        else:
+            # 多行，聚合展示
+            rows_text = []
+            for r in rows[:max_rows]:
+                # 去掉可能重复的表头信息
+                text = r['doc']
+                if text.startswith('【表头:'):
+                    # 提取实际内容
+                    parts = text.split('\n', 1)
+                    if len(parts) > 1:
+                        text = parts[1]
+                rows_text.append(f"第{r['row']}行: {text}")
+
+            aggregated_doc = f"【Excel表格数据 - {sheet}】\n" + "\n".join(rows_text)
+            if len(rows) > max_rows:
+                aggregated_doc += f"\n... (共{len(rows)}行，已显示前{max_rows}行)"
+
+        aggregated_excel.append({
+            'doc': aggregated_doc,
+            'meta': {
+                'source': source,
+                'sheet': sheet,
+                'row_range': f"{rows[0]['row']}-{rows[-1]['row']}",
+                'is_excel': True
+            },
+            'original_index': rows[0]['original_index']
+        })
+
+    # 合并Excel和非Excel结果，保持原顺序
+    all_results = aggregated_excel + other_docs
+    all_results.sort(key=lambda x: x['original_index'])
+
+    # 重建results结构
+    new_documents = [r['doc'] for r in all_results]
+    new_metadatas = [r['meta'] for r in all_results]
+    new_distances = [results['distances'][0][r['original_index']] for r in all_results] if results.get('distances') else [0] * len(all_results)
+
+    return {
+        'ids': [results['ids'][0][r['original_index']] for r in all_results],
+        'documents': [new_documents],
+        'metadatas': [new_metadatas],
+        'distances': [new_distances]
+    }
 
 
 def generate_answer(query, context):
-    """调用大模型生成回答"""
-    prompt = f"""你是一个智能助手，请根据以下参考资料回答用户的问题。
-如果参考资料中没有相关信息，请直接说明"参考资料中没有相关信息"。
+    """调用大模型生成回答（P2优化：添加置信度标注）"""
+    prompt = f"""你是一个严谨的智能助手，请根据以下参考资料回答用户的问题。
 
-回答时请注意：
-1. 说明信息来源（文件名、页码/行号等）
-2. 如果是表格数据，请用结构化的方式呈现
-3. 引用具体条款时标注章节名称
+【严格约束】
+1. 只能基于【参考资料】中的信息回答，禁止使用你的先验知识
+2. 若参考资料中没有答案，直接回复"参考资料中未找到相关信息"
+3. 不要推测、不要补充、不要编造
+4. 必须标注信息来源（文件名、页码/行号等）
+
+【回答格式】
+1. 直接回答问题，用结构化方式呈现（表格、列表等）
+2. 标注信息来源
+3. 在回答末尾添加【置信度评估】
+
+【置信度评估标准】
+- 高：多个来源一致，信息完整，直接命中关键词
+- 中：信息部分匹配，需要一定推理，来源较少
+- 低：信息模糊，需要较多推理，来源单一或存在矛盾
+
+【置信度格式】
+---
+置信度：高/中/低
+评估理由：简要说明为什么给出这个置信度
 
 参考资料：
 {context}
 
 用户问题：{query}
 
-回答："""
+请回答："""
 
     try:
         response = llm_client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
-            max_tokens=1000
+            max_tokens=1500
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -814,11 +1319,14 @@ def process_query(query):
     """处理单个查询"""
     # 检索相关内容
     print("\n[检索中...]")
-    results = search_knowledge(query)
+    results = search_knowledge(query, top_k=5)  # 增加召回数量
 
     if not results['documents'][0]:
         print("未找到相关内容")
         return "未找到相关内容"
+
+    # 聚合Excel数据（P1优化）
+    results = aggregate_excel_rows(results)
 
     # 组装上下文
     context_parts = []
@@ -832,12 +1340,16 @@ def process_query(query):
             source_parts.append(f"第{meta['page']}页")
         if 'sheet' in meta and 'row' in meta:
             source_parts.append(f"工作表\"{meta['sheet']}\"第{meta['row']}行")
+        if 'row_range' in meta:
+            source_parts.append(f"第{meta['row_range']}行")
         if 'section' in meta and meta['section']:
             source_parts.append(f"【{meta['section']}】")
         if meta.get('is_table'):
             source_parts.append("(表格)")
         if meta.get('is_header'):
             source_parts.append("(表头)")
+        if meta.get('is_excel'):
+            source_parts.append("(Excel数据)")
 
         source_str = " ".join(source_parts)
         context_parts.append(f"【来源: {source_str}】\n{doc}")
@@ -869,12 +1381,16 @@ def process_query(query):
             source_info += f" 第{meta['page']}页"
         if 'sheet' in meta and 'row' in meta:
             source_info += f" [{meta['sheet']} 第{meta['row']}行]"
+        if 'row_range' in meta:
+            source_info += f" [{meta['sheet']} 第{meta['row_range']}行]"
         if 'section' in meta and meta['section']:
             source_info += f" 【{meta['section']}】"
         if meta.get('is_table'):
             source_info += " [表格]"
         if meta.get('is_header'):
             source_info += " [表头]"
+        if meta.get('is_excel'):
+            source_info += " [Excel]"
 
         print(f"  [{i}] {source_info}: {preview}")
 

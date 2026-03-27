@@ -7,6 +7,9 @@ bge-base-zh-v1.5/
 # 向量数据库
 chroma_db/
 
+# BM25索引文件
+bm25_index.pkl
+
 # Python虚拟环境
 venv/
 .env/
@@ -33,6 +36,9 @@ Thumbs.db
 # 临时文件
 *.tmp
 *.temp
+
+# Excel临时文件
+~$*.xlsx
 
 # Claude Code计划文件
 .claude/
