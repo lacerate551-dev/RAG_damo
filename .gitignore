@@ -42,3 +42,5 @@ Thumbs.db
 
 # Claude Code计划文件
 .claude/
+# Claude Code本地配置
+CLAUDE.md

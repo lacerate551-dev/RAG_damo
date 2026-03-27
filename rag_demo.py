@@ -39,7 +39,7 @@ BM25_WEIGHT = 0.5  # BM25检索权重
 
 # Rerank配置 (P3优化)
 USE_RERANK = True  # 是否启用重排序
-RERANK_MODEL_NAME = "BAAI/bge-reranker-base"  # 重排序模型
+RERANK_MODEL_NAME = r"C:\Users\qq318\.cache\huggingface\hub\models--BAAI--bge-reranker-base\snapshots\2cfc18c9415c912f9d8155881c133215df768a70"       # 重排序模型
 RERANK_CANDIDATES = 20  # 重排序前的候选数量（混合检索后）
 RERANK_TOP_K = 5  # 重排序后返回的数量
 
@@ -1443,3 +1443,24 @@ if __name__ == "__main__":
         # 交互模式
         print(f"\n当前知识库: {collection.count()} 个片段")
         chat()
+
+# from flask import Flask, request, jsonify
+#
+# app = Flask(__name__)
+#
+# @app.route('/search', methods=['POST'])
+# def search():
+#   data = request.json
+#   query = data.get('query', '')
+#   top_k = data.get('top_k', 5)
+#
+#   # 调用你现有的检索函数
+#   results = search_knowledge(query, top_k=top_k)
+#
+#   return jsonify({
+#       'contexts': results['documents'][0],
+#       'metadatas': results['metadatas'][0]
+#   })
+#
+# if __name__ == '__main__':
+#   app.run(host='0.0.0.0', port=5000)
