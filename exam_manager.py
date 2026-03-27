@@ -65,7 +65,8 @@ def parse_json_response(result: dict) -> dict:
 
 
 def generate_exam(topic: str, choice_count: int = 3, blank_count: int = 2,
-                  short_answer_count: int = 2, difficulty: int = 3) -> dict:
+                  short_answer_count: int = 2, difficulty: int = 3,
+                  choice_score: int = 2, blank_score: int = 3) -> dict:
     """
     生成试卷
 
@@ -75,6 +76,8 @@ def generate_exam(topic: str, choice_count: int = 3, blank_count: int = 2,
         blank_count: 填空题数量
         short_answer_count: 简答题数量
         difficulty: 难度(1-5)
+        choice_score: 选择题每题分值（默认2分）
+        blank_score: 填空题每题分值（默认3分）
 
     Returns:
         试卷JSON
@@ -110,6 +113,21 @@ def generate_exam(topic: str, choice_count: int = 3, blank_count: int = 2,
             questions_json = questions_json[:-3]
         questions_json = questions_json.strip()
         questions_json = json.loads(questions_json)
+
+    # 添加分值字段
+    for q in questions_json.get("choice_questions", []):
+        q["score"] = choice_score
+    for q in questions_json.get("blank_questions", []):
+        q["score"] = blank_score
+    # 简答题分值由LLM生成，保留reference_answer中的total_score
+
+    # 重新计算总分
+    total_score = 0
+    total_score += len(questions_json.get("choice_questions", [])) * choice_score
+    total_score += len(questions_json.get("blank_questions", [])) * blank_score
+    for q in questions_json.get("short_answer_questions", []):
+        total_score += q.get("reference_answer", {}).get("total_score", 0)
+    questions_json["total_score"] = total_score
 
     return questions_json
 
@@ -150,7 +168,7 @@ def grade_question(question: dict, student_answer: str) -> dict:
     批阅单道题
 
     Args:
-        question: 题目信息(含正确答案)
+        question: 题目信息(含正确答案和分值)
         student_answer: 学生答案
 
     Returns:
@@ -161,7 +179,7 @@ def grade_question(question: dict, student_answer: str) -> dict:
         # 选择题
         question_type = "choice"
         correct_answer = question.get("answer", "")
-        max_score = 2  # 选择题默认2分
+        max_score = question.get("score", 2)  # 从试卷获取分值，默认2分
     elif 'reference_answer' in question:
         # 简答题 - 使用blank类型（填空和简答合并处理）
         question_type = "blank"
@@ -171,7 +189,7 @@ def grade_question(question: dict, student_answer: str) -> dict:
         # 填空题
         question_type = "blank"
         correct_answer = question.get("answer", "")
-        max_score = 3  # 填空题默认3分
+        max_score = question.get("score", 3)  # 从试卷获取分值，默认3分
 
     inputs = {
         "question_id": question.get("id", 0),
@@ -242,7 +260,7 @@ def grade_exam(exam_filepath: str, student_answers: dict) -> dict:
         result = grade_question(q, student_answer)
 
         q_score = result.get("score", 0)
-        q_max = 2  # 选择题默认2分
+        q_max = q.get("score", 2)  # 从试卷获取分值
 
         report["total_score"] += q_score
         report["max_score"] += q_max
@@ -267,7 +285,7 @@ def grade_exam(exam_filepath: str, student_answers: dict) -> dict:
         result = grade_question(q, student_answer)
 
         q_score = result.get("score", 0)
-        q_max = 3  # 填空题默认3分
+        q_max = q.get("score", 3)  # 从试卷获取分值
 
         report["total_score"] += q_score
         report["max_score"] += q_max
