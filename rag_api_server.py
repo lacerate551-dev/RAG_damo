@@ -1,18 +1,20 @@
 """
 带会话管理的 RAG API 服务 - 使用 Agentic RAG
 
-提供 REST API 接口供前端调用：
+提供 REST API 接口供前端和 Dify 工作流调用：
 1. POST /chat - 发送消息并获取回复（普通聊天，直接LLM回复）
 2. POST /rag - 发送消息并获取回复（知识库问答，使用Agentic RAG）
-3. GET /sessions - 获取用户会话列表
-4. DELETE /session/<session_id> - 删除会话
-5. GET /history/<session_id> - 获取会话历史
+3. POST /search - 混合检索接口（供 Dify 工作流调用）
+4. GET /sessions - 获取用户会话列表
+5. DELETE /session/<session_id> - 删除会话
+6. GET /history/<session_id> - 获取会话历史
 
 特性：
 - 双模式：普通聊天 / 知识库问答
 - 多轮对话：记住上下文
 - 用户隔离：不同用户会话独立
 - 并发支持：多用户同时请求
+- Dify 集成：提供 HTTP 检索接口
 
 使用方式：
     python rag_api_server.py
@@ -22,14 +24,22 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sys
 import os
+import pickle
+import numpy as np
 
 # 添加当前目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from session_manager import SessionManager
 from agentic_rag import AgenticRAG
-from rag_demo import collection, API_KEY, BASE_URL, MODEL
+from rag_demo import (
+    collection, API_KEY, BASE_URL, MODEL,
+    embedding_model, reranker, EMBEDDING_MODEL_PATH, RERANK_MODEL_PATH,
+    CHROMA_DB_PATH, VECTOR_WEIGHT, BM25_WEIGHT
+)
 from openai import OpenAI
+from rank_bm25 import BM25Okapi
+import jieba
 
 # 初始化
 app = Flask(__name__)
@@ -44,6 +54,28 @@ agentic_rag = AgenticRAG()
 # LLM 客户端（用于普通聊天，使用更快的模型）
 llm_client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 CHAT_MODEL = "qwen3.5-flash"  # 聊天使用更快的模型
+
+# BM25 索引路径
+BM25_INDEX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bm25_index.pkl")
+
+# 加载 BM25 索引
+print("加载 BM25 索引...")
+try:
+    with open(BM25_INDEX_PATH, 'rb') as f:
+        bm25_data = pickle.load(f)
+    bm25_docs = bm25_data['documents']
+    bm25_metas = bm25_data['metadatas']
+    bm25_ids = bm25_data['ids']
+    tokenized_docs = [list(jieba.cut(doc)) for doc in bm25_docs]
+    bm25 = BM25Okapi(tokenized_docs)
+    print(f"BM25 索引加载完成: {len(bm25_docs)} 个文档")
+except FileNotFoundError:
+    print(f"警告: BM25 索引文件未找到: {BM25_INDEX_PATH}")
+    print("请先运行 'python rag_demo.py --rebuild' 构建索引")
+    bm25 = None
+    bm25_docs = []
+    bm25_metas = []
+    bm25_ids = []
 
 
 def chat_with_llm(message: str, history: list = None) -> str:
@@ -68,6 +100,91 @@ def chat_with_llm(message: str, history: list = None) -> str:
         max_tokens=300
     )
     return response.choices[0].message.content.strip()
+
+
+# ============== 混合检索功能（供 Dify 调用）==============
+
+def reciprocal_rank_fusion(results_list, weights=None, k=60):
+    """RRF 融合算法"""
+    if weights is None:
+        weights = [1.0] * len(results_list)
+
+    doc_scores = {}
+    for results, weight in zip(results_list, weights):
+        if not results['documents'][0]:
+            continue
+        for rank, (doc_id, doc, meta) in enumerate(zip(
+            results['ids'][0],
+            results['documents'][0],
+            results['metadatas'][0]
+        )):
+            rrf_score = weight / (k + rank + 1)
+            if doc_id not in doc_scores:
+                doc_scores[doc_id] = {'score': 0.0, 'doc': doc, 'meta': meta}
+            doc_scores[doc_id]['score'] += rrf_score
+
+    sorted_items = sorted(doc_scores.items(), key=lambda x: x[1]['score'], reverse=True)
+    return {
+        'ids': [[item[0] for item in sorted_items]],
+        'documents': [[item[1]['doc'] for item in sorted_items]],
+        'metadatas': [[item[1]['meta'] for item in sorted_items]],
+        'distances': [[item[1]['score'] for item in sorted_items]]
+    }
+
+
+def search_vector(query: str, top_k: int = 15) -> dict:
+    """向量检索"""
+    query_vector = embedding_model.encode(query).tolist()
+    return collection.query(query_embeddings=[query_vector], n_results=top_k)
+
+
+def search_bm25(query: str, top_k: int = 15) -> dict:
+    """BM25 检索"""
+    if bm25 is None:
+        return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+
+    tokenized_query = list(jieba.cut(query))
+    scores = bm25.get_scores(tokenized_query)
+    top_indices = np.argsort(scores)[::-1][:top_k]
+    return {
+        'ids': [[bm25_ids[i] for i in top_indices]],
+        'documents': [[bm25_docs[i] for i in top_indices]],
+        'metadatas': [[bm25_metas[i] for i in top_indices]],
+        'distances': [[float(scores[i]) for i in top_indices]]
+    }
+
+
+def search_hybrid(query: str, top_k: int = 5, candidates: int = 15) -> dict:
+    """混合检索 + Rerank"""
+    # 向量检索
+    vector_results = search_vector(query, candidates)
+    # BM25 检索
+    bm25_results = search_bm25(query, candidates)
+    # RRF 融合
+    fused_results = reciprocal_rank_fusion(
+        [vector_results, bm25_results],
+        [VECTOR_WEIGHT, BM25_WEIGHT]
+    )
+
+    # Rerank
+    if reranker and fused_results['documents'][0]:
+        pairs = [(query, doc) for doc in fused_results['documents'][0]]
+        scores = reranker.predict(pairs)
+        sorted_indices = np.argsort(scores)[::-1][:top_k]
+        return {
+            'ids': [[fused_results['ids'][0][i] for i in sorted_indices]],
+            'documents': [[fused_results['documents'][0][i] for i in sorted_indices]],
+            'metadatas': [[fused_results['metadatas'][0][i] for i in sorted_indices]],
+            'distances': [[float(scores[i]) for i in sorted_indices]]
+        }
+
+    # 没有 Reranker，直接返回融合结果
+    return {
+        'ids': [fused_results['ids'][0][:top_k]],
+        'documents': [fused_results['documents'][0][:top_k]],
+        'metadatas': [fused_results['metadatas'][0][:top_k]],
+        'distances': [fused_results['distances'][0][:top_k]]
+    }
 
 
 @app.route('/chat', methods=['POST'])
@@ -169,6 +286,40 @@ def rag():
         "answer": result["answer"],
         "mode": "rag",
         "sources": result.get("sources", [])
+    })
+
+
+@app.route('/search', methods=['POST'])
+def search():
+    """
+    混合检索接口 - 供 Dify 工作流调用
+
+    请求体:
+    {
+        "query": "查询文本",
+        "top_k": 5  // 可选，默认5
+    }
+
+    返回:
+    {
+        "contexts": ["文档1", "文档2", ...],
+        "metadatas": [{"source": "文件名", ...}, ...],
+        "scores": [0.95, 0.89, ...]
+    }
+    """
+    data = request.json
+    query = data.get('query', '')
+    top_k = data.get('top_k', 5)
+
+    if not query:
+        return jsonify({'error': 'query is required'}), 400
+
+    results = search_hybrid(query, top_k=top_k)
+
+    return jsonify({
+        'contexts': results['documents'][0],
+        'metadatas': results['metadatas'][0],
+        'scores': results['distances'][0]
     })
 
 
@@ -304,15 +455,17 @@ def health():
     return jsonify({
         "status": "ok",
         "knowledge_base": f"{collection.count()} 条记录",
+        "bm25_index": f"{len(bm25_docs)} 个文档" if bm25 else "未加载",
         "mode": "Agentic RAG"
     })
 
 
 if __name__ == '__main__':
-    print("=" * 50)
+    print("=" * 60)
     print("RAG API 服务启动")
-    print("=" * 50)
+    print("=" * 60)
     print(f"知识库: {collection.count()} 条记录")
+    print(f"BM25 索引: {len(bm25_docs)} 个文档")
     print(f"会话数据库: ./sessions.db")
     print()
     print("双模式:")
@@ -322,13 +475,18 @@ if __name__ == '__main__':
     print("API 接口:")
     print("  POST /chat          - 普通聊天")
     print("  POST /rag           - 知识库问答")
+    print("  POST /search        - 混合检索 (供 Dify 调用)")
     print("  GET  /sessions      - 获取会话列表")
     print("  GET  /history/<id>  - 获取会话历史")
     print("  DELETE /session/<id> - 删除会话")
     print("  POST /clear/<id>    - 清空历史")
     print("  GET  /stats         - 统计信息")
     print("  GET  /health        - 健康检查")
-    print("=" * 50)
+    print()
+    print("Dify 集成:")
+    print("  在 Dify HTTP 节点中使用: POST http://localhost:5001/search")
+    print("  请求体: {\"query\": \"查询内容\", \"top_k\": 5}")
+    print("=" * 60)
 
     # threaded=True 支持多用户同时请求
     app.run(host='0.0.0.0', port=5001, debug=True, threaded=True)

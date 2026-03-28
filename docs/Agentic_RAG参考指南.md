@@ -265,7 +265,7 @@ Agent决策: answer
 
 【不修改的文件】
 - rag_demo.py        (传统RAG，保持不变)
-- rag_api.py         (API服务，保持不变)
+- rag_api_server.py  (API服务，保持不变)
 - exam_manager.py    (Dify出题系统，保持不变)
 - config.py          (配置文件，保持不变)
 ```
