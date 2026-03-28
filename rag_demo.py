@@ -172,6 +172,23 @@ class BM25Index:
         self.ids = []
 
 
+def rebuild_bm25_index():
+    """从ChromaDB重建BM25索引"""
+    # 获取所有文档
+    results = collection.get()
+    if not results['ids']:
+        bm25_index.clear()
+        return 0
+
+    # 重建索引
+    bm25_index.add_documents(
+        ids=results['ids'],
+        documents=results['documents'],
+        metadatas=results['metadatas']
+    )
+    return len(results['ids'])
+
+
 # ========== 初始化组件 ==========
 print("=" * 50)
 print("RAG Demo 知识库问答系统 (混合检索版)")
@@ -473,7 +490,14 @@ def sync_documents():
             filepath = os.path.join(DOCUMENTS_PATH, f)
             add_file_to_index(filepath)
 
-    print(f"\n同步完成，当前共 {collection.count()} 个片段")
+    print(f"\n向量库同步完成，当前共 {collection.count()} 个片段")
+
+    # 重建BM25索引（增量更新后需要重建以保持一致）
+    if USE_HYBRID_SEARCH:
+        print("\n重建BM25索引...")
+        rebuild_bm25_index()
+        bm25_index.save(BM25_INDEX_PATH)
+        print(f"BM25索引更新完成: {len(bm25_index.documents)} 个文档")
 
 
 # ========== 文档处理函数 ==========
