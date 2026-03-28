@@ -26,26 +26,27 @@
 ## 项目结构
 
 ```
-简单智能体入门/
-├── bge-base-zh-v1.5/     # 本地向量模型（需单独下载）
-├── documents/            # 文档目录
-├── chroma_db/            # 向量数据库（自动生成）
-├── chat-ui/              # 前端界面
+RAG_damo/
+├── models/                    # 模型目录（需下载）
+│   ├── bge-base-zh-v1.5/     # 向量模型（必需）
+│   │   ├── config.json
+│   │   ├── pytorch_model.bin
+│   │   ├── tokenizer.json
+│   │   └── vocab.txt
+│   └── bge-reranker-base/    # 重排序模型（首次运行自动下载）
+├── documents/                 # 文档目录
+├── chroma_db/                 # 向量数据库（自动生成）
+├── chat-ui/                   # 前端界面
 │   ├── index.html
 │   ├── style.css
 │   └── app.js
-├── docs/                 # 文档
-│   ├── Agentic_RAG完整指南.md
-│   ├── Agentic_RAG速查卡片.md
-│   ├── 会话管理API文档.md
-│   └── 多源信息融合指南.md
-├── rag_demo.py           # RAG基础功能
-├── agentic_rag.py        # Agentic RAG 核心
-├── rag_api_server.py     # REST API 服务
-├── session_manager.py    # 会话管理器
-├── exam_manager.py       # 智能出题系统
-├── config.example.py     # 配置示例
-├── venv/                 # Python虚拟环境
+├── docs/                      # 文档
+├── rag_demo.py               # RAG基础功能
+├── agentic_rag.py            # Agentic RAG 核心
+├── rag_api_server.py         # REST API 服务
+├── session_manager.py        # 会话管理器
+├── config.example.py         # 配置示例
+├── venv/                     # Python虚拟环境
 └── README.md
 ```
 
@@ -76,24 +77,60 @@ source venv/bin/activate
 ### 3. 安装依赖
 
 ```bash
-pip install chromadb sentence-transformers openai python-docx pdfplumber openpyxl flask flask-cors rank_bm25 jieba requests -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install chromadb sentence-transformers openai python-docx pdfplumber openpyxl flask flask-cors rank_bm25 jieba requests transformers -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-### 4. 下载向量模型
+### 4. 下载模型
 
-从 Hugging Face 下载 BGE-base-zh-v1.5 模型，放入 `bge-base-zh-v1.5/` 目录：
+本项目使用两个模型：
+
+| 模型 | 用途 | 大小 | 是否必需 |
+|------|------|------|----------|
+| BGE-base-zh-v1.5 | 向量编码 | ~400MB | **必需** |
+| BGE-reranker-base | 结果重排序 | ~280MB | 可选（首次运行自动下载） |
+
+#### 4.1 下载向量模型（必需）
+
+创建模型目录并下载：
 
 ```bash
-# 方法1：使用 huggingface-cli
+# 创建模型目录
+mkdir models
+
+# 方法1：使用 huggingface-cli（推荐）
 pip install huggingface-hub
-huggingface-cli download BAAI/bge-base-zh-v1.5 --local-dir ./bge-base-zh-v1.5
+huggingface-cli download BAAI/bge-base-zh-v1.5 --local-dir ./models/bge-base-zh-v1.5
 
 # 方法2：手动下载
 # 访问 https://huggingface.co/BAAI/bge-base-zh-v1.5
-# 下载所有文件到 ./bge-base-zh-v1.5/ 目录
+# 下载所有文件到 ./models/bge-base-zh-v1.5/ 目录
 ```
 
-**注意：Rerank 模型会在首次运行时自动下载**，无需手动配置。
+下载完成后，目录结构应为：
+```
+models/bge-base-zh-v1.5/
+├── config.json
+├── pytorch_model.bin
+├── tokenizer.json
+├── tokenizer_config.json
+├── vocab.txt
+├── special_tokens_map.json
+└── ...
+```
+
+#### 4.2 重排序模型（可选）
+
+首次运行时会自动下载到 `./models/bge-reranker-base/`，无需手动操作。
+
+如需手动下载：
+```bash
+huggingface-cli download BAAI/bge-reranker-base --local-dir ./models/bge-reranker-base
+```
+
+如不需要重排序功能，可在 `rag_demo.py` 中禁用：
+```python
+USE_RERANK = False
+```
 
 ### 5. 配置API密钥
 

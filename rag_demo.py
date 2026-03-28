@@ -2,6 +2,18 @@
 RAG Demo - 基于本地向量模型 + Chroma + Qwen API 的简单知识库问答系统
 支持格式: PDF, Word(.docx/.doc), Excel(.xlsx), TXT
 混合检索: 向量检索 + BM25关键词检索 + Rerank重排序
+
+模型目录结构:
+  models/
+  ├── bge-base-zh-v1.5/      # 向量模型（必需）
+  │   ├── config.json
+  │   ├── pytorch_model.bin
+  │   ├── tokenizer.json
+  │   └── vocab.txt
+  └── bge-reranker-base/     # 重排序模型（首次运行自动下载）
+      ├── config.json
+      ├── model.safetensors
+      └── tokenizer.json
 """
 
 import os
@@ -26,22 +38,58 @@ except ImportError:
     print("请复制config.example.py为config.py并填入你的API Key")
     exit(1)
 
-# ========== 配置 ==========
-EMBEDDING_MODEL_PATH = "./bge-base-zh-v1.5"
-CHROMA_DB_PATH = "./chroma_db"
-DOCUMENTS_PATH = "./documents"
+# ========== 路径配置 ==========
+# 项目根目录
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# 混合检索配置 (P4优化)
+# 模型目录（统一管理）
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+
+# 向量模型路径（必需，需手动下载）
+EMBEDDING_MODEL_PATH = os.path.join(MODELS_DIR, "bge-base-zh-v1.5")
+
+# 重排序模型路径（首次运行自动下载到此目录）
+RERANK_MODEL_PATH = os.path.join(MODELS_DIR, "bge-reranker-base")
+
+# 数据目录
+CHROMA_DB_PATH = os.path.join(PROJECT_ROOT, "chroma_db")
+DOCUMENTS_PATH = os.path.join(PROJECT_ROOT, "documents")
+BM25_INDEX_PATH = os.path.join(PROJECT_ROOT, "bm25_index.pkl")
+
+# 混合检索配置
 USE_HYBRID_SEARCH = True  # 是否启用混合检索
-BM25_INDEX_PATH = "./bm25_index.pkl"  # BM25索引存储路径
 VECTOR_WEIGHT = 0.5  # 向量检索权重
 BM25_WEIGHT = 0.5  # BM25检索权重
 
-# Rerank配置 (P3优化)
+# Rerank配置
 USE_RERANK = True  # 是否启用重排序
-RERANK_MODEL_NAME = "BAAI/bge-reranker-base"  # 重排序模型（HuggingFace模型名，首次运行自动下载）
 RERANK_CANDIDATES = 20  # 重排序前的候选数量（混合检索后）
 RERANK_TOP_K = 5  # 重排序后返回的数量
+
+
+# ========== 模型初始化辅助函数 ==========
+def ensure_models_dir():
+    """确保模型目录存在"""
+    os.makedirs(MODELS_DIR, exist_ok=True)
+
+
+def check_embedding_model():
+    """检查向量模型是否存在"""
+    required_files = ["config.json", "pytorch_model.bin", "tokenizer.json", "vocab.txt"]
+    model_dir = EMBEDDING_MODEL_PATH
+
+    if not os.path.exists(model_dir):
+        return False, f"模型目录不存在: {model_dir}"
+
+    missing_files = []
+    for f in required_files:
+        if not os.path.exists(os.path.join(model_dir, f)):
+            missing_files.append(f)
+
+    if missing_files:
+        return False, f"缺少文件: {', '.join(missing_files)}"
+
+    return True, None
 
 
 # ========== BM25索引管理器 ==========
@@ -129,7 +177,24 @@ print("=" * 50)
 print("RAG Demo 知识库问答系统 (混合检索版)")
 print("=" * 50)
 
+# 确保模型目录存在
+ensure_models_dir()
+
+# [1/5] 加载本地向量模型
 print("\n[1/5] 加载本地向量模型...")
+model_ok, model_error = check_embedding_model()
+if not model_ok:
+    print(f"\n错误: 向量模型未正确安装!")
+    print(f"  {model_error}")
+    print("\n请按以下步骤下载模型:")
+    print("  1. 创建模型目录: mkdir models")
+    print("  2. 下载向量模型:")
+    print("     pip install huggingface-hub")
+    print("     huggingface-cli download BAAI/bge-base-zh-v1.5 --local-dir ./models/bge-base-zh-v1.5")
+    print("\n  或者手动下载: https://huggingface.co/BAAI/bge-base-zh-v1.5")
+    print("  将文件放入: ./models/bge-base-zh-v1.5/")
+    exit(1)
+
 embedding_model = SentenceTransformer(EMBEDDING_MODEL_PATH)
 print(f"      模型加载完成: {EMBEDDING_MODEL_PATH}")
 
@@ -156,16 +221,38 @@ llm_client = OpenAI(
 print(f"      API地址: {BASE_URL}")
 print(f"      模型: {MODEL}")
 
-# 初始化Reranker模型 (P3优化)
+# 初始化Reranker模型
 reranker = None
 if USE_RERANK:
     print("\n[5/5] 加载重排序模型...")
     try:
-        reranker = CrossEncoder(RERANK_MODEL_NAME)
-        print(f"      Rerank模型加载完成: {RERANK_MODEL_NAME}")
+        # 检查本地模型是否存在
+        if os.path.exists(RERANK_MODEL_PATH) and os.path.exists(os.path.join(RERANK_MODEL_PATH, "config.json")):
+            # 使用本地模型
+            reranker = CrossEncoder(RERANK_MODEL_PATH)
+            print(f"      Rerank模型加载完成: {RERANK_MODEL_PATH}")
+        else:
+            # 从 HuggingFace 下载并指定缓存目录
+            print(f"      首次运行，正在下载 Rerank 模型...")
+            print(f"      模型将保存到: {RERANK_MODEL_PATH}")
+            os.makedirs(RERANK_MODEL_PATH, exist_ok=True)
+
+            # 下载模型
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+            model = AutoModelForSequenceClassification.from_pretrained("BAAI/bge-reranker-base")
+            tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-base")
+
+            # 保存到本地
+            model.save_pretrained(RERANK_MODEL_PATH)
+            tokenizer.save_pretrained(RERANK_MODEL_PATH)
+
+            # 加载模型
+            reranker = CrossEncoder(RERANK_MODEL_PATH)
+            print(f"      Rerank模型下载完成: {RERANK_MODEL_PATH}")
     except Exception as e:
         print(f"      Rerank模型加载失败: {e}")
-        print("      将使用纯向量检索模式")
+        print("      将使用纯向量检索模式（不影响基本功能）")
+        print("      如需使用 Rerank，请手动下载模型到 ./models/bge-reranker-base/")
         USE_RERANK = False
 else:
     print("\n[5/5] 跳过重排序模型加载 (已禁用)")
