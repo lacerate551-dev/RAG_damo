@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG 对话测试系统</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- 顶部导航 -->
+        <header class="header">
+            <h1>RAG 对话测试系统</h1>
+            <div class="user-selector">
+                <label>用户ID:</label>
+                <select id="userSelect">
+                    <option value="test_user_001">测试用户1</option>
+                    <option value="test_user_002">测试用户2</option>
+                    <option value="custom">自定义...</option>
+                </select>
+                <input type="text" id="customUserInput" placeholder="输入用户ID" style="display:none;">
+            </div>
+            <div class="mode-switcher">
+                <button id="modeToggle" class="mode-toggle chat-mode">
+                    <span class="mode-icon">Chat</span>
+                </button>
+                <span id="modeLabel" class="mode-label">普通聊天</span>
+            </div>
+            <div class="session-info">
+                <span>当前会话: <code id="currentSessionId">新会话</code></span>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <!-- 左侧会话列表 -->
+            <aside class="sidebar">
+                <div class="sidebar-header">
+                    <h2>会话列表</h2>
+                    <button id="newSessionBtn" class="btn btn-primary">+ 新建会话</button>
+                </div>
+                <div id="sessionList" class="session-list">
+                    <!-- 会话列表动态生成 -->
+                </div>
+            </aside>
+
+            <!-- 右侧聊天区域 -->
+            <main class="chat-area">
+                <div id="chatMessages" class="chat-messages">
+                    <!-- 消息动态生成 -->
+                </div>
+                <div class="chat-input-area">
+                    <input type="text" id="messageInput" placeholder="输入消息..." />
+                    <button id="sendBtn" class="btn btn-primary">发送</button>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

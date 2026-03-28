@@ -1443,24 +1443,3 @@ if __name__ == "__main__":
         # 交互模式
         print(f"\n当前知识库: {collection.count()} 个片段")
         chat()
-
-# from flask import Flask, request, jsonify
-#
-# app = Flask(__name__)
-#
-# @app.route('/search', methods=['POST'])
-# def search():
-#   data = request.json
-#   query = data.get('query', '')
-#   top_k = data.get('top_k', 5)
-#
-#   # 调用你现有的检索函数
-#   results = search_knowledge(query, top_k=top_k)
-#
-#   return jsonify({
-#       'contexts': results['documents'][0],
-#       'metadatas': results['metadatas'][0]
-#   })
-#
-# if __name__ == '__main__':
-#   app.run(host='0.0.0.0', port=5000)

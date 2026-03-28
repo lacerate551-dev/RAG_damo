@@ -44,3 +44,21 @@ Thumbs.db
 .claude/
 # Claude Code本地配置
 CLAUDE.md
+
+# 会话数据库（含用户数据）
+sessions.db
+
+# 测试文件
+tests/
+
+# 文档源文件（可能含敏感内容）
+documents/
+
+# 批阅报告
+批阅报告/
+
+# 题库数据
+题库/
+
+# 非必要文档
+docs/superpowers/
