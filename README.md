@@ -93,6 +93,8 @@ huggingface-cli download BAAI/bge-base-zh-v1.5 --local-dir ./bge-base-zh-v1.5
 # 下载所有文件到 ./bge-base-zh-v1.5/ 目录
 ```
 
+**注意：Rerank 模型会在首次运行时自动下载**，无需手动配置。
+
 ### 5. 配置API密钥
 
 ```bash
@@ -245,6 +247,18 @@ python rag_demo.py --sync
 - `pytorch_model.bin`
 - `tokenizer.json`
 - `vocab.txt`
+
+### Q: Rerank 模型下载慢或失败？
+
+Rerank 模型 (`BAAI/bge-reranker-base`) 会在首次运行时自动从 HuggingFace 下载。
+
+如果下载失败，可以：
+1. 使用代理或科学上网
+2. 手动下载后放入 `~/.cache/huggingface/hub/` 目录
+3. 或在 `rag_demo.py` 中禁用 Rerank：
+   ```python
+   USE_RERANK = False  # 设置为 False
+   ```
 
 ### Q: API 调用失败？
 

@@ -39,7 +39,7 @@ BM25_WEIGHT = 0.5  # BM25检索权重
 
 # Rerank配置 (P3优化)
 USE_RERANK = True  # 是否启用重排序
-RERANK_MODEL_NAME = r"C:\Users\qq318\.cache\huggingface\hub\models--BAAI--bge-reranker-base\snapshots\2cfc18c9415c912f9d8155881c133215df768a70"       # 重排序模型
+RERANK_MODEL_NAME = "BAAI/bge-reranker-base"  # 重排序模型（HuggingFace模型名，首次运行自动下载）
 RERANK_CANDIDATES = 20  # 重排序前的候选数量（混合检索后）
 RERANK_TOP_K = 5  # 重排序后返回的数量
 
