@@ -16,19 +16,29 @@ import jieba
 import pickle
 import numpy as np
 
-# 配置
-EMBEDDING_MODEL_PATH = "./bge-base-zh-v1.5"
-CHROMA_DB_PATH = "./chroma_db"
-BM25_INDEX_PATH = "./bm25_index.pkl"
+# 路径配置
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+
+EMBEDDING_MODEL_PATH = os.path.join(MODELS_DIR, "bge-base-zh-v1.5")
+RERANK_MODEL_PATH = os.path.join(MODELS_DIR, "bge-reranker-base")
+CHROMA_DB_PATH = os.path.join(PROJECT_ROOT, "chroma_db")
+BM25_INDEX_PATH = os.path.join(PROJECT_ROOT, "bm25_index.pkl")
 VECTOR_WEIGHT = 0.5
 BM25_WEIGHT = 0.5
-RERANK_MODEL_NAME = r"C:\Users\qq318\.cache\huggingface\hub\models--BAAI--bge-reranker-base\snapshots\2cfc18c9415c912f9d8155881c133215df768a70"
 
 print("初始化RAG组件...")
 
 # 加载模型
 embedding_model = SentenceTransformer(EMBEDDING_MODEL_PATH)
-reranker = CrossEncoder(RERANK_MODEL_NAME)
+
+# 加载Rerank模型
+if os.path.exists(RERANK_MODEL_PATH) and os.path.exists(os.path.join(RERANK_MODEL_PATH, "config.json")):
+    reranker = CrossEncoder(RERANK_MODEL_PATH)
+else:
+    print(f"警告: Rerank模型未找到，请下载到 {RERANK_MODEL_PATH}")
+    print("  huggingface-cli download BAAI/bge-reranker-base --local-dir ./models/bge-reranker-base")
+    reranker = None
 
 # 加载向量库
 chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
