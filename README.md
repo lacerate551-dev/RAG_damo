@@ -278,7 +278,7 @@ python agentic_rag.py
 
 ```bash
 # 1. 将文档放入 documents/ 目录
-# 2. 运行同步
+# 2. 运行同步（同时更新向量库和BM25索引）
 python rag_demo.py --sync
 ```
 
@@ -286,9 +286,21 @@ python rag_demo.py --sync
 
 ```bash
 # 1. 从 documents/ 目录删除文件
-# 2. 运行同步
+# 2. 运行同步（同时更新向量库和BM25索引）
 python rag_demo.py --sync
 ```
+
+### 重建索引
+
+```bash
+# 完全重建（清空后重新构建向量库和BM25索引）
+python rag_demo.py --rebuild
+
+# 仅重建BM25索引（如果损坏或需要更新）
+python rag_demo.py --sync
+```
+
+> **说明**：`--sync` 会自动同步向量库（ChromaDB）和 BM25 索引，保持两者一致。
 
 ## 常见问题
 
