@@ -45,7 +45,10 @@ RAG_damo/
 ├── agentic_rag.py            # Agentic RAG 核心
 ├── rag_api_server.py         # REST API 服务
 ├── session_manager.py        # 会话管理器
+├── exam_manager.py           # Dify出题系统管理器
+├── run_exam.py               # 出题系统运行脚本
 ├── config.example.py         # 配置示例
+├── requirements.txt          # Python依赖
 ├── venv/                     # Python虚拟环境
 └── README.md
 ```
@@ -75,6 +78,12 @@ source venv/bin/activate
 ```
 
 ### 3. 安装依赖
+
+```bash
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+或手动安装：
 
 ```bash
 pip install chromadb sentence-transformers openai python-docx pdfplumber openpyxl flask flask-cors rank_bm25 jieba requests transformers -i https://pypi.tuna.tsinghua.edu.cn/simple
@@ -149,6 +158,7 @@ DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DASHSCOPE_MODEL = "qwen3.5-plus"
 
 # Serper API（可选，用于网络搜索）
+# 注册地址: https://serper.dev/
 SERPER_API_KEY = "your-serper-api-key"
 
 # Dify工作流API配置（可选，用于智能出题）
@@ -161,6 +171,11 @@ API_KEY = DASHSCOPE_API_KEY
 BASE_URL = DASHSCOPE_BASE_URL
 MODEL = DASHSCOPE_MODEL
 ```
+
+> **说明**：
+> - `DASHSCOPE_API_KEY`：必需，用于大模型调用
+> - `SERPER_API_KEY`：可选，启用网络搜索功能
+> - `DIFY_*`：可选，用于 Dify 智能出题集成
 
 ### 6. 准备知识库文档
 
