@@ -279,7 +279,7 @@ python rag_demo.py --sync
 
 ### Q: 向量模型加载失败？
 
-确保 `bge-base-zh-v1.5/` 目录包含以下文件：
+确保 `models/bge-base-zh-v1.5/` 目录包含以下文件：
 - `config.json`
 - `pytorch_model.bin`
 - `tokenizer.json`
@@ -287,11 +287,14 @@ python rag_demo.py --sync
 
 ### Q: Rerank 模型下载慢或失败？
 
-Rerank 模型 (`BAAI/bge-reranker-base`) 会在首次运行时自动从 HuggingFace 下载。
+Rerank 模型 (`BAAI/bge-reranker-base`) 会在首次运行时自动下载到 `models/bge-reranker-base/`。
 
 如果下载失败，可以：
 1. 使用代理或科学上网
-2. 手动下载后放入 `~/.cache/huggingface/hub/` 目录
+2. 手动下载：
+   ```bash
+   huggingface-cli download BAAI/bge-reranker-base --local-dir ./models/bge-reranker-base
+   ```
 3. 或在 `rag_demo.py` 中禁用 Rerank：
    ```python
    USE_RERANK = False  # 设置为 False
