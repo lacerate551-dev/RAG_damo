@@ -78,28 +78,26 @@ except FileNotFoundError:
     bm25_ids = []
 
 
-def chat_with_llm(message: str, history: list = None) -> str:
-    """普通聊天，直接使用LLM回复"""
-    messages = [
-        {"role": "system", "content": "你是一个友好、专业的智能助手。回答简洁，不超过150字。"}
-    ]
+def chat_with_llm(message: str, history: list = None, enable_web_search: bool = True) -> str:
+    """
+    智能聊天 - 使用 Agentic RAG 的网络搜索能力
 
-    if history:
-        for msg in history[-6:]:  # 最近3轮
-            messages.append({
-                "role": msg["role"],
-                "content": msg["content"]
-            })
+    Args:
+        message: 用户消息
+        history: 对话历史
+        enable_web_search: 是否启用网络搜索
 
-    messages.append({"role": "user", "content": message})
-
-    response = llm_client.chat.completions.create(
-        model=CHAT_MODEL,  # 使用更快的模型
-        messages=messages,
-        temperature=0.8,
-        max_tokens=300
+    Returns:
+        回复内容
+    """
+    # 使用 Agentic RAG 处理，启用网络搜索但不使用知识库
+    result = agentic_rag.chat_search(
+        message,
+        history=history,
+        enable_web_search=enable_web_search,
+        verbose=False
     )
-    return response.choices[0].message.content.strip()
+    return result["answer"]
 
 
 # ============== 混合检索功能（供 Dify 调用）==============
@@ -224,16 +222,18 @@ def chat():
     # 获取历史上下文
     history = session_manager.get_history(session_id, limit=10)
 
-    # 直接LLM回复
-    answer = chat_with_llm(message, history)
+    # 智能聊天（支持网络搜索）
+    result = chat_with_llm(message, history)
 
     # 保存助手回复
-    session_manager.add_message(session_id, "assistant", answer)
+    session_manager.add_message(session_id, "assistant", result["answer"])
 
     return jsonify({
         "session_id": session_id,
-        "answer": answer,
-        "mode": "chat"
+        "answer": result["answer"],
+        "mode": "chat",
+        "sources": result.get("sources", []),
+        "web_searched": result.get("web_searched", False)
     })
 
 
@@ -460,6 +460,135 @@ def health():
     })
 
 
+# ==================== Graph RAG API ====================
+
+# 尝试导入 Graph RAG 组件
+try:
+    from config import USE_GRAPH_RAG
+except ImportError:
+    USE_GRAPH_RAG = False
+
+try:
+    from graph_manager import get_graph_manager
+    from graph_rag import GraphRAG
+    HAS_GRAPH_RAG = True
+except ImportError:
+    HAS_GRAPH_RAG = False
+    print("提示: Graph RAG 模块未安装，图谱 API 不可用")
+
+
+@app.route('/graph/search', methods=['POST'])
+def graph_search():
+    """
+    图谱检索接口
+
+    请求体:
+    {
+        "query": "查询内容",
+        "top_k": 5,
+        "depth": 2
+    }
+    """
+    if not HAS_GRAPH_RAG or not USE_GRAPH_RAG:
+        return jsonify({
+            "error": "Graph RAG 功能未启用",
+            "hint": "请在 config.py 中配置 Neo4j 并设置 USE_GRAPH_RAG=True"
+        }), 400
+
+    data = request.get_json()
+    query = data.get('query', '')
+    top_k = data.get('top_k', 5)
+    depth = data.get('depth', 2)
+
+    if not query:
+        return jsonify({"error": "缺少 query 参数"}), 400
+
+    try:
+        rag = GraphRAG()
+        result = rag.search(query, top_k=top_k, graph_depth=depth)
+
+        return jsonify({
+            "answer": result.answer,
+            "entities": result.entities,
+            "has_graph_context": bool(result.graph_context),
+            "sources": result.sources,
+            "graph_context": result.graph_context[:500] if result.graph_context else None
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/graph/build', methods=['POST'])
+def build_graph():
+    """
+    重建图谱索引
+
+    从现有知识库文档中提取实体和关系，构建知识图谱
+    """
+    if not HAS_GRAPH_RAG or not USE_GRAPH_RAG:
+        return jsonify({
+            "error": "Graph RAG 功能未启用",
+            "hint": "请在 config.py 中配置 Neo4j 并设置 USE_GRAPH_RAG=True"
+        }), 400
+
+    try:
+        from rag_demo import rebuild_knowledge_graph
+
+        success = rebuild_knowledge_graph(verbose=True)
+
+        if success:
+            return jsonify({
+                "status": "success",
+                "message": "知识图谱构建完成"
+            })
+        else:
+            return jsonify({
+                "status": "error",
+                "message": "知识图谱构建失败，请检查 Neo4j 连接"
+            }), 500
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/graph/stats', methods=['GET'])
+def graph_stats():
+    """获取图谱统计信息"""
+    if not HAS_GRAPH_RAG or not USE_GRAPH_RAG:
+        return jsonify({
+            "enabled": False,
+            "message": "Graph RAG 功能未启用"
+        })
+
+    try:
+        gm = get_graph_manager()
+        if not gm or not gm.connected:
+            return jsonify({
+                "enabled": True,
+                "connected": False,
+                "message": "无法连接到 Neo4j"
+            })
+
+        stats = gm.get_stats()
+        gm.close()
+
+        return jsonify({
+            "enabled": True,
+            "connected": True,
+            "nodes": stats['nodes'],
+            "edges": stats['edges'],
+            "types": stats['types']
+        })
+
+    except Exception as e:
+        return jsonify({
+            "enabled": True,
+            "connected": False,
+            "error": str(e)
+        })
+
+
 if __name__ == '__main__':
     print("=" * 60)
     print("RAG API 服务启动")
@@ -482,6 +611,11 @@ if __name__ == '__main__':
     print("  POST /clear/<id>    - 清空历史")
     print("  GET  /stats         - 统计信息")
     print("  GET  /health        - 健康检查")
+    print()
+    print("Graph RAG 接口:")
+    print("  POST /graph/search  - 图谱检索")
+    print("  POST /graph/build   - 重建图谱索引")
+    print("  GET  /graph/stats   - 图谱统计信息")
     print()
     print("Dify 集成:")
     print("  在 Dify HTTP 节点中使用: POST http://localhost:5001/search")

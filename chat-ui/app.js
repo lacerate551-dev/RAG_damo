@@ -8,7 +8,8 @@ let state = {
     mode: 'chat',  // 'chat' 或 'rag'
     sessions: [],
     messages: {},
-    pendingRequests: new Map()
+    pendingRequests: new Map(),
+    graphStats: null
 };
 
 // ===== DOM 元素 =====
@@ -22,7 +23,9 @@ const elements = {
     sendBtn: document.getElementById('sendBtn'),
     newSessionBtn: document.getElementById('newSessionBtn'),
     modeToggle: document.getElementById('modeToggle'),
-    modeLabel: document.getElementById('modeLabel')
+    modeLabel: document.getElementById('modeLabel'),
+    graphStats: document.getElementById('graphStats'),
+    graphTestBtn: document.getElementById('graphTestBtn')
 };
 
 // ===== API 调用 =====
@@ -97,13 +100,13 @@ function updateModeUI() {
     if (state.mode === 'chat') {
         elements.modeToggle.classList.remove('rag-mode');
         elements.modeToggle.classList.add('chat-mode');
-        elements.modeLabel.textContent = '普通聊天';
-        elements.modeLabel.title = '直接使用LLM回复，速度快';
+        elements.modeLabel.textContent = '智能聊天';
+        elements.modeLabel.title = '支持网络搜索，适合实时问题';
     } else {
         elements.modeToggle.classList.remove('chat-mode');
         elements.modeToggle.classList.add('rag-mode');
         elements.modeLabel.textContent = '知识库问答';
-        elements.modeLabel.title = '使用Agentic RAG检索知识库后回复';
+        elements.modeLabel.title = '知识库检索 + 网络搜索 + 图谱检索';
     }
 }
 
@@ -177,8 +180,9 @@ function renderMessages() {
         elements.chatMessages.innerHTML = `
             <div class="empty-state">
                 <h3>开始对话</h3>
-                <p>当前模式: ${state.mode === 'chat' ? '普通聊天' : '知识库问答'}</p>
-                <p class="mode-hint">${state.mode === 'chat' ? '直接LLM回复，速度快' : '检索知识库后回复'}</p>
+                <p>当前模式: ${state.mode === 'chat' ? '智能聊天' : '知识库问答'}</p>
+                <p class="mode-hint">${state.mode === 'chat' ? '支持网络搜索，适合天气、新闻等实时问题' : '知识库检索 + 网络搜索 + 图谱检索'}</p>
+                ${state.graphStats && state.graphStats.connected ? '<p class="graph-hint">图谱已连接，可测试多跳查询</p>' : ''}
             </div>
         `;
         return;
@@ -189,9 +193,12 @@ function renderMessages() {
             <div class="message-header">
                 ${msg.role === 'user' ? '用户' : '助手'}
                 ${msg.mode ? `<span class="mode-tag">${msg.mode === 'chat' ? '聊天' : '知识库'}</span>` : ''}
+                ${msg.webSearched ? '<span class="web-tag">网络搜索</span>' : ''}
+                ${msg.hasGraph ? '<span class="graph-tag">图谱</span>' : ''}
             </div>
             <div class="message-content">${escapeHtml(msg.content)}</div>
             ${msg.sources && msg.sources.length > 0 ? renderSources(msg.sources) : ''}
+            ${msg.entities && msg.entities.length > 0 ? renderEntities(msg.entities) : ''}
         </div>
     `).join('');
 
@@ -214,7 +221,18 @@ function renderSources(sources) {
     return `
         <div class="message-sources">
             <strong>来源:</strong>
-            ${sources.map(s => `<span>${escapeHtml(s.source)}</span>`).join(', ')}
+            ${sources.map(s => `<span>${escapeHtml(s.source || s.type || '未知')}</span>`).join(', ')}
+        </div>
+    `;
+}
+
+// 渲染实体
+function renderEntities(entities) {
+    if (!entities || entities.length === 0) return '';
+    return `
+        <div class="message-entities">
+            <strong>相关实体:</strong>
+            ${entities.map(e => `<span class="entity-tag">${escapeHtml(e)}</span>`).join(' ')}
         </div>
     `;
 }
@@ -325,7 +343,8 @@ async function handleSend() {
             role: 'assistant',
             content: data.answer,
             sources: data.sources,
-            mode: data.mode  // 记录回复模式
+            mode: data.mode,  // 记录回复模式
+            webSearched: data.web_searched  // 是否进行了网络搜索
         });
 
         // 刷新会话列表
@@ -395,6 +414,11 @@ elements.messageInput.addEventListener('keypress', (e) => {
 // 新建会话按钮
 elements.newSessionBtn.addEventListener('click', newSession);
 
+// 图谱测试按钮
+if (elements.graphTestBtn) {
+    elements.graphTestBtn.addEventListener('click', testGraphSearch);
+}
+
 // ===== 工具函数 =====
 
 function escapeHtml(text) {
@@ -441,8 +465,106 @@ async function init() {
     // 加载会话列表
     await fetchSessions();
 
+    // 加载图谱状态
+    await fetchGraphStats();
+
     // 聚焦输入框
     elements.messageInput.focus();
+}
+
+// ===== 图谱相关 =====
+
+// 获取图谱统计
+async function fetchGraphStats() {
+    try {
+        const data = await apiCall('/graph/stats');
+        state.graphStats = data;
+        renderGraphStats();
+    } catch (error) {
+        console.error('获取图谱状态失败:', error);
+        elements.graphStats.innerHTML = `
+            <span class="error">图谱未启用</span>
+            <p class="hint">启动Neo4j后可用</p>
+        `;
+    }
+}
+
+// 渲染图谱统计
+function renderGraphStats() {
+    if (!state.graphStats) {
+        elements.graphStats.innerHTML = '<span class="loading">加载中...</span>';
+        return;
+    }
+
+    if (!state.graphStats.enabled || !state.graphStats.connected) {
+        elements.graphStats.innerHTML = `
+            <span class="status-off">○ 未连接</span>
+            <p class="hint">启动Neo4j后可用</p>
+        `;
+        return;
+    }
+
+    const stats = state.graphStats;
+    let typesHtml = '';
+    if (stats.types) {
+        const topTypes = Object.entries(stats.types)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 4)
+            .map(([type, count]) => `<span class="type-tag">${type}: ${count}</span>`)
+            .join('');
+        typesHtml = `<div class="type-list">${topTypes}</div>`;
+    }
+
+    elements.graphStats.innerHTML = `
+        <span class="status-on">● 已连接</span>
+        <div class="stats-row">
+            <span>节点: <strong>${stats.nodes}</strong></span>
+            <span>关系: <strong>${stats.edges}</strong></span>
+        </div>
+        ${typesHtml}
+    `;
+}
+
+// 测试图谱检索
+async function testGraphSearch() {
+    const testQueries = [
+        "发生一级安全事件后应该向谁报告？",
+        "导出机密级数据需要哪些人审批？",
+        "新员工入职后谁来负责信息安全培训？"
+    ];
+
+    const query = testQueries[Math.floor(Math.random() * testQueries.length)];
+
+    // 添加用户消息
+    const sessionKey = state.currentSessionId || 'new';
+    if (!state.messages[sessionKey]) {
+        state.messages[sessionKey] = [];
+    }
+    state.messages[sessionKey].push({ role: 'user', content: query });
+    renderMessages();
+
+    // 发送请求
+    try {
+        const data = await apiCall('/graph/search', {
+            method: 'POST',
+            body: JSON.stringify({ query: query })
+        });
+
+        state.messages[sessionKey].push({
+            role: 'assistant',
+            content: data.answer || '无答案',
+            sources: data.sources,
+            entities: data.entities,
+            hasGraph: data.has_graph_context
+        });
+        renderMessages();
+    } catch (error) {
+        state.messages[sessionKey].push({
+            role: 'assistant',
+            content: `图谱检索失败: ${error.message}`
+        });
+        renderMessages();
+    }
 }
 
 // 页面加载完成后初始化

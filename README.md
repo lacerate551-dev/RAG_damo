@@ -1,20 +1,28 @@
 # RAG Demo - 本地知识库问答系统
 
-基于本地向量模型 + Chroma向量数据库 + Qwen API 的智能知识库问答系统，支持双模式对话和Agentic RAG。
+基于本地向量模型 + Chroma向量数据库 + Neo4j知识图谱 + Qwen API 的智能知识库问答系统，支持双模式对话、Agentic RAG 和 Graph RAG。
+
+> **最新版本**: v3.0.0 (Graph RAG 功能开发中，即将发布)
 
 ## 功能特性
 
-### v3.0.0 新特性
-- **双模式切换**：普通聊天(qwen3.5-flash) / 知识库问答(qwen3.5-plus)
+### 最新特性 (开发中)
+- **Graph RAG**：Neo4j 图数据库存储实体关系，多跳推理查询
+- **图谱检索**：向量检索 + 图谱检索融合
+- **智能聊天网络搜索**：Chat 模式支持实时天气、新闻查询
+
+### v3.0.0 特性
+- **双模式切换**：智能聊天(支持网络搜索) / 知识库问答(多源检索)
 - **会话管理**：SQLite 持久化，支持多用户多会话
 - **并发支持**：Flask threaded 模式，多用户同时请求
-- **前端界面**：会话列表、模式切换、加载状态显示
+- **前端界面**：会话列表、模式切换、图谱状态显示
 
 ### Agentic RAG 核心能力
 - **知识库检索**：向量检索 + BM25 + Rerank
-- **网络搜索**：知识库不足时自动搜索（可选，需配置 SERPER_API_KEY）
+- **网络搜索**：实时信息自动搜索（需配置 SERPER_API_KEY）
+- **图谱检索**：实体关系推理、多跳查询
 - **Agent 决策**：动态决定检索、改写、分解等操作
-- **多源融合**：智能处理知识库和网络内容
+- **多源融合**：智能处理知识库、网络、图谱内容
 
 ### 基础功能
 - 支持多种文档格式：PDF、Word(.docx)、Excel(.xlsx)、TXT
@@ -29,11 +37,7 @@
 RAG_damo/
 ├── models/                    # 模型目录（需下载）
 │   ├── bge-base-zh-v1.5/     # 向量模型（必需）
-│   │   ├── config.json
-│   │   ├── pytorch_model.bin
-│   │   ├── tokenizer.json
-│   │   └── vocab.txt
-│   └── bge-reranker-base/    # 重排序模型（首次运行自动下载）
+│   └── bge-reranker-base/    # 重排序模型（自动下载）
 ├── documents/                 # 文档目录
 ├── chroma_db/                 # 向量数据库（自动生成）
 ├── chat-ui/                   # 前端界面
@@ -43,13 +47,14 @@ RAG_damo/
 ├── docs/                      # 文档
 ├── rag_demo.py               # RAG基础功能
 ├── agentic_rag.py            # Agentic RAG 核心
+├── graph_rag.py              # Graph RAG 检索模块
+├── graph_manager.py          # Neo4j 图谱管理器
+├── entity_extractor.py       # 实体提取器
+├── graph_build.py            # 图谱构建脚本
 ├── rag_api_server.py         # REST API 服务
 ├── session_manager.py        # 会话管理器
-├── exam_manager.py           # Dify出题系统管理器
-├── run_exam.py               # 出题系统运行脚本
 ├── config.example.py         # 配置示例
 ├── requirements.txt          # Python依赖
-├── venv/                     # Python虚拟环境
 └── README.md
 ```
 
@@ -83,10 +88,9 @@ source venv/bin/activate
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-或手动安装：
-
+Graph RAG 额外依赖：
 ```bash
-pip install chromadb sentence-transformers openai python-docx pdfplumber openpyxl flask flask-cors rank_bm25 jieba requests transformers -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install neo4j -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 ### 4. 下载模型
@@ -98,55 +102,18 @@ pip install chromadb sentence-transformers openai python-docx pdfplumber openpyx
 | BGE-base-zh-v1.5 | 向量编码 | ~400MB | **必需** |
 | BGE-reranker-base | 结果重排序 | ~280MB | 可选（首次运行自动下载） |
 
-#### 4.1 下载向量模型（必需）
-
-创建模型目录并下载：
-
 ```bash
 # 创建模型目录
 mkdir models
 
-# 方法1：使用 huggingface-cli（推荐）
-pip install huggingface-hub
+# 下载向量模型
 huggingface-cli download BAAI/bge-base-zh-v1.5 --local-dir ./models/bge-base-zh-v1.5
-
-# 方法2：手动下载
-# 访问 https://huggingface.co/BAAI/bge-base-zh-v1.5
-# 下载所有文件到 ./models/bge-base-zh-v1.5/ 目录
-```
-
-下载完成后，目录结构应为：
-```
-models/bge-base-zh-v1.5/
-├── config.json
-├── pytorch_model.bin
-├── tokenizer.json
-├── tokenizer_config.json
-├── vocab.txt
-├── special_tokens_map.json
-└── ...
-```
-
-#### 4.2 重排序模型（可选）
-
-首次运行时会自动下载到 `./models/bge-reranker-base/`，无需手动操作。
-
-如需手动下载：
-```bash
-huggingface-cli download BAAI/bge-reranker-base --local-dir ./models/bge-reranker-base
-```
-
-如不需要重排序功能，可在 `rag_demo.py` 中禁用：
-```python
-USE_RERANK = False
 ```
 
 ### 5. 配置API密钥
 
 ```bash
-# 复制配置示例
 cp config.example.py config.py
-
 # 编辑 config.py，填入你的 API Key
 ```
 
@@ -158,13 +125,13 @@ DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DASHSCOPE_MODEL = "qwen3.5-plus"
 
 # Serper API（可选，用于网络搜索）
-# 注册地址: https://serper.dev/
 SERPER_API_KEY = "your-serper-api-key"
 
-# Dify工作流API配置（可选，用于智能出题）
-DIFY_API_URL = "https://api.dify.ai/v1"
-DIFY_QUESTION_API_KEY = "your-dify-question-api-key"
-DIFY_GRADE_API_KEY = "your-dify-grade-api-key"
+# Neo4j 图数据库配置（可选，用于 Graph RAG）
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_USER = "neo4j"
+NEO4J_PASSWORD = "password123"
+USE_GRAPH_RAG = True  # 是否启用图谱检索
 
 # 兼容旧变量名
 API_KEY = DASHSCOPE_API_KEY
@@ -172,35 +139,37 @@ BASE_URL = DASHSCOPE_BASE_URL
 MODEL = DASHSCOPE_MODEL
 ```
 
-> **说明**：
-> - `DASHSCOPE_API_KEY`：必需，用于大模型调用
-> - `SERPER_API_KEY`：可选，启用网络搜索功能
-> - `DIFY_*`：可选，用于 Dify 智能出题集成
-
-### 6. 准备知识库文档
-
-将文档放入 `documents/` 目录：
+### 6. 启动 Neo4j（可选，用于 Graph RAG）
 
 ```bash
-mkdir documents
-# 复制你的文档到 documents/ 目录
-# 支持 PDF、Word(.docx)、Excel(.xlsx)、TXT 格式
+# 使用 Docker 启动 Neo4j
+docker run -d \
+  --name neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/password123 \
+  -v neo4j_data:/data \
+  neo4j:latest
+
+# 访问 Neo4j Browser: http://localhost:7474
 ```
 
-### 7. 构建知识库
+### 7. 准备知识库文档
+
+将文档放入 `documents/` 目录，支持 PDF、Word(.docx)、Excel(.xlsx)、TXT 格式。
+
+### 8. 构建知识库
 
 ```bash
-# 首次构建或完全重建
+# 构建向量索引 + BM25索引
 python rag_demo.py --rebuild
 
-# 增量同步（添加新文档后）
-python rag_demo.py --sync
+# 构建知识图谱（需要 Neo4j）
+python graph_build.py
 ```
 
-### 8. 启动服务
+### 9. 启动服务
 
 ```bash
-# 启动 API 服务
 python rag_api_server.py
 ```
 
@@ -212,55 +181,39 @@ python rag_api_server.py
 
 ### 双模式对话
 
-| 模式 | 端点 | 模型 | 特点 |
-|------|------|------|------|
-| 普通聊天 | `/chat` | qwen3.5-flash | 快速响应，日常对话 |
-| 知识库问答 | `/rag` | qwen3.5-plus | 检索知识库，准确回答 |
+| 模式 | 端点 | 特点 |
+|------|------|------|
+| 智能聊天 | `/chat` | 支持网络搜索，适合实时问题（天气、新闻等） |
+| 知识库问答 | `/rag` | 知识库 + 网络 + 图谱多源检索，专业准确 |
 
 前端界面可点击按钮切换模式。
 
-### API 接口
-
-#### 发送消息
+### Graph RAG API
 
 ```bash
-# 普通聊天
-curl -X POST http://localhost:5001/chat \
+# 图谱检索
+curl -X POST http://localhost:5001/graph/search \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "user1", "session_id": null, "message": "你好"}'
+  -d '{"query": "信息技术部负责什么？", "top_k": 5, "depth": 2}'
 
-# 知识库问答
-curl -X POST http://localhost:5001/rag \
-  -H "Content-Type: application/json" \
-  -d '{"user_id": "user1", "session_id": null, "message": "请假流程是什么"}'
-```
+# 获取图谱统计
+curl http://localhost:5001/graph/stats
 
-#### 获取会话列表
-
-```bash
-curl "http://localhost:5001/sessions?user_id=user1"
-```
-
-#### 获取会话历史
-
-```bash
-curl "http://localhost:5001/history/{session_id}?user_id=user1"
-```
-
-#### 删除会话
-
-```bash
-curl -X DELETE "http://localhost:5001/session/{session_id}?user_id=user1"
+# 重建图谱索引
+curl -X POST http://localhost:5001/graph/build
 ```
 
 ### 命令行问答
 
 ```bash
-# 单次问答
-python rag_demo.py "请假流程是什么"
+# 知识库问答
+python agentic_rag.py "请假流程是什么"
 
 # 交互模式
 python agentic_rag.py
+
+# 测试 Graph RAG
+python graph_test.py
 ```
 
 交互模式命令：
@@ -270,127 +223,115 @@ python agentic_rag.py
 | `/quit` | 退出程序 |
 | `/kb 问题` | 仅知识库检索 |
 | `/web 问题` | 强制网络搜索 |
-| `/compare 问题` | 对比传统RAG和Agentic RAG |
-
-## 文档管理
-
-### 添加文档
-
-```bash
-# 1. 将文档放入 documents/ 目录
-# 2. 运行同步（同时更新向量库和BM25索引）
-python rag_demo.py --sync
-```
-
-### 删除文档
-
-```bash
-# 1. 从 documents/ 目录删除文件
-# 2. 运行同步（同时更新向量库和BM25索引）
-python rag_demo.py --sync
-```
-
-### 重建索引
-
-```bash
-# 完全重建（清空后重新构建向量库和BM25索引）
-python rag_demo.py --rebuild
-
-# 仅重建BM25索引（如果损坏或需要更新）
-python rag_demo.py --sync
-```
-
-> **说明**：`--sync` 会自动同步向量库（ChromaDB）和 BM25 索引，保持两者一致。
-
-## 常见问题
-
-### Q: 向量模型加载失败？
-
-确保 `models/bge-base-zh-v1.5/` 目录包含以下文件：
-- `config.json`
-- `pytorch_model.bin`
-- `tokenizer.json`
-- `vocab.txt`
-
-### Q: Rerank 模型下载慢或失败？
-
-Rerank 模型 (`BAAI/bge-reranker-base`) 会在首次运行时自动下载到 `models/bge-reranker-base/`。
-
-如果下载失败，可以：
-1. 使用代理或科学上网
-2. 手动下载：
-   ```bash
-   huggingface-cli download BAAI/bge-reranker-base --local-dir ./models/bge-reranker-base
-   ```
-3. 或在 `rag_demo.py` 中禁用 Rerank：
-   ```python
-   USE_RERANK = False  # 设置为 False
-   ```
-
-### Q: API 调用失败？
-
-1. 检查 `config.py` 是否正确配置 API Key
-2. 确认 API Key 有效且未过期
-3. 检查网络连接
-
-### Q: 知识库为空？
-
-```bash
-# 重新构建知识库
-python rag_demo.py --rebuild
-```
-
-### Q: 如何查看已索引的文档？
-
-```bash
-python rag_demo.py --list
-```
-
-### Q: 前端页面无法连接 API？
-
-1. 确认 API 服务已启动：`python rag_api_server.py`
-2. 检查端口 5001 是否被占用
-3. 确认浏览器访问 http://localhost:5001/health 返回正常
 
 ## 技术架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      前端 (chat-ui)                          │
-│              HTML + CSS + JavaScript                         │
-└─────────────────────────┬───────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    rag_api_server.py                         │
-│  ┌─────────────┐              ┌─────────────────────┐       │
-│  │  /chat      │              │     /rag            │       │
-│  │ 普通聊天     │              │   知识库问答         │       │
-│  │ qwen-flash  │              │   qwen-plus         │       │
-│  └─────────────┘              └──────────┬──────────┘       │
-│                                          │                  │
-└──────────────────────────────────────────┼──────────────────┘
-                                           │
-                          ▼                │
-┌─────────────────────────────────────────────────────────────┐
-│                    agentic_rag.py                            │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │ Agent决策   │  │ 知识库检索   │  │    网络搜索(可选)   │ │
-│  │ 检索/改写/  │  │ 向量+BM25+  │  │    Serper API       │ │
-│  │ 分解/回答   │  │ Rerank      │  │                     │ │
-│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    rag_demo.py                               │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │ 文档解析     │  │ BGE Embedding│  │     Chroma         │ │
-│  │ PDF/Word/   │  │  (本地模型)  │  │   向量数据库        │ │
-│  │ Excel/TXT   │  └─────────────┘  └─────────────────────┘ │
-│  └─────────────┘                                             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         前端 (chat-ui)                                   │
+│                 HTML + CSS + JavaScript                                  │
+│   ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────┐    │
+│   │ 智能聊天     │    │ 知识库问答   │    │     图谱状态显示         │    │
+│   │ +网络搜索    │    │ +图谱检索    │    │   节点/关系/类型         │    │
+│   └─────────────┘    └─────────────┘    └─────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       rag_api_server.py                                  │
+│   ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────┐    │
+│   │   /chat     │    │    /rag     │    │    /graph/search        │    │
+│   │ 智能聊天     │    │  知识库问答  │    │     图谱检索            │    │
+│   └──────┬──────┘    └──────┬──────┘    └───────────┬─────────────┘    │
+│          │                  │                       │                   │
+└──────────┼──────────────────┼───────────────────────┼───────────────────┘
+           │                  │                       │
+           ▼                  ▼                       ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Agentic RAG                                       │
+│   ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────┐    │
+│   │ Agent决策   │    │ 知识库检索   │    │     Graph RAG           │    │
+│   │ 检索/改写/  │    │ 向量+BM25+  │    │   实体提取 + 图谱查询    │    │
+│   │ 分解/回答   │    │ Rerank      │    │                         │    │
+│   └─────────────┘    └─────────────┘    └─────────────────────────┘    │
+│                                                                          │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │                      网络搜索 (Serper API)                       │   │
+│   │              实时信息：天气、新闻、股价等                         │   │
+│   └─────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          数据层                                          │
+│   ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────┐    │
+│   │  ChromaDB   │    │   BM25索引   │    │       Neo4j            │    │
+│   │  向量数据库  │    │  关键词检索  │    │     知识图谱           │    │
+│   └─────────────┘    └─────────────┘    └─────────────────────────┘    │
+│                                                                          │
+│   ┌─────────────┐    ┌─────────────┐                                    │
+│   │ 文档解析     │    │ BGE向量模型  │                                    │
+│   │ PDF/Word/   │    │  (本地运行)  │                                    │
+│   │ Excel/TXT   │    └─────────────┘                                    │
+│   └─────────────┘                                                        │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
+
+## Graph RAG 功能详解
+
+### 实体类型
+
+从企业制度文档中自动提取的实体类型：
+
+| 实体类型 | 示例 |
+|----------|------|
+| 部门 | 人力资源部、财务部、信息技术部 |
+| 制度 | 差旅管理办法、信息安全管理制度 |
+| 人员 | 员工、经理、审批人 |
+| 流程 | 报销流程、审批流程 |
+| 条件 | 享受条件、适用范围 |
+
+### 关系类型
+
+| 关系 | 示例 |
+|------|------|
+| 负责 | 人力资源部 → 负责 → 差旅管理办法 |
+| 适用 | 差旅管理办法 → 适用 → 员工 |
+| 包含 | 报销流程 → 包含 → 审批步骤 |
+| 审批 | 部门负责人 → 审批 → 报销申请 |
+
+### 多跳查询示例
+
+```
+Q: 发生一级安全事件后应该向谁报告？
+→ 图谱推理链：
+  一级安全事件 --属于--> 安全事件
+  安全事件 --报告--> 应急响应小组
+  应急响应小组 --由--> 安全部门负责
+→ A: 应向应急响应小组报告，由安全部门负责处理
+```
+
+## API 接口文档
+
+### 基础接口
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/chat` | POST | 智能聊天（支持网络搜索） |
+| `/rag` | POST | 知识库问答（多源检索） |
+| `/search` | POST | 混合检索（供 Dify 调用） |
+| `/sessions` | GET | 获取会话列表 |
+| `/history/<id>` | GET | 获取会话历史 |
+| `/session/<id>` | DELETE | 删除会话 |
+| `/health` | GET | 健康检查 |
+
+### Graph RAG 接口
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/graph/search` | POST | 图谱检索 |
+| `/graph/build` | POST | 重建图谱索引 |
+| `/graph/stats` | GET | 获取图谱统计 |
 
 ## 依赖库
 
@@ -399,6 +340,7 @@ python rag_demo.py --list
 | chromadb | 向量数据库 |
 | sentence-transformers | 向量模型 |
 | openai | 大模型API |
+| neo4j | 图数据库 |
 | pdfplumber | PDF解析 |
 | python-docx | Word解析 |
 | openpyxl | Excel解析 |
@@ -408,13 +350,38 @@ python rag_demo.py --list
 | jieba | 中文分词 |
 | requests | HTTP请求 |
 
+## 常见问题
+
+### Q: Neo4j 连接失败？
+
+1. 确认 Docker 已启动 Neo4j 容器
+2. 访问 http://localhost:7474 检查 Neo4j Browser
+3. 检查 config.py 中的 NEO4J_PASSWORD 是否正确
+
+### Q: Graph RAG 未启用？
+
+确保 config.py 中设置：
+```python
+USE_GRAPH_RAG = True
+```
+
+### Q: 网络搜索不工作？
+
+1. 确认 config.py 中配置了 SERPER_API_KEY
+2. 注册地址: https://serper.dev/
+
+### Q: 向量模型加载失败？
+
+确保 `models/bge-base-zh-v1.5/` 目录包含必要文件。
+
 ## 版本历史
 
 | 版本 | 更新内容 |
 |------|----------|
+| **Unreleased** | Graph RAG：Neo4j知识图谱、实体提取、多跳推理；智能聊天网络搜索 |
 | v3.0.0 | 双模式RAG系统：普通聊天/知识库问答，会话管理，前端界面 |
-| v2.1.0 | 添加Dify智能出题系统集成，支持自动出题和批阅 |
-| v1.1.0 | RAG幻觉问题优化（混合检索+Rerank+置信度） |
+| v2.1.0 | Dify智能出题系统集成 |
+| v1.1.0 | RAG幻觉优化：混合检索+Rerank+置信度 |
 | v1.0.0 | 初始版本：RAG本地知识库问答系统 |
 
 ## License

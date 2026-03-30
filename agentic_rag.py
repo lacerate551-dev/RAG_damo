@@ -4,8 +4,9 @@ Agentic RAG - 知识库智能问答系统
 核心能力：
 1. 知识库检索 - 向量检索 + BM25 + Rerank
 2. 网络搜索 - 当知识库不足时自动搜索（需配置SERPER_API_KEY）
-3. 多源融合 - 智能处理知识库和网络内容
-4. Agent决策 - 动态决定检索、改写、分解等操作
+3. 图谱检索 - 实体关系推理（需配置Neo4j）
+4. 多源融合 - 智能处理知识库和网络内容
+5. Agent决策 - 动态决定检索、改写、分解等操作
 
 使用方式：
     from agentic_rag import AgenticRAG
@@ -16,6 +17,7 @@ Agentic RAG - 知识库智能问答系统
 
 配置（可选）：
 - 在config.py中添加 SERPER_API_KEY 启用网络搜索
+- 在config.py中配置 Neo4j 启用图谱检索
 """
 
 import json
@@ -41,6 +43,18 @@ except ImportError:
     HAS_SERPER = False
     SERPER_API_KEY = None
 
+# 尝试导入 Graph RAG 组件
+try:
+    from config import USE_GRAPH_RAG
+except ImportError:
+    USE_GRAPH_RAG = False
+
+try:
+    from graph_rag import GraphRAG, should_use_graph
+    HAS_GRAPH_RAG = True
+except ImportError:
+    HAS_GRAPH_RAG = False
+
 
 class AgenticRAG:
     """
@@ -49,25 +63,49 @@ class AgenticRAG:
     支持能力：
     - 知识库检索：向量检索 + BM25 + Rerank
     - 网络搜索：知识库不足时自动搜索
+    - 图谱检索：实体关系推理
     - 多源融合：智能处理知识库和网络内容
     - Agent决策：动态决定检索、改写、分解等操作
     """
 
-    def __init__(self, max_iterations: int = 3, enable_web_search: bool = True):
+    def __init__(
+        self,
+        max_iterations: int = 3,
+        enable_web_search: bool = True,
+        enable_graph: bool = True
+    ):
         """
         初始化
 
         Args:
             max_iterations: 最大迭代次数
             enable_web_search: 是否启用网络搜索
+            enable_graph: 是否启用图谱检索
         """
         self.max_iterations = max_iterations
         self.enable_web_search = enable_web_search and HAS_SERPER
+        self.enable_graph = enable_graph and HAS_GRAPH_RAG and USE_GRAPH_RAG
         self.client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+
+        # 初始化图谱检索
+        self.graph_rag = None
+        if self.enable_graph:
+            try:
+                self.graph_rag = GraphRAG()
+                if self.graph_rag.graph_manager and self.graph_rag.graph_manager.connected:
+                    print("✓ Graph RAG 已启用")
+                else:
+                    self.graph_rag = None
+                    self.enable_graph = False
+            except Exception as e:
+                print(f"✗ Graph RAG 初始化失败: {e}")
+                self.graph_rag = None
+                self.enable_graph = False
 
         # 信息来源标记
         self.SOURCE_KB = "知识库"
         self.SOURCE_WEB = "网络搜索"
+        self.SOURCE_GRAPH = "知识图谱"
 
     def process(self, query: str, verbose: bool = True, history: list = None) -> dict:
         """
@@ -181,6 +219,24 @@ class AgenticRAG:
                 if verbose:
                     print(f"   找到 {len(web_results)} 条结果")
 
+            elif decision["action"] == "graph_search":
+                # 图谱检索
+                if not self.enable_graph:
+                    if verbose:
+                        print("[提示] 图谱检索未启用，使用知识库检索")
+                    decision["action"] = "kb_search"
+                    continue
+
+                if verbose:
+                    print(f"[图谱检索] {current_query}")
+
+                graph_results = self._graph_search(current_query, verbose)
+                for result in graph_results:
+                    all_contexts.append(result)
+
+                if verbose and graph_results:
+                    print(f"   找到 {len(graph_results)} 条结果")
+
             elif decision["action"] == "rewrite":
                 current_query = decision.get("new_query", current_query)
                 if verbose:
@@ -225,6 +281,11 @@ class AgenticRAG:
                 source_str = meta.get('source', '未知')
                 if 'page' in meta:
                     source_str += f" 第{meta['page']}页"
+            elif source_type == self.SOURCE_GRAPH:
+                source_str = "知识图谱"
+                entities = c.get('entities', [])
+                if entities:
+                    source_str += f" (实体: {', '.join(entities[:3])})"
             else:
                 source_str = meta.get('title', meta.get('source', '未知'))
 
@@ -243,6 +304,7 @@ class AgenticRAG:
         决策类型：
         - kb_search: 检索知识库
         - web_search: 网络搜索
+        - graph_search: 图谱检索（实体关系推理）
         - answer: 生成答案
         - rewrite: 改写查询
         - decompose: 分解问题
@@ -250,17 +312,24 @@ class AgenticRAG:
         # 分析现有信息
         kb_count = sum(1 for c in contexts if c.get('source_type') == self.SOURCE_KB)
         web_count = sum(1 for c in contexts if c.get('source_type') == self.SOURCE_WEB)
+        graph_count = sum(1 for c in contexts if c.get('source_type') == self.SOURCE_GRAPH)
+
+        # 判断是否需要图谱检索
+        need_graph = self._need_graph_search(current_query, contexts)
 
         # 构建上下文摘要
         context_summary = ""
         if contexts:
             kb_docs = [c['doc'][:200] for c in contexts if c.get('source_type') == self.SOURCE_KB][:2]
             web_docs = [c['doc'][:200] for c in contexts if c.get('source_type') == self.SOURCE_WEB][:2]
+            graph_docs = [c['doc'][:200] for c in contexts if c.get('source_type') == self.SOURCE_GRAPH][:2]
 
             if kb_docs:
                 context_summary += f"\n[知识库内容({kb_count}条)]\n" + "\n".join(f"- {d}..." for d in kb_docs)
             if web_docs:
                 context_summary += f"\n[网络内容({web_count}条)]\n" + "\n".join(f"- {d}..." for d in web_docs)
+            if graph_docs:
+                context_summary += f"\n[图谱内容({graph_count}条)]\n" + "\n".join(f"- {d}..." for d in graph_docs)
 
         prompt = f"""你是一个智能信息检索助手。请分析问题并决定下一步行动。
 
@@ -274,7 +343,7 @@ class AgenticRAG:
 {context_summary if context_summary else "暂无"}
 
 【迭代历史】
-已进行 {len(history)} 轮，已检索知识库 {kb_count} 条，网络 {web_count} 条
+已进行 {len(history)} 轮，已检索知识库 {kb_count} 条，网络 {web_count} 条，图谱 {graph_count} 条
 
 【决策选项】
 
@@ -286,20 +355,25 @@ class AgenticRAG:
    - 适用：知识库信息不足、需要最新信息、需要更权威的来源
    - 输出: {{"action": "web_search", "search_query": "搜索词", "reason": "为什么需要网络搜索"}}
 
-3. **answer** - 生成答案
+3. **graph_search** - 图谱检索
+   - 适用：涉及实体关系、多跳推理、如"XX部门负责什么"、"XX流程包含哪些步骤"
+   - 输出: {{"action": "graph_search", "reason": "为什么需要图谱检索"}}
+
+4. **answer** - 生成答案
    - 适用：信息足够回答问题
    - 输出: {{"action": "answer", "reason": "信息已足够"}}
 
-4. **rewrite** - 改写查询
+5. **rewrite** - 改写查询
    - 适用：查询词不准确、检索结果差
    - 输出: {{"action": "rewrite", "new_query": "改写后的查询", "reason": "为什么改写"}}
 
-5. **decompose** - 分解问题
+6. **decompose** - 分解问题
    - 适用：问题包含多个子问题
    - 输出: {{"action": "decompose", "sub_queries": ["子问题1", "子问题2"], "reason": "为什么分解"}}
 
 【决策原则】
 - 首轮优先检索知识库（kb_search）
+- 涉及部门职责、流程步骤、制度关系等问题，优先图谱检索（graph_search）
 - 如果知识库信息明显过时或不完整，考虑 web_search
 - 网络搜索的查询词应简洁、专业
 - 避免重复检索相同内容
@@ -325,7 +399,7 @@ class AgenticRAG:
 
             decision = json.loads(content.strip())
 
-            valid_actions = ["answer", "kb_search", "web_search", "rewrite", "decompose"]
+            valid_actions = ["answer", "kb_search", "web_search", "graph_search", "rewrite", "decompose"]
             if decision.get("action") not in valid_actions:
                 decision = {"action": "kb_search", "reason": "默认检索知识库"}
 
@@ -333,6 +407,74 @@ class AgenticRAG:
 
         except Exception as e:
             return {"action": "kb_search", "reason": f"决策解析失败: {str(e)}"}
+
+    def _need_graph_search(self, query: str, contexts: list) -> bool:
+        """
+        判断是否需要图谱检索
+
+        Args:
+            query: 用户查询
+            contexts: 已有上下文
+
+        Returns:
+            是否需要图谱检索
+        """
+        if not self.enable_graph or not self.graph_rag:
+            return False
+
+        # 使用图谱检索的场景关键词
+        graph_keywords = [
+            "负责", "管理", "属于", "包含", "相关",
+            "哪个部门", "谁负责", "什么流程", "什么条件",
+            "审批", "适用", "限额", "标准", "规定",
+            "关系", "关联", "流程是什么", "步骤"
+        ]
+
+        query_lower = query.lower()
+        return any(kw in query_lower for kw in graph_keywords)
+
+    def _graph_search(self, query: str, verbose: bool = True) -> list:
+        """
+        执行图谱检索
+
+        Args:
+            query: 用户查询
+            verbose: 是否打印详细过程
+
+        Returns:
+            检索结果列表
+        """
+        if not self.graph_rag:
+            return []
+
+        try:
+            result = self.graph_rag.search(query, top_k=3, verbose=verbose)
+
+            contexts = []
+            if result.graph_context:
+                contexts.append({
+                    'doc': result.graph_context,
+                    'meta': {'source': '知识图谱', 'type': 'graph'},
+                    'source_type': self.SOURCE_GRAPH,
+                    'query': query,
+                    'entities': result.entities
+                })
+
+            # 同时添加向量检索的结果
+            for ctx in result.vector_contexts[:3]:
+                contexts.append({
+                    'doc': ctx['content'],
+                    'meta': ctx['metadata'],
+                    'source_type': self.SOURCE_KB,
+                    'query': query
+                })
+
+            return contexts
+
+        except Exception as e:
+            if verbose:
+                print(f"图谱检索失败: {e}")
+            return []
 
     def _web_search(self, query: str, top_k: int = 5) -> list:
         """
@@ -473,6 +615,122 @@ class AgenticRAG:
             if 'page' in meta:
                 source_parts.append(f"第{meta['page']}页")
             return " ".join(source_parts)
+
+    def chat_search(
+        self,
+        query: str,
+        history: list = None,
+        enable_web_search: bool = True,
+        verbose: bool = False
+    ) -> dict:
+        """
+        聊天搜索 - 适用于需要实时信息的对话
+
+        不使用知识库，但可以网络搜索
+
+        Args:
+            query: 用户问题
+            history: 对话历史
+            enable_web_search: 是否启用网络搜索
+            verbose: 是否打印详细过程
+
+        Returns:
+            {"answer": 回答, "sources": 来源列表}
+        """
+        contexts = []
+
+        # 判断是否需要网络搜索
+        need_web = enable_web_search and self.enable_web_search and self._should_web_search(query)
+
+        if need_web:
+            if verbose:
+                print(f"[网络搜索] {query}")
+
+            web_results = self._web_search(query)
+            for result in web_results:
+                contexts.append({
+                    'doc': result['snippet'],
+                    'meta': {
+                        'source': result['link'],
+                        'title': result['title'],
+                        'date': result.get('date', '')
+                    },
+                    'source_type': self.SOURCE_WEB,
+                    'query': query
+                })
+
+            if verbose:
+                print(f"   找到 {len(web_results)} 条结果")
+
+        # 生成回答
+        if contexts:
+            answer = self._generate_fused_answer(query, contexts)
+        else:
+            # 没有网络搜索结果，直接用 LLM 回答
+            answer = self._direct_answer(query, history)
+
+        sources = self._extract_sources(contexts)
+        return {
+            "answer": answer,
+            "sources": sources,
+            "web_searched": need_web
+        }
+
+    def _should_web_search(self, query: str) -> bool:
+        """
+        判断是否需要网络搜索
+
+        Args:
+            query: 用户查询
+
+        Returns:
+            是否需要网络搜索
+        """
+        # 需要实时信息的场景
+        realtime_keywords = [
+            "今天", "最新", "今日", "当前", "现在",
+            "天气", "新闻", "股价", "行情", "汇率",
+            "最近", "近期", "这周", "本月", "今年",
+            "实时", "动态", "热点", "发生"
+        ]
+
+        query_lower = query.lower()
+        return any(kw in query_lower for kw in realtime_keywords)
+
+    def _direct_answer(self, query: str, history: list = None) -> str:
+        """
+        直接 LLM 回答（无检索）
+
+        Args:
+            query: 用户问题
+            history: 对话历史
+
+        Returns:
+            回答内容
+        """
+        messages = [
+            {"role": "system", "content": "你是一个友好、专业的智能助手。回答简洁明了，不超过200字。"}
+        ]
+
+        if history:
+            for msg in history[-6:]:
+                messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+
+        messages.append({"role": "user", "content": query})
+
+        try:
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                temperature=0.8,
+                max_tokens=500
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            return f"抱歉，回答时出现错误: {str(e)}"
 
     def chat(self):
         """交互模式"""
