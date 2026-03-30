@@ -858,24 +858,69 @@ def split_text(text, chunk_size=300, overlap=50):
 
 def build_knowledge_base(force=False):
     """构建知识库（向量索引 + BM25索引）"""
+    global chroma_client, collection
+
     print("\n" + "=" * 50)
     print("构建知识库")
     print("=" * 50)
 
-    # 检查是否已有数据
-    existing_count = collection.count()
-    if existing_count > 0:
-        print(f"\n知识库已有 {existing_count} 条记录")
-        if not force:
-            print("保持现有知识库 (使用 --rebuild 参数强制重建)")
-            return
-        # 清空现有数据
-        ids = collection.get()['ids']
-        if ids:
-            collection.delete(ids=ids)
-            print("已清空原有数据")
+    # 强制重建模式：清空并重建
+    if force:
+        print("\n[强制重建模式]")
         # 清空BM25索引
         bm25_index.clear()
+
+        # 尝试清空 collection 数据
+        try:
+            # 获取所有 ID 并删除
+            results = collection.get()
+            if results['ids']:
+                collection.delete(ids=results['ids'])
+                print(f"已清空原有数据: {len(results['ids'])} 条记录")
+            else:
+                print("数据库为空，开始构建")
+        except Exception as e:
+            # 如果出错，尝试删除并重建整个数据库目录
+            print(f"清空数据失败，尝试重建数据库目录: {e}")
+            import shutil
+            import gc
+            import time
+
+            # 关闭连接
+            try:
+                del collection
+                del chroma_client
+            except:
+                pass
+            collection = None
+            chroma_client = None
+            gc.collect()
+            time.sleep(2)
+
+            # 删除目录
+            if os.path.exists(CHROMA_DB_PATH):
+                shutil.rmtree(CHROMA_DB_PATH)
+                print(f"已删除旧数据库: {CHROMA_DB_PATH}")
+
+            # 重新创建
+            chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+            collection = chroma_client.get_or_create_collection(
+                name="knowledge_base",
+                metadata={"description": "RAG Demo 知识库"}
+            )
+            print("已创建新数据库")
+    else:
+        # 检查是否已有数据
+        try:
+            existing_count = collection.count()
+            if existing_count > 0:
+                print(f"\n知识库已有 {existing_count} 条记录")
+                print("保持现有知识库 (使用 --rebuild 参数强制重建)")
+                return
+        except Exception as e:
+            print(f"\n数据库可能已损坏，将重建: {e}")
+            # 递归调用，强制重建
+            return build_knowledge_base(force=True)
 
     # 加载文档
     print("\n加载文档...")
@@ -1060,6 +1105,7 @@ def build_knowledge_base(force=False):
         print(f"      BM25索引构建完成: {len(all_docs)} 个文档")
 
     print(f"\n知识库构建完成，共 {total_chunks} 个片段")
+    print("\n提示: 图谱构建请运行 'python graph_build.py --help'")
 
 
 # ========== 检索函数 ==========
