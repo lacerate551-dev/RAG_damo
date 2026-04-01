@@ -384,6 +384,14 @@ USE_GRAPH_RAG = True
 | v1.1.0 | RAG幻觉优化：混合检索+Rerank+置信度 |
 | v1.0.0 | 初始版本：RAG本地知识库问答系统 |
 
+## 文档
+
+- [开发文档](docs/开发文档.md) - API 接口、Dify 集成、部署指南
+- [Graph RAG 使用指南](docs/Graph_RAG使用指南.md) - 知识图谱功能详解
+- [Agentic RAG 完整指南](docs/Agentic_RAG完整指南.md) - Agent 决策机制
+- [会话管理 API 文档](docs/会话管理API文档.md) - 会话系统说明
+- [Dify 快速入门指南](docs/Dify快速入门指南.md) - Dify 工作流集成
+
 ## License
 
 MIT

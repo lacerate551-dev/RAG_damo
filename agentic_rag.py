@@ -107,7 +107,7 @@ class AgenticRAG:
         self.SOURCE_WEB = "网络搜索"
         self.SOURCE_GRAPH = "知识图谱"
 
-    def process(self, query: str, verbose: bool = True, history: list = None) -> dict:
+    def process(self, query: str, verbose: bool = True, history: list = None, log_callback=None) -> dict:
         """
         主处理流程
 
@@ -115,6 +115,7 @@ class AgenticRAG:
             query: 用户问题
             verbose: 是否打印详细过程
             history: 对话历史 [{"role": "user/assistant", "content": "..."}]
+            log_callback: 日志回调函数，用于实时推送思考过程
 
         Returns:
             {
@@ -122,9 +123,27 @@ class AgenticRAG:
                 "iterations": 迭代次数,
                 "reasoning": 推理过程,
                 "contexts": 检索到的上下文,
-                "sources": 来源列表
+                "sources": 来源列表,
+                "log_trace": 完整日志记录
             }
         """
+        import time
+        start_time = time.time()
+        log_trace = []  # 完整日志记录
+
+        def emit_log(event_type, data):
+            """发送日志事件"""
+            log_entry = {
+                "type": event_type,
+                "timestamp": time.time() - start_time,
+                **data
+            }
+            log_trace.append(log_entry)
+            if log_callback:
+                log_callback(log_entry)
+
+        emit_log("start", {"query": query})
+
         if verbose:
             print("\n" + "=" * 60)
             print(f"[用户] {query}")
@@ -141,12 +160,22 @@ class AgenticRAG:
 
         while iteration < self.max_iterations:
             iteration += 1
+            iter_start = time.time()
 
             if verbose:
                 print(f"\n--- 第 {iteration} 轮迭代 ---")
 
             # Agent决策
+            think_start = time.time()
             decision = self._think(query, current_query, all_contexts, reasoning_trace)
+            think_duration = (time.time() - think_start) * 1000
+
+            emit_log("decision", {
+                "iteration": iteration,
+                "action": decision['action'],
+                "reason": decision.get('reason', ''),
+                "duration_ms": round(think_duration, 0)
+            })
 
             reasoning_trace.append({
                 "iteration": iteration,
@@ -162,18 +191,28 @@ class AgenticRAG:
             # 执行决策
             if decision["action"] == "answer":
                 # 生成答案
+                answer_start = time.time()
                 answer = self._generate_fused_answer(query, all_contexts)
+                answer_duration = (time.time() - answer_start) * 1000
+
+                emit_log("answer", {
+                    "duration_ms": round(answer_duration, 0),
+                    "total_duration_ms": round((time.time() - start_time) * 1000, 0)
+                })
+
                 sources = self._extract_sources(all_contexts)
                 return {
                     "answer": answer,
                     "iterations": iteration,
                     "reasoning": reasoning_trace,
                     "contexts": all_contexts,
-                    "sources": sources
+                    "sources": sources,
+                    "log_trace": log_trace
                 }
 
             elif decision["action"] == "kb_search":
                 # 知识库检索
+                search_start = time.time()
                 if verbose:
                     print(f"[知识库检索] {current_query}")
 
@@ -189,6 +228,18 @@ class AgenticRAG:
                         'query': current_query
                     })
 
+                search_duration = (time.time() - search_start) * 1000
+                emit_log("retrieve", {
+                    "source": "知识库",
+                    "query": current_query,
+                    "count": len(docs),
+                    "duration_ms": round(search_duration, 0),
+                    "snippets": [
+                        {"source": m.get('source', '未知'), "page": m.get('page'), "text": d[:100] + "..."}
+                        for d, m in zip(docs[:3], metas[:3])
+                    ]
+                })
+
                 if verbose:
                     print(f"   找到 {len(docs)} 个片段")
 
@@ -197,9 +248,11 @@ class AgenticRAG:
                 if not self.enable_web_search:
                     if verbose:
                         print("[警告] 网络搜索未配置，跳过")
+                    emit_log("warning", {"message": "网络搜索未配置"})
                     continue
 
                 search_query = decision.get('search_query', current_query)
+                search_start = time.time()
                 if verbose:
                     print(f"[网络搜索] {search_query}")
 
@@ -216,6 +269,18 @@ class AgenticRAG:
                         'query': search_query
                     })
 
+                search_duration = (time.time() - search_start) * 1000
+                emit_log("retrieve", {
+                    "source": "网络搜索",
+                    "query": search_query,
+                    "count": len(web_results),
+                    "duration_ms": round(search_duration, 0),
+                    "snippets": [
+                        {"title": r.get('title', ''), "source": r.get('link', ''), "text": r.get('snippet', '')[:100] + "..."}
+                        for r in web_results[:3]
+                    ]
+                })
+
                 if verbose:
                     print(f"   找到 {len(web_results)} 条结果")
 
@@ -224,26 +289,43 @@ class AgenticRAG:
                 if not self.enable_graph:
                     if verbose:
                         print("[提示] 图谱检索未启用，使用知识库检索")
+                    emit_log("warning", {"message": "图谱检索未启用"})
                     decision["action"] = "kb_search"
                     continue
 
                 if verbose:
                     print(f"[图谱检索] {current_query}")
 
+                search_start = time.time()
                 graph_results = self._graph_search(current_query, verbose)
                 for result in graph_results:
                     all_contexts.append(result)
+
+                search_duration = (time.time() - search_start) * 1000
+                emit_log("retrieve", {
+                    "source": "知识图谱",
+                    "query": current_query,
+                    "count": len(graph_results),
+                    "duration_ms": round(search_duration, 0),
+                    "snippets": [
+                        {"text": r.get('doc', '')[:100] + "..."}
+                        for r in graph_results[:3]
+                    ]
+                })
 
                 if verbose and graph_results:
                     print(f"   找到 {len(graph_results)} 条结果")
 
             elif decision["action"] == "rewrite":
+                old_query = current_query
                 current_query = decision.get("new_query", current_query)
+                emit_log("rewrite", {"old_query": old_query, "new_query": current_query})
                 if verbose:
                     print(f"[改写查询] {current_query}")
 
             elif decision["action"] == "decompose":
                 sub_queries = decision.get("sub_queries", [])
+                emit_log("decompose", {"sub_queries": sub_queries})
                 if verbose:
                     print(f"[分解问题] {len(sub_queries)} 个子问题")
 
@@ -260,40 +342,74 @@ class AgenticRAG:
                         })
 
         # 达到迭代上限
+        emit_log("max_iterations", {"iterations": iteration})
         answer = self._generate_fused_answer(query, all_contexts)
         sources = self._extract_sources(all_contexts)
+
+        emit_log("complete", {
+            "total_duration_ms": round((time.time() - start_time) * 1000, 0)
+        })
+
         return {
             "answer": answer,
             "iterations": iteration,
             "reasoning": reasoning_trace,
             "contexts": all_contexts,
-            "sources": sources
+            "sources": sources,
+            "log_trace": log_trace
         }
 
     def _extract_sources(self, contexts: list) -> list:
-        """提取来源列表"""
-        sources = []
+        """提取来源列表，合并同一来源"""
+        # 按来源分组
+        source_map = {}  # {source_key: {"source": str, "type": str, "count": int, "pages": list}}
+
         for c in contexts:
             meta = c.get('meta', {})
             source_type = c.get('source_type', '未知')
 
             if source_type == self.SOURCE_KB:
-                source_str = meta.get('source', '未知')
-                if 'page' in meta:
-                    source_str += f" 第{meta['page']}页"
+                source_key = meta.get('source', '未知')
+                page = meta.get('page')
             elif source_type == self.SOURCE_GRAPH:
-                source_str = "知识图谱"
                 entities = c.get('entities', [])
+                source_key = "知识图谱"
                 if entities:
-                    source_str += f" (实体: {', '.join(entities[:3])})"
+                    source_key += f" ({', '.join(entities[:3])})"
+                page = None
             else:
-                source_str = meta.get('title', meta.get('source', '未知'))
+                source_key = meta.get('title', meta.get('source', '未知'))
+                page = None
+
+            # 合并同一来源
+            if source_key not in source_map:
+                source_map[source_key] = {
+                    "source": source_key,
+                    "type": source_type,
+                    "count": 0,
+                    "pages": []
+                }
+
+            source_map[source_key]["count"] += 1
+            if page:
+                if page not in source_map[source_key]["pages"]:
+                    source_map[source_key]["pages"].append(page)
+
+        # 构建结果列表
+        sources = []
+        for key, info in source_map.items():
+            source_str = info["source"]
+            # 如果有页码信息，添加到来源名称
+            if info["pages"]:
+                pages_str = ", ".join(f"第{p}页" for p in sorted(info["pages"]))
+                source_str = f"{source_str} ({pages_str})"
 
             sources.append({
                 "source": source_str,
-                "type": source_type,
-                "snippet": c.get('doc', '')[:100] + "..." if len(c.get('doc', '')) > 100 else c.get('doc', '')
+                "type": info["type"],
+                "count": info["count"]  # 添加引用次数
             })
+
         return sources
 
     def _think(self, original_query: str, current_query: str,
@@ -577,9 +693,11 @@ class AgenticRAG:
    - 知识库文档可能过时，标注其时间信息
    - 网络信息通常更新，但需验证权威性
 
-4. **来源标注**
+4. **来源标注（重要）**
    - 每个关键信息必须标注来源
-   - 格式：[知识库-文件名-页码] 或 [网络-标题]
+   - **知识库来源格式**：[文件名 第X页] 或 [文件名]（无页码时）
+   - **网络来源格式**：[网站名称] 或 [文章标题]
+   - 示例："根据《管理制度汇编》第5页的规定..."、"百度百科显示..."
 
 【回答格式】
 

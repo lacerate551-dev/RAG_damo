@@ -1,5 +1,7 @@
 // ===== 配置 =====
 const API_BASE = 'http://localhost:5001';
+const LOG_STORAGE_KEY = 'rag_chat_logs';
+const MAX_LOGS = 1000;  // 最大日志条数限制
 
 // ===== 状态管理 =====
 let state = {
@@ -9,7 +11,8 @@ let state = {
     sessions: [],
     messages: {},
     pendingRequests: new Map(),
-    graphStats: null
+    graphStats: null,
+    logs: []  // 所有会话的日志，按时间顺序累积
 };
 
 // ===== DOM 元素 =====
@@ -25,7 +28,12 @@ const elements = {
     modeToggle: document.getElementById('modeToggle'),
     modeLabel: document.getElementById('modeLabel'),
     graphStats: document.getElementById('graphStats'),
-    graphTestBtn: document.getElementById('graphTestBtn')
+    graphTestBtn: document.getElementById('graphTestBtn'),
+    // 日志面板元素
+    logPanel: document.getElementById('logPanel'),
+    logPanelContent: document.getElementById('logPanelContent'),
+    clearLogBtn: document.getElementById('clearLogBtn'),
+    toggleLogPanelBtn: document.getElementById('toggleLogPanelBtn')
 };
 
 // ===== API 调用 =====
@@ -50,21 +58,327 @@ async function apiCall(endpoint, options = {}) {
     }
 }
 
-// 发送消息
-async function sendMessage(message, targetSessionId) {
-    // 根据模式选择接口
-    const endpoint = state.mode === 'chat' ? '/chat' : '/rag';
+// ===== 日志持久化 =====
 
-    const data = await apiCall(endpoint, {
-        method: 'POST',
-        body: JSON.stringify({
-            user_id: state.currentUserId,
-            session_id: targetSessionId,
-            message: message
-        })
+// 从 localStorage 加载日志
+function loadLogs() {
+    try {
+        const saved = localStorage.getItem(LOG_STORAGE_KEY);
+        if (saved) {
+            const parsed = JSON.parse(saved);
+            // 校验数据格式
+            if (Array.isArray(parsed)) {
+                state.logs = parsed;
+                console.log(`已加载 ${state.logs.length} 条历史日志`);
+            } else {
+                console.warn('日志数据格式异常，已重置');
+                state.logs = [];
+            }
+        }
+    } catch (e) {
+        console.error('加载日志失败:', e);
+        state.logs = [];
+    }
+}
+
+// 保存日志到 localStorage
+function saveLogs() {
+    try {
+        // 限制最大条数，防止存储过大
+        if (state.logs.length > MAX_LOGS) {
+            state.logs = state.logs.slice(-MAX_LOGS);
+        }
+        localStorage.setItem(LOG_STORAGE_KEY, JSON.stringify(state.logs));
+    } catch (e) {
+        console.error('保存日志失败:', e);
+    }
+}
+
+// 获取会话标签
+function getSessionLabel(sessionId) {
+    if (!sessionId || sessionId === 'new') return '新会话';
+    return sessionId.substring(0, 8);
+}
+
+// 发送消息 - RAG模式使用SSE流式
+async function sendMessage(message, targetSessionId) {
+    // 普通聊天模式使用普通API
+    if (state.mode === 'chat') {
+        const data = await apiCall('/chat', {
+            method: 'POST',
+            body: JSON.stringify({
+                user_id: state.currentUserId,
+                session_id: targetSessionId,
+                message: message
+            })
+        });
+        return data;
+    }
+
+    // RAG模式使用SSE流式API
+    return new Promise((resolve, reject) => {
+        const eventSource = new EventSource(
+            `${API_BASE}/rag/stream`,
+            { withCredentials: false }
+        );
+
+        // 由于EventSource不支持POST，我们需要用fetch
+        fetch(`${API_BASE}/rag/stream`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                user_id: state.currentUserId,
+                session_id: targetSessionId,
+                message: message
+            })
+        }).then(response => {
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let result = null;
+
+            function readStream() {
+                reader.read().then(({ done, value }) => {
+                    if (done) {
+                        if (result) {
+                            resolve(result);
+                        } else {
+                            reject(new Error('流式响应未完成'));
+                        }
+                        return;
+                    }
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            try {
+                                const data = JSON.parse(line.slice(6));
+                                handleStreamEvent(data);
+
+                                if (data.type === 'result') {
+                                    result = {
+                                        session_id: data.session_id,
+                                        answer: data.answer,
+                                        mode: data.mode,
+                                        sources: data.sources,
+                                        log_trace: data.log_trace
+                                    };
+                                }
+                            } catch (e) {
+                                console.error('解析SSE数据失败:', e);
+                            }
+                        }
+                    }
+
+                    readStream();
+                }).catch(reject);
+            }
+
+            readStream();
+        }).catch(reject);
+    });
+}
+
+// 处理流式事件
+function handleStreamEvent(event) {
+    const logContent = elements.logPanelContent;
+
+    // 移除空状态提示
+    const emptyState = logContent.querySelector('.log-empty');
+    if (emptyState) {
+        emptyState.remove();
+    }
+
+    // 添加会话ID和唯一ID到事件
+    event.session_id = event.session_id || state.currentSessionId || 'new';
+    event.id = `log-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    // 存储到状态和localStorage
+    state.logs.push(event);
+    saveLogs();
+
+    // 创建日志条目
+    const logEntry = createLogEntry(event);
+    if (logEntry) {
+        logContent.appendChild(logEntry);
+        // 自动滚动到底部
+        logContent.scrollTop = logContent.scrollHeight;
+    }
+}
+
+// 创建日志条目DOM元素
+function createLogEntry(event) {
+    const logEntry = document.createElement('div');
+    logEntry.className = `log-entry log-${event.type}`;
+    logEntry.id = event.id;
+
+    const timeStr = event.timestamp ? `${event.timestamp.toFixed(2)}s` : '';
+    const sessionLabel = getSessionLabel(event.session_id);
+
+    switch (event.type) {
+        case 'start':
+            logEntry.innerHTML = `
+                <div class="log-header">
+                    <span class="log-session">[${sessionLabel}]</span>
+                    <span class="log-type">开始</span>
+                    <span class="log-time">${timeStr}</span>
+                </div>
+                <div class="log-content">开始处理查询...</div>
+            `;
+            break;
+
+        case 'decision':
+            logEntry.innerHTML = `
+                <div class="log-header">
+                    <span class="log-session">[${sessionLabel}]</span>
+                    <span class="log-type">决策</span>
+                    <span class="log-time">${timeStr}</span>
+                </div>
+                <div class="log-content">${escapeHtml(event.reason || event.action || '分析中...')}</div>
+                ${event.action ? `<div class="log-detail"><span class="log-detail-item"><strong>动作:</strong> ${event.action}</span></div>` : ''}
+            `;
+            break;
+
+        case 'rewrite':
+            logEntry.innerHTML = `
+                <div class="log-header">
+                    <span class="log-session">[${sessionLabel}]</span>
+                    <span class="log-type">改写</span>
+                    <span class="log-time">${timeStr}</span>
+                </div>
+                <div class="log-content">
+                    <div>原查询: ${escapeHtml(event.original_query || '')}</div>
+                    <div>改写为: <strong>${escapeHtml(event.rewritten_query || '')}</strong></div>
+                </div>
+            `;
+            break;
+
+        case 'decompose':
+            logEntry.innerHTML = `
+                <div class="log-header">
+                    <span class="log-session">[${sessionLabel}]</span>
+                    <span class="log-type">分解</span>
+                    <span class="log-time">${timeStr}</span>
+                </div>
+                <div class="log-content">问题被分解为多个子问题:</div>
+                <div class="log-sub-queries">
+                    ${(event.sub_queries || []).map(q => `<div class="log-sub-query">${escapeHtml(q)}</div>`).join('')}
+                </div>
+            `;
+            break;
+
+        case 'retrieve':
+            const snippets = event.snippets || [];
+            const duration = event.duration_ms ? `<span class="log-duration">${event.duration_ms}ms</span>` : '';
+            logEntry.innerHTML = `
+                <div class="log-header">
+                    <span class="log-session">[${sessionLabel}]</span>
+                    <span class="log-type">检索</span>
+                    <span class="log-time">${timeStr}${duration}</span>
+                </div>
+                <div class="log-content">找到 ${event.count || 0} 条相关文档</div>
+                ${snippets.length > 0 ? `
+                    <div class="log-snippets">
+                        ${snippets.slice(0, 3).map((s, i) => `
+                            <div class="log-snippet">
+                                <div class="snippet-source">[${i + 1}] ${escapeHtml(s.source || '未知来源')}</div>
+                                ${escapeHtml(s.text || s.content || '').substring(0, 150)}...
+                            </div>
+                        `).join('')}
+                    </div>
+                ` : ''}
+            `;
+            break;
+
+        case 'answer':
+            logEntry.innerHTML = `
+                <div class="log-header">
+                    <span class="log-session">[${sessionLabel}]</span>
+                    <span class="log-type">回答</span>
+                    <span class="log-time">${timeStr}</span>
+                </div>
+                <div class="log-content">${escapeHtml(event.answer || event.preview || '生成回答中...').substring(0, 200)}${(event.answer || event.preview || '').length > 200 ? '...' : ''}</div>
+            `;
+            break;
+
+        case 'complete':
+            const totalDuration = event.total_duration_ms ? `<span class="log-duration">${event.total_duration_ms}ms</span>` : '';
+            logEntry.innerHTML = `
+                <div class="log-header">
+                    <span class="log-session">[${sessionLabel}]</span>
+                    <span class="log-type">完成</span>
+                    <span class="log-time">${timeStr}${totalDuration}</span>
+                </div>
+                <div class="log-content">✓ 处理完成，共 ${event.iterations || 1} 轮迭代</div>
+            `;
+            break;
+
+        case 'error':
+            logEntry.innerHTML = `
+                <div class="log-header">
+                    <span class="log-session">[${sessionLabel}]</span>
+                    <span class="log-type">错误</span>
+                    <span class="log-time">${timeStr}</span>
+                </div>
+                <div class="log-content" style="color: #dc3545;">${escapeHtml(event.message || '未知错误')}</div>
+            `;
+            break;
+
+        case 'result':
+            // 最终结果，显示总结
+            logEntry.innerHTML = `
+                <div class="log-header">
+                    <span class="log-session">[${sessionLabel}]</span>
+                    <span class="log-type">结果</span>
+                    <span class="log-time">${timeStr}</span>
+                </div>
+                <div class="log-content">✓ 回答已生成</div>
+                ${event.sources && event.sources.length > 0 ? `
+                    <div class="log-detail">
+                        <span class="log-detail-item"><strong>来源:</strong> ${event.sources.map(s => s.source || s.type || '未知').join(', ')}</span>
+                    </div>
+                ` : ''}
+            `;
+            break;
+
+        default:
+            logEntry.innerHTML = `
+                <div class="log-header">
+                    <span class="log-session">[${sessionLabel}]</span>
+                    <span class="log-type">${escapeHtml(event.type)}</span>
+                    <span class="log-time">${timeStr}</span>
+                </div>
+                <div class="log-content">${escapeHtml(JSON.stringify(event, null, 2).substring(0, 200))}</div>
+            `;
+    }
+
+    return logEntry;
+}
+
+// 渲染所有历史日志
+function renderAllLogs() {
+    const logContent = elements.logPanelContent;
+
+    if (state.logs.length === 0) {
+        logContent.innerHTML = '<div class="log-empty">暂无日志，发送消息开始对话</div>';
+        return;
+    }
+
+    logContent.innerHTML = '';
+    state.logs.forEach(event => {
+        const logEntry = createLogEntry(event);
+        if (logEntry) {
+            logContent.appendChild(logEntry);
+        }
     });
 
-    return data;
+    // 滚动到底部
+    logContent.scrollTop = logContent.scrollHeight;
 }
 
 // 获取会话列表
@@ -359,6 +673,15 @@ async function handleSend() {
             role: 'assistant',
             content: `错误: ${error.message}`
         });
+
+        // 在日志面板显示错误
+        if (elements.logPanelContent) {
+            handleStreamEvent({
+                type: 'error',
+                message: error.message,
+                timestamp: 0
+            });
+        }
     } finally {
         // 清除加载状态
         state.pendingRequests.delete(targetSessionId);
@@ -419,6 +742,25 @@ if (elements.graphTestBtn) {
     elements.graphTestBtn.addEventListener('click', testGraphSearch);
 }
 
+// 日志面板控制
+if (elements.clearLogBtn) {
+    elements.clearLogBtn.addEventListener('click', () => {
+        // 清空状态和存储
+        state.logs = [];
+        localStorage.removeItem(LOG_STORAGE_KEY);
+        // 清空UI
+        elements.logPanelContent.innerHTML = '<div class="log-empty">暂无日志，发送消息开始对话</div>';
+    });
+}
+
+if (elements.toggleLogPanelBtn) {
+    elements.toggleLogPanelBtn.addEventListener('click', () => {
+        elements.logPanel.classList.toggle('collapsed');
+        const icon = elements.toggleLogPanelBtn.textContent;
+        elements.toggleLogPanelBtn.textContent = icon === '◀' ? '▶' : '◀';
+    });
+}
+
 // ===== 工具函数 =====
 
 function escapeHtml(text) {
@@ -461,6 +803,10 @@ async function init() {
     // 初始化
     state.messages['new'] = [];
     updateModeUI();
+
+    // 加载历史日志
+    loadLogs();
+    renderAllLogs();
 
     // 加载会话列表
     await fetchSessions();

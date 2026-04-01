@@ -78,7 +78,7 @@ except FileNotFoundError:
     bm25_ids = []
 
 
-def chat_with_llm(message: str, history: list = None, enable_web_search: bool = True) -> str:
+def chat_with_llm(message: str, history: list = None, enable_web_search: bool = True) -> dict:
     """
     智能聊天 - 使用 Agentic RAG 的网络搜索能力
 
@@ -88,7 +88,7 @@ def chat_with_llm(message: str, history: list = None, enable_web_search: bool = 
         enable_web_search: 是否启用网络搜索
 
     Returns:
-        回复内容
+        {"answer": 回答内容, "sources": 来源列表, "web_searched": 是否进行了网络搜索}
     """
     # 使用 Agentic RAG 处理，启用网络搜索但不使用知识库
     result = agentic_rag.chat_search(
@@ -97,7 +97,7 @@ def chat_with_llm(message: str, history: list = None, enable_web_search: bool = 
         enable_web_search=enable_web_search,
         verbose=False
     )
-    return result["answer"]
+    return result
 
 
 # ============== 混合检索功能（供 Dify 调用）==============
@@ -235,6 +235,107 @@ def chat():
         "sources": result.get("sources", []),
         "web_searched": result.get("web_searched", False)
     })
+
+
+@app.route('/rag/stream', methods=['POST'])
+def rag_stream():
+    """
+    知识库问答模式 - SSE 流式返回（包含思考过程日志）
+
+    请求体:
+    {
+        "user_id": "用户ID",
+        "session_id": "会话ID（首次为null）",
+        "message": "消息内容"
+    }
+
+    返回: SSE 流，每个事件格式:
+    data: {"type": "decision/retrieve/answer/complete", ...}
+    """
+    from flask import Response
+    import json
+    import queue
+    import threading
+
+    data = request.json
+    user_id = data.get('user_id')
+    session_id = data.get('session_id')
+    message = data.get('message')
+
+    if not user_id or not message:
+        return jsonify({"error": "缺少 user_id 或 message"}), 400
+
+    # 获取或创建会话
+    session_id = session_manager.get_or_create_session(user_id, session_id)
+
+    # 保存用户消息
+    session_manager.add_message(session_id, "user", message)
+
+    # 获取历史上下文
+    history = session_manager.get_history(session_id, limit=10)
+
+    # 创建消息队列用于 SSE
+    log_queue = queue.Queue()
+
+    def log_callback(event):
+        """日志回调，将事件放入队列"""
+        log_queue.put(event)
+
+    def generate():
+        """生成 SSE 流"""
+        try:
+            # 在后台线程中处理
+            result_holder = {'result': None}
+
+            def process():
+                result = agentic_rag.process(
+                    message,
+                    verbose=False,
+                    history=history,
+                    log_callback=log_callback
+                )
+                result_holder['result'] = result
+
+            thread = threading.Thread(target=process)
+            thread.start()
+
+            # 实时发送日志事件
+            while thread.is_alive() or not log_queue.empty():
+                try:
+                    event = log_queue.get(timeout=0.1)
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                except queue.Empty:
+                    continue
+
+            thread.join()
+            result = result_holder['result']
+
+            # 保存助手回复
+            if result:
+                session_manager.add_message(session_id, "assistant", result["answer"])
+
+                # 发送最终结果
+                final_event = {
+                    "type": "result",
+                    "session_id": session_id,
+                    "answer": result["answer"],
+                    "mode": "rag",
+                    "sources": result.get("sources", []),
+                    "log_trace": result.get("log_trace", [])
+                }
+                yield f"data: {json.dumps(final_event, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            error_event = {"type": "error", "message": str(e)}
+            yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+
+    return Response(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no'
+        }
+    )
 
 
 @app.route('/rag', methods=['POST'])
