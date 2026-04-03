@@ -1,5 +1,9 @@
 # Agentic RAG 完整指南
 
+> **版本说明**
+> - **v1** (`agentic_rag.py`)：基础版 - 查询改写、迭代检索、问题分解
+> - **v2** (`agentic_rag_v2.py`)：增强版 - 网络搜索、多源融合、冲突处理
+
 ## 一、功能概述
 
 Agentic RAG 是一个智能问答系统，具备以下核心能力：
@@ -361,9 +365,20 @@ SERPER_API_KEY = "your-serper-key"  # 网络搜索（可选）
 
 ---
 
-## 十一、最佳实践
+## 十一、代码对照表
 
-### 11.1 何时使用 Agentic RAG
+| 功能 | 传统RAG代码位置 | Agentic RAG代码位置 |
+|------|----------------|-------------------|
+| 检索入口 | `rag_demo.py:search_knowledge()` | 调用上述函数 |
+| 生成答案 | `rag_demo.py:generate_answer()` | 调用上述函数 |
+| Agent决策 | 无 | `agentic_rag.py:_think()` |
+| 主流程 | `rag_demo.py:process_query()` | `agentic_rag.py:process()` |
+
+---
+
+## 十二、最佳实践
+
+### 12.1 何时使用 Agentic RAG
 
 ✅ **推荐使用**：
 - 复杂问题需要多轮检索
@@ -375,7 +390,7 @@ SERPER_API_KEY = "your-serper-key"  # 网络搜索（可选）
 - 简单明确的问题（用传统RAG更快）
 - 对响应时间敏感的场景
 
-### 11.2 性能优化
+### 12.2 性能优化
 
 ```python
 # 减少迭代次数
@@ -385,7 +400,7 @@ rag = AgenticRAG(max_iterations=2)
 rag = AgenticRAG(enable_web_search=False)
 ```
 
-### 11.3 调试技巧
+### 12.3 调试技巧
 
 ```python
 # 打印详细过程

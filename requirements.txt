@@ -15,6 +15,7 @@ docx2txt>=0.8
 # Web服务
 flask>=2.0.0
 flask-cors>=4.0.0
+PyJWT>=2.8.0
 
 # 检索相关
 rank-bm25>=0.2.2

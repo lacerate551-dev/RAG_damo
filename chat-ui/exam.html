@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>出题系统</title>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        /* 覆盖 style.css 的 overflow: hidden */
+        html, body {
+            height: auto !important;
+            min-height: 100%;
+            overflow: visible !important;
+        }
+
+        body {
+            background: linear-gradient(135deg, #f5f7fa 0%, #e4e8ec 100%);
+            padding-bottom: 40px;
+        }
+
+        .exam-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .exam-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #e0e4e8;
+        }
+
+        .exam-header h1 {
+            font-size: 24px;
+            color: #333;
+            margin: 0;
+        }
+
+        .exam-tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .exam-tab {
+            padding: 10px 20px;
+            border: none;
+            background: #f0f0f0;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+
+        .exam-tab:hover {
+            background: #e0e0e0;
+        }
+
+        .exam-tab.active {
+            background: #4a90d9;
+            color: white;
+        }
+
+        .exam-panel {
+            display: none;
+        }
+
+        .exam-panel.active {
+            display: block;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 500;
+            color: #333;
+        }
+
+        .form-group input, .form-group select, .form-group textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+
+        .form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+            outline: none;
+            border-color: #4a90d9;
+        }
+
+        .form-row {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+
+        .form-row .form-group {
+            flex: 1;
+            min-width: 150px;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+
+        .btn-primary { background: #4a90d9; color: white; }
+        .btn-primary:hover { background: #357abd; }
+        .btn-secondary { background: #6c757d; color: white; }
+        .btn-success { background: #28a745; color: white; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-warning { background: #ffc107; color: #333; }
+        .btn-sm { padding: 5px 10px; font-size: 12px; }
+        .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+        .exam-card {
+            background: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+
+        .exam-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .exam-card-title {
+            font-weight: 600;
+            font-size: 16px;
+            color: #333;
+        }
+
+        .exam-status {
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        .status-draft { background: #fff3cd; color: #856404; }
+        .status-pending_review { background: #cce5ff; color: #004085; }
+        .status-approved { background: #d4edda; color: #155724; }
+        .status-rejected { background: #f8d7da; color: #721c24; }
+
+        .exam-card-meta {
+            color: #666;
+            font-size: 13px;
+            margin-bottom: 10px;
+        }
+
+        .exam-card-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        /* 题目样式 */
+        .question-item {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+
+        .question-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .question-type {
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            background: #4a90d9;
+            color: white;
+        }
+
+        .question-content {
+            font-size: 15px;
+            margin-bottom: 10px;
+            line-height: 1.6;
+        }
+
+        .question-options {
+            margin-left: 20px;
+        }
+
+        .question-option {
+            padding: 8px 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .question-option input[type="radio"] {
+            width: auto;
+        }
+
+        .question-answer {
+            margin-top: 10px;
+            padding: 10px;
+            background: #e8f5e9;
+            border-radius: 4px;
+            border-left: 3px solid #28a745;
+        }
+
+        .question-analysis {
+            margin-top: 10px;
+            padding: 10px;
+            background: #fff8e1;
+            border-radius: 4px;
+            color: #856404;
+        }
+
+        /* 批阅结果 */
+        .score-display {
+            text-align: center;
+            padding: 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 12px;
+            color: white;
+            margin-bottom: 20px;
+        }
+
+        .score-value {
+            font-size: 48px;
+            font-weight: bold;
+        }
+
+        .score-rate {
+            font-size: 24px;
+            opacity: 0.9;
+        }
+
+        .question-result {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px;
+            border-bottom: 1px solid #eee;
+            border-radius: 4px;
+            margin-bottom: 8px;
+        }
+
+        .question-result.correct { background: #d4edda; }
+        .question-result.wrong { background: #f8d7da; }
+        .question-result.partial { background: #fff3cd; }
+
+        /* 加载状态 */
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+
+        .loading::after {
+            content: '';
+            width: 20px;
+            height: 20px;
+            border: 2px solid #4a90d9;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+            margin-left: 10px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* 空状态 */
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #999;
+        }
+
+        /* 返回链接 */
+        .back-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            margin-bottom: 20px;
+            color: #4a90d9;
+            text-decoration: none;
+            font-size: 14px;
+        }
+
+        .back-link:hover {
+            text-decoration: underline;
+        }
+
+        /* 审核面板 */
+        .review-panel {
+            background: #fff8e1;
+            border: 1px solid #ffc107;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 15px 0;
+        }
+
+        .review-panel h4 {
+            margin: 0 0 10px 0;
+            color: #856404;
+        }
+
+        .review-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        /* 试卷名称输入 */
+        .exam-name-input {
+            font-size: 16px;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            width: 100%;
+            max-width: 400px;
+        }
+
+        .exam-name-input:focus {
+            outline: none;
+            border-color: #4a90d9;
+        }
+
+        /* 统计卡片 */
+        .stats-row {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .stat-card {
+            background: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 15px 20px;
+            min-width: 120px;
+        }
+
+        .stat-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #4a90d9;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: #666;
+        }
+
+        /* 简答题输入框 */
+        .short-answer-input {
+            width: 100%;
+            min-height: 100px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+            resize: vertical;
+        }
+    </style>
+</head>
+<body>
+    <div class="exam-container">
+        <a href="index.html" class="back-link">← 返回聊天界面</a>
+
+        <div class="exam-header">
+            <h1>📚 出题系统</h1>
+            <div id="userInfo">未登录</div>
+        </div>
+
+        <!-- 统计卡片 -->
+        <div class="stats-row" id="statsRow">
+            <div class="stat-card">
+                <div class="stat-value" id="totalExams">-</div>
+                <div class="stat-label">试卷总数</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="approvedExams">-</div>
+                <div class="stat-label">已审核</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="totalReports">-</div>
+                <div class="stat-label">批阅报告</div>
+            </div>
+        </div>
+
+        <!-- 标签页导航 -->
+        <div class="exam-tabs">
+            <button class="exam-tab active" data-tab="generate">📝 生成试卷</button>
+            <button class="exam-tab" data-tab="list">📋 试卷列表</button>
+            <button class="exam-tab" data-tab="review">✅ 审核试卷</button>
+            <button class="exam-tab" data-tab="grade">📝 批阅试卷</button>
+            <button class="exam-tab" data-tab="reports">📊 批阅报告</button>
+        </div>
+
+        <!-- 生成试卷面板 -->
+        <div id="generatePanel" class="exam-panel active">
+            <div class="exam-card">
+                <h3>生成新试卷</h3>
+                <form id="generateForm">
+                    <div class="form-group">
+                        <label>试卷名称（便于识别）</label>
+                        <input type="text" id="examName" class="exam-name-input" placeholder="例如：Python基础测试卷" required>
+                    </div>
+                    <div class="form-group">
+                        <label>主题/知识点</label>
+                        <input type="text" id="topic" placeholder="例如：Python基础知识、国家社科基金项目申报" required>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>选择题数量</label>
+                            <input type="number" id="choiceCount" value="3" min="0" max="20">
+                        </div>
+                        <div class="form-group">
+                            <label>填空题数量</label>
+                            <input type="number" id="blankCount" value="2" min="0" max="20">
+                        </div>
+                        <div class="form-group">
+                            <label>简答题数量</label>
+                            <input type="number" id="shortAnswerCount" value="2" min="0" max="10">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>难度 (1-5)</label>
+                            <select id="difficulty">
+                                <option value="1">1 - 简单</option>
+                                <option value="2">2 - 较简单</option>
+                                <option value="3" selected>3 - 中等</option>
+                                <option value="4">4 - 较难</option>
+                                <option value="5">5 - 困难</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>选择题分值</label>
+                            <input type="number" id="choiceScore" value="2" min="1" max="10">
+                        </div>
+                        <div class="form-group">
+                            <label>填空题分值</label>
+                            <input type="number" id="blankScore" value="3" min="1" max="10">
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary" id="generateBtn">生成试卷</button>
+                </form>
+            </div>
+
+            <!-- 生成的试卷预览 -->
+            <div id="examPreview" style="display:none; margin-top: 20px;">
+                <h3>试卷预览</h3>
+                <div id="examContent"></div>
+                <div class="review-panel" id="quickReviewPanel" style="display:none;">
+                    <h4>试卷操作</h4>
+                    <p>试卷已生成，请检查题目内容是否正确。</p>
+                    <div class="review-actions">
+                        <button class="btn btn-primary" id="submitReviewBtn">📤 提交审核</button>
+                        <button class="btn btn-secondary" id="saveDraftBtn">💾 保存草稿</button>
+                    </div>
+                </div>
+                <!-- 管理员快速审核面板 -->
+                <div class="review-panel" id="adminReviewPanel" style="display:none; background: #e8f5e9; border-color: #4caf50;">
+                    <h4>管理员审核</h4>
+                    <p>您是管理员，可以直接审核此试卷。</p>
+                    <div class="review-actions">
+                        <button class="btn btn-success" id="approveBtn">✓ 直接通过</button>
+                        <button class="btn btn-danger" id="rejectBtn">✗ 驳回</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 试卷列表面板 -->
+        <div id="listPanel" class="exam-panel">
+            <div style="margin-bottom: 15px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                <select id="statusFilter" style="padding: 8px; border-radius: 6px; border: 1px solid #ddd;">
+                    <option value="">全部状态</option>
+                    <option value="draft">草稿</option>
+                    <option value="pending_review">待审核</option>
+                    <option value="approved">已通过</option>
+                    <option value="rejected">已驳回</option>
+                </select>
+                <button class="btn btn-secondary btn-sm" id="refreshListBtn">刷新</button>
+            </div>
+            <div id="examList" class="exam-list">
+                <div class="loading">加载中...</div>
+            </div>
+        </div>
+
+        <!-- 审核试卷面板 -->
+        <div id="reviewPanel" class="exam-panel">
+            <div style="margin-bottom: 15px;">
+                <h3>审核试卷</h3>
+                <p style="color: #666;">以下草稿试卷需要管理员审核后才能用于考试</p>
+            </div>
+            <div id="pendingReviewList" class="exam-list">
+                <div class="loading">加载中...</div>
+            </div>
+        </div>
+
+        <!-- 批阅试卷面板 -->
+        <div id="gradePanel" class="exam-panel">
+            <div class="exam-card">
+                <h3>批阅试卷</h3>
+                <div class="form-group">
+                    <label>选择试卷（仅显示已审核通过的试卷）</label>
+                    <select id="examSelect">
+                        <option value="">请选择试卷...</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>学生姓名</label>
+                    <input type="text" id="studentName" placeholder="输入学生姓名" required>
+                </div>
+                <div id="examQuestions" style="display:none;">
+                    <!-- 动态生成题目 -->
+                </div>
+                <button class="btn btn-primary" id="submitGradeBtn" style="display:none;">提交批阅</button>
+            </div>
+        </div>
+
+        <!-- 批阅报告面板 -->
+        <div id="reportsPanel" class="exam-panel">
+            <div id="reportsList" class="exam-list">
+                <div class="loading">加载中...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 试卷详情弹窗 -->
+    <div id="examModal" class="modal" style="display:none;">
+        <div class="modal-content modal-lg">
+            <div class="modal-header">
+                <h2 id="examModalTitle">试卷详情</h2>
+                <button class="modal-close" id="closeExamModal">&times;</button>
+            </div>
+            <div class="modal-body" id="examModalContent" style="max-height: 70vh; overflow-y: auto;">
+            </div>
+            <div class="modal-footer" style="padding: 15px; text-align: right; border-top: 1px solid #eee;">
+                <button class="btn btn-success" id="modalApproveBtn" style="display:none;">审核通过</button>
+                <button class="btn btn-danger" id="modalRejectBtn" style="display:none;">驳回</button>
+                <button class="btn btn-primary" id="modalGradeBtn" style="display:none;">去批阅</button>
+                <button class="btn btn-secondary" id="modalCloseBtn">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 批阅结果弹窗 -->
+    <div id="gradeResultModal" class="modal" style="display:none;">
+        <div class="modal-content modal-lg">
+            <div class="modal-header">
+                <h2>批阅结果</h2>
+                <button class="modal-close" id="closeGradeResultModal">&times;</button>
+            </div>
+            <div class="modal-body" id="gradeResultContent" style="max-height: 70vh; overflow-y: auto;">
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast 提示 -->
+    <div id="toast" class="toast"></div>
+
+    <script src="exam.js?v=20260403d"></script>
+</body>
+</html>

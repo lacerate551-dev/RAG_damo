@@ -110,7 +110,8 @@ class GraphRAG:
         query: str,
         top_k: int = 5,
         graph_depth: int = 2,
-        verbose: bool = False
+        verbose: bool = False,
+        allowed_levels: list = None
     ) -> MergedResult:
         """
         主检索接口：向量检索 + 图谱检索融合
@@ -120,6 +121,7 @@ class GraphRAG:
             top_k: 向量检索返回数量
             graph_depth: 图谱搜索深度
             verbose: 是否打印详细过程
+            allowed_levels: 允许访问的安全级别列表
 
         Returns:
             MergedResult 包含答案和上下文
@@ -130,7 +132,7 @@ class GraphRAG:
         # 1. 向量检索
         if verbose:
             print("[1] 执行向量检索...")
-        vector_results = search_knowledge(query, top_k=top_k)
+        vector_results = search_knowledge(query, top_k=top_k, allowed_levels=allowed_levels)
         vector_contexts = self._format_vector_results(vector_results)
 
         # 2. 图谱检索（如果启用）

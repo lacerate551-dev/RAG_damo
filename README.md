@@ -2,13 +2,19 @@
 
 基于本地向量模型 + Chroma向量数据库 + Neo4j知识图谱 + Qwen API 的智能知识库问答系统，支持双模式对话、Agentic RAG 和 Graph RAG。
 
-> **最新版本**: v4.1.0 (前端日志面板 + 来源去重优化)
+> **最新版本**: v4.2.0 (出题系统完善 + 审核流程优化)
 
 ## 功能特性
 
-### 最新特性 (v4.1.0)
+### 最新特性 (v4.2.0)
+- **出题系统完善**：试卷生成、审核、批阅完整流程
+- **审核流程优化**：管理员可在"审核试卷"中审核草稿试卷
+- **前端界面优化**：修复页面滚动问题，优化交互体验
+- **试卷名称自定义**：生成试卷时可指定名称
+
+### v4.1.0 特性
 - **前端日志面板**：实时显示Agent思考过程（决策、检索、改写、回答等）
-- **日志持久化**：localStorage存储，刷新页面后日志保留，支持累积显示
+- **日志持久化**：localStorage存储，刷新页面后日志保留
 - **来源去重**：同一来源合并显示，页码信息整合
 
 ### v4.0.0 特性
@@ -16,9 +22,7 @@
 - **图谱检索**：向量检索 + 图谱检索融合
 - **智能聊天网络搜索**：Chat 模式支持实时天气、新闻查询
 - **双模式切换**：智能聊天(支持网络搜索) / 知识库问答(多源检索)
-- **会话管理**：SQLite 持久化，支持多用户多会话
-- **并发支持**：Flask threaded 模式，多用户同时请求
-- **前端界面**：会话列表、模式切换、图谱状态显示
+- **出题系统**：Dify 智能出题 + 批阅 + 前端管理界面
 
 ### Agentic RAG 核心能力
 - **知识库检索**：向量检索 + BM25 + Rerank
@@ -42,11 +46,15 @@ RAG_damo/
 │   ├── bge-base-zh-v1.5/     # 向量模型（必需）
 │   └── bge-reranker-base/    # 重排序模型（自动下载）
 ├── documents/                 # 文档目录
+├── 题库/                      # 试卷存储目录
+├── 批阅报告/                   # 批阅报告目录
 ├── chroma_db/                 # 向量数据库（自动生成）
 ├── chat-ui/                   # 前端界面
-│   ├── index.html
+│   ├── index.html            # 主聊天界面
+│   ├── exam.html             # 出题系统界面
 │   ├── style.css
-│   └── app.js
+│   ├── app.js
+│   └── exam.js
 ├── docs/                      # 文档
 ├── rag_demo.py               # RAG基础功能
 ├── agentic_rag.py            # Agentic RAG 核心
@@ -55,6 +63,8 @@ RAG_damo/
 ├── entity_extractor.py       # 实体提取器
 ├── graph_build.py            # 图谱构建脚本
 ├── rag_api_server.py         # REST API 服务
+├── exam_manager.py           # 出题系统核心逻辑
+├── exam_api.py               # 出题系统 API
 ├── session_manager.py        # 会话管理器
 ├── config.example.py         # 配置示例
 ├── requirements.txt          # Python依赖
@@ -227,6 +237,58 @@ python graph_test.py
 | `/kb 问题` | 仅知识库检索 |
 | `/web 问题` | 强制网络搜索 |
 
+## 出题系统
+
+### 功能概述
+
+出题系统支持智能生成试卷、审核管理、学生答题和自动批阅。
+
+### 使用流程
+
+```
+生成试卷 → 管理员审核 → 学生答题 → 自动批阅 → 生成报告
+   (草稿)    (通过/驳回)   (已通过试卷)   (系统评分)
+```
+
+### 前端界面
+
+访问 `chat-ui/exam.html` 进入出题系统：
+
+1. **生成试卷**：输入主题、题目数量、难度等参数
+2. **审核试卷**：管理员审核草稿试卷（审核通过后才能用于考试）
+3. **批阅试卷**：选择已通过的试卷，学生作答后系统自动批阅
+4. **批阅报告**：查看历史批阅记录和成绩
+
+### 试卷状态
+
+| 状态 | 说明 |
+|------|------|
+| `draft` | 草稿，管理员可审核 |
+| `approved` | 已通过，可用于学生答题 |
+| `rejected` | 已驳回，不可使用 |
+
+### API 调用示例
+
+```bash
+# 生成试卷
+curl -X POST http://localhost:5001/exam/generate \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"topic": "Python基础", "choice_count": 5, "name": "Python入门测试"}'
+
+# 审核通过
+curl -X POST http://localhost:5001/exam/<exam_id>/review \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "approve"}'
+
+# 批阅试卷
+curl -X POST http://localhost:5001/exam/<exam_id>/grade \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"student_name": "张三", "answers": {"choice_1": "A", "blank_1": "答案"}}'
+```
+
 ## 技术架构
 
 ```
@@ -336,6 +398,20 @@ Q: 发生一级安全事件后应该向谁报告？
 | `/graph/build` | POST | 重建图谱索引 |
 | `/graph/stats` | GET | 获取图谱统计 |
 
+### 出题系统接口
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/exam/generate` | POST | 生成试卷 |
+| `/exam/list` | GET | 获取试卷列表 |
+| `/exam/<id>` | GET/PUT/DELETE | 试卷 CRUD |
+| `/exam/<id>/review` | POST | 审核试卷（管理员） |
+| `/exam/<id>/grade` | POST | 批阅试卷 |
+| `/exam/report/<id>` | GET | 获取批阅报告 |
+| `/exam/report/list` | GET | 批阅报告列表 |
+
+详细 API 文档请参考 [API对接文档](docs/API对接文档.md)
+
 ## 依赖库
 
 | 库名 | 用途 |
@@ -381,8 +457,9 @@ USE_GRAPH_RAG = True
 
 | 版本 | 更新内容 |
 |------|----------|
+| **v4.2.0** | 出题系统完善：试卷审核流程优化、前端界面修复、试卷名称自定义 |
 | **v4.1.0** | 前端日志面板：实时显示Agent思考过程，日志持久化存储；来源去重优化 |
-| **v4.0.0** | Graph RAG：Neo4j知识图谱、实体提取、多跳推理；智能聊天网络搜索 |
+| **v4.0.0** | Graph RAG：Neo4j知识图谱、实体提取、多跳推理；智能聊天网络搜索；出题系统集成 |
 | v3.0.0 | 双模式RAG系统：普通聊天/知识库问答，会话管理，前端界面 |
 | v2.1.0 | Dify智能出题系统集成 |
 | v1.1.0 | RAG幻觉优化：混合检索+Rerank+置信度 |
@@ -390,11 +467,16 @@ USE_GRAPH_RAG = True
 
 ## 文档
 
-- [开发文档](docs/开发文档.md) - API 接口、Dify 集成、部署指南
+- [API对接文档](docs/API对接文档.md) - 完整 API 接口说明、认证、出题系统
+- [开发文档](docs/开发文档.md) - 系统架构、技术栈、Dify 集成、部署指南
 - [Graph RAG 使用指南](docs/Graph_RAG使用指南.md) - 知识图谱功能详解
-- [Agentic RAG 完整指南](docs/Agentic_RAG完整指南.md) - Agent 决策机制
-- [会话管理 API 文档](docs/会话管理API文档.md) - 会话系统说明
-- [Dify 快速入门指南](docs/Dify快速入门指南.md) - Dify 工作流集成
+- [Agentic RAG 完整指南](docs/Agentic_RAG完整指南.md) - Agent 决策机制与使用方法
+- [Dify 快速入门指南](docs/Dify快速入门指南.md) - Dify 工作流集成教程
+- [出题批卷系统集成方案](docs/出题批卷系统集成方案.md) - 出题系统设计文档
+- [文档权限控制实现说明](docs/文档权限控制实现说明.md) - 权限系统技术说明
+- [多源信息融合指南](docs/多源信息融合指南.md) - 知识库与网络搜索融合策略
+- [RAG幻觉问题优化方案](docs/RAG幻觉问题优化方案.md) - 幻觉问题分析与解决方案
+- [RAG系统生产环境风险分析](docs/RAG系统生产环境风险分析与优化方向.md) - 安全风险与优化方向
 
 ## License
 

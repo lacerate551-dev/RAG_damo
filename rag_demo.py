@@ -761,9 +761,17 @@ def extract_text_from_txt(filepath):
 
 
 def load_documents():
-    """递归加载文档目录下的所有支持的文件"""
+    """递归加载文档目录下的所有支持的文件，根据目录名自动分配安全级别"""
     documents = []
     supported_extensions = {'.txt', '.pdf', '.docx', '.doc', '.xlsx'}
+
+    # 目录名 -> 安全级别映射
+    security_levels = {
+        'public': 'public',           # 公开 - 所有人可见
+        'internal': 'internal',       # 内部 - 登录用户可见
+        'confidential': 'confidential',  # 机密 - 管理层及以上
+        'secret': 'secret'            # 绝密 - 仅管理员
+    }
 
     if not os.path.exists(DOCUMENTS_PATH):
         print(f"错误: 文档目录不存在 - {DOCUMENTS_PATH}")
@@ -781,6 +789,14 @@ def load_documents():
             # 计算相对路径（用于显示）
             rel_path = os.path.relpath(filepath, DOCUMENTS_PATH)
 
+            # 根据目录路径确定安全级别
+            security_level = 'public'  # 默认公开
+            rel_path_lower = rel_path.lower().replace('\\', '/')
+            for dir_name, level in security_levels.items():
+                if f'/{dir_name}/' in f'/{rel_path_lower}/':
+                    security_level = level
+                    break
+
             # 根据文件类型提取文本
             if ext == '.pdf':
                 # PDF特殊处理，返回带页码的列表
@@ -789,9 +805,10 @@ def load_documents():
                     documents.append({
                         'filename': rel_path,
                         'type': 'pdf',
-                        'pages': pages
+                        'pages': pages,
+                        'security_level': security_level
                     })
-                    print(f"      加载文档: {rel_path} (PDF, {len(pages)}页)")
+                    print(f"      加载文档: {rel_path} (PDF, {len(pages)}页) [{security_level}]")
             elif ext in {'.docx', '.doc'}:
                 # Word返回带结构的内容块列表
                 blocks = extract_text_from_docx(filepath)
@@ -799,10 +816,11 @@ def load_documents():
                     documents.append({
                         'filename': rel_path,
                         'type': 'docx',
-                        'blocks': blocks
+                        'blocks': blocks,
+                        'security_level': security_level
                     })
                     tables_count = sum(1 for b in blocks if b.get('is_table'))
-                    print(f"      加载文档: {rel_path} (Word, {len(blocks)}段落, {tables_count}表格)")
+                    print(f"      加载文档: {rel_path} (Word, {len(blocks)}段落, {tables_count}表格) [{security_level}]")
             elif ext == '.xlsx':
                 # Excel返回带行列信息的内容块列表
                 blocks = extract_text_from_xlsx(filepath)
@@ -810,19 +828,21 @@ def load_documents():
                     documents.append({
                         'filename': rel_path,
                         'type': 'xlsx',
-                        'rows': blocks  # 兼容原结构
+                        'rows': blocks,  # 兼容原结构
+                        'security_level': security_level
                     })
                     multi_block_count = sum(1 for b in blocks if b.get('is_block'))
-                    print(f"      加载文档: {rel_path} (Excel, {len(blocks)}个数据块, {multi_block_count}个多行块)")
+                    print(f"      加载文档: {rel_path} (Excel, {len(blocks)}个数据块, {multi_block_count}个多行块) [{security_level}]")
             elif ext == '.txt':
                 content = extract_text_from_txt(filepath)
                 if content.strip():
                     documents.append({
                         'filename': rel_path,
                         'content': content,
-                        'type': 'txt'
+                        'type': 'txt',
+                        'security_level': security_level
                     })
-                    print(f"      加载文档: {rel_path} (TXT)")
+                    print(f"      加载文档: {rel_path} (TXT) [{security_level}]")
 
     return documents
 
@@ -961,7 +981,8 @@ def build_knowledge_base(force=False):
                         'page': page_num,
                         'chunk_index': i,
                         'has_table': has_table,
-                        'section': section
+                        'section': section,
+                        'security_level': doc.get('security_level', 'public')
                     }
 
                     collection.add(
@@ -1004,7 +1025,8 @@ def build_knowledge_base(force=False):
                         'source': doc['filename'],
                         'chunk_index': doc_chunks,
                         'is_table': is_table,
-                        'section': section
+                        'section': section,
+                        'security_level': doc.get('security_level', 'public')
                     }
 
                     collection.add(
@@ -1050,7 +1072,8 @@ def build_knowledge_base(force=False):
                     'row_range': row_range,
                     'block_title': block_title,
                     'is_block': is_block,
-                    'is_excel': True
+                    'is_excel': True,
+                    'security_level': doc.get('security_level', 'public')
                 }
 
                 collection.add(
@@ -1080,7 +1103,8 @@ def build_knowledge_base(force=False):
 
                 meta = {
                     'source': doc['filename'],
-                    'chunk_index': i
+                    'chunk_index': i,
+                    'security_level': doc.get('security_level', 'public')
                 }
 
                 collection.add(
@@ -1191,7 +1215,7 @@ def rerank_results(query, results, top_k=5):
     return reranked_results
 
 
-def search_knowledge(query, top_k=5):
+def search_knowledge(query, top_k=5, allowed_levels=None):
     """
     混合检索 (P4优化: 向量检索 + BM25 + RRF融合 + Rerank)
 
@@ -1200,24 +1224,62 @@ def search_knowledge(query, top_k=5):
     2. BM25检索 - 关键词匹配
     3. RRF融合 - 合并两种检索结果
     4. Rerank精排 - 最终排序
+
+    Args:
+        query: 查询文本
+        top_k: 返回结果数
+        allowed_levels: 允许访问的安全级别列表，如 ["public", "internal"]
+                       None 表示不过滤（向后兼容）
     """
     results_list = []
     weights = []
+
+    # 构建权限过滤条件
+    where_filter = None
+    if allowed_levels:
+        where_filter = {"security_level": {"$in": allowed_levels}}
 
     # 1. 向量检索
     query_vector = embedding_model.encode(query).tolist()
     recall_k = RERANK_CANDIDATES if (USE_RERANK or USE_HYBRID_SEARCH) else top_k
 
-    vector_results = collection.query(
-        query_embeddings=[query_vector],
-        n_results=recall_k
-    )
+    query_kwargs = {
+        "query_embeddings": [query_vector],
+        "n_results": recall_k
+    }
+    if where_filter:
+        query_kwargs["where"] = where_filter
+
+    vector_results = collection.query(**query_kwargs)
     results_list.append(vector_results)
     weights.append(VECTOR_WEIGHT)
 
     # 2. BM25检索 (如果启用混合检索)
     if USE_HYBRID_SEARCH and bm25_index.bm25:
         bm25_results = bm25_index.search(query, top_k=recall_k)
+        # BM25 后处理：过滤无权限文档
+        if where_filter and bm25_results['metadatas'][0]:
+            allowed_set = set(allowed_levels)
+            filtered_ids = []
+            filtered_docs = []
+            filtered_metas = []
+            filtered_scores = []
+            for bid, bdoc, bmeta, bscore in zip(
+                bm25_results['ids'][0], bm25_results['documents'][0],
+                bm25_results['metadatas'][0], bm25_results['distances'][0]
+            ):
+                doc_level = bmeta.get('security_level', 'public')
+                if doc_level in allowed_set:
+                    filtered_ids.append(bid)
+                    filtered_docs.append(bdoc)
+                    filtered_metas.append(bmeta)
+                    filtered_scores.append(bscore)
+            bm25_results = {
+                'ids': [filtered_ids],
+                'documents': [filtered_docs],
+                'metadatas': [filtered_metas],
+                'distances': [filtered_scores]
+            }
         results_list.append(bm25_results)
         weights.append(BM25_WEIGHT)
 

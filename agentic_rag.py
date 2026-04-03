@@ -107,7 +107,8 @@ class AgenticRAG:
         self.SOURCE_WEB = "网络搜索"
         self.SOURCE_GRAPH = "知识图谱"
 
-    def process(self, query: str, verbose: bool = True, history: list = None, log_callback=None) -> dict:
+    def process(self, query: str, verbose: bool = True, history: list = None,
+                log_callback=None, allowed_levels: list = None) -> dict:
         """
         主处理流程
 
@@ -116,6 +117,7 @@ class AgenticRAG:
             verbose: 是否打印详细过程
             history: 对话历史 [{"role": "user/assistant", "content": "..."}]
             log_callback: 日志回调函数，用于实时推送思考过程
+            allowed_levels: 允许访问的安全级别列表，如 ["public", "internal"]
 
         Returns:
             {
@@ -148,6 +150,24 @@ class AgenticRAG:
             print("\n" + "=" * 60)
             print(f"[用户] {query}")
             print("=" * 60)
+
+        # 检查是否为元问题（关于知识库本身的问题）
+        if self._is_meta_question(query):
+            if verbose:
+                print("\n[元问题] 检测到关于知识库本身的问题")
+            emit_log("decision", {"action": "meta_query", "reason": "检测到元问题，直接回答"})
+
+            answer = self._answer_meta_question(query, allowed_levels)
+            emit_log("answer", {"reason": "元问题直接回答"})
+
+            return {
+                "answer": answer,
+                "iterations": 0,
+                "reasoning": [{"type": "meta_question", "query": query}],
+                "contexts": [],
+                "sources": [],
+                "log_trace": log_trace
+            }
 
         # 知识问答流程
         all_contexts = []
@@ -216,7 +236,7 @@ class AgenticRAG:
                 if verbose:
                     print(f"[知识库检索] {current_query}")
 
-                results = search_knowledge(current_query, top_k=5)
+                results = search_knowledge(current_query, top_k=5, allowed_levels=allowed_levels)
                 docs = results.get('documents', [[]])[0]
                 metas = results.get('metadatas', [[]])[0]
 
@@ -297,7 +317,7 @@ class AgenticRAG:
                     print(f"[图谱检索] {current_query}")
 
                 search_start = time.time()
-                graph_results = self._graph_search(current_query, verbose)
+                graph_results = self._graph_search(current_query, verbose, allowed_levels=allowed_levels)
                 for result in graph_results:
                     all_contexts.append(result)
 
@@ -424,11 +444,22 @@ class AgenticRAG:
         - answer: 生成答案
         - rewrite: 改写查询
         - decompose: 分解问题
+        - meta_answer: 元问题直接回答（关于系统/权限/目录的问题）
         """
         # 分析现有信息
         kb_count = sum(1 for c in contexts if c.get('source_type') == self.SOURCE_KB)
         web_count = sum(1 for c in contexts if c.get('source_type') == self.SOURCE_WEB)
         graph_count = sum(1 for c in contexts if c.get('source_type') == self.SOURCE_GRAPH)
+
+        # 判断是否为元问题（关于系统本身的问题）
+        meta_keywords = [
+            "有哪些文件", "什么文件", "哪些文件", "文件列表", "文件目录",
+            "可以查看", "能查看", "有权限", "权限", "能访问", "可以访问",
+            "知识库有哪些", "库里有", "文档有哪些", "有哪些文档",
+            "系统支持", "系统能", "你能做什么", "你可以做什么",
+            "帮助", "使用说明", "怎么用", "如何使用"
+        ]
+        is_meta_question = any(kw in current_query for kw in meta_keywords)
 
         # 判断是否需要图谱检索
         need_graph = self._need_graph_search(current_query, contexts)
@@ -464,11 +495,11 @@ class AgenticRAG:
 【决策选项】
 
 1. **kb_search** - 检索知识库
-   - 适用：首次检索、知识库可能有所需信息
+   - 适用：需要查找知识库中的具体内容、政策、规定等
    - 输出: {{"action": "kb_search"}}
 
 2. **web_search** - 网络搜索
-   - 适用：知识库信息不足、需要最新信息、需要更权威的来源
+   - 适用：知识库信息不足、需要最新实时信息、需要更权威的来源
    - 输出: {{"action": "web_search", "search_query": "搜索词", "reason": "为什么需要网络搜索"}}
 
 3. **graph_search** - 图谱检索
@@ -476,7 +507,7 @@ class AgenticRAG:
    - 输出: {{"action": "graph_search", "reason": "为什么需要图谱检索"}}
 
 4. **answer** - 生成答案
-   - 适用：信息足够回答问题
+   - 适用：已有信息足够回答问题
    - 输出: {{"action": "answer", "reason": "信息已足够"}}
 
 5. **rewrite** - 改写查询
@@ -487,13 +518,26 @@ class AgenticRAG:
    - 适用：问题包含多个子问题
    - 输出: {{"action": "decompose", "sub_queries": ["子问题1", "子问题2"], "reason": "为什么分解"}}
 
-【决策原则】
-- 首轮优先检索知识库（kb_search）
-- 涉及部门职责、流程步骤、制度关系等问题，优先图谱检索（graph_search）
-- 如果知识库信息明显过时或不完整，考虑 web_search
-- 网络搜索的查询词应简洁、专业
-- 避免重复检索相同内容
-- 信息足够时立即 answer，不要浪费轮次
+【重要决策原则】
+
+1. **元问题识别**（重要！）
+   - 如果用户问的是"有哪些文件"、"能查看什么"、"有什么权限"、"知识库包含什么"等关于系统本身的问题
+   - 这类问题不需要检索内容，应该直接回答或提供文档列表
+   - 如果已有检索结果包含文档来源信息，直接用 answer 生成答案
+
+2. **检索优先级**
+   - 首轮优先检索知识库（kb_search）
+   - 涉及部门职责、流程步骤、制度关系等问题，优先图谱检索（graph_search）
+   - 只有当知识库明显无法回答（如实时信息、外部知识）时才用 web_search
+
+3. **效率原则**
+   - 信息足够时立即 answer，不要浪费轮次
+   - 避免重复检索相同内容
+   - 如果检索结果已经包含了文档来源信息，可以直接回答元问题
+
+4. **网络搜索谨慎使用**
+   - 网络搜索仅用于：实时信息、外部知识、知识库确实没有的内容
+   - 内部文档、公司制度、业务流程等问题不应使用网络搜索
 
 请输出JSON格式的决策（只输出JSON）:"""
 
@@ -549,13 +593,110 @@ class AgenticRAG:
         query_lower = query.lower()
         return any(kw in query_lower for kw in graph_keywords)
 
-    def _graph_search(self, query: str, verbose: bool = True) -> list:
+    def _is_meta_question(self, query: str) -> bool:
+        """
+        判断是否为元问题（关于知识库本身的问题）
+
+        Args:
+            query: 用户查询
+
+        Returns:
+            是否为元问题
+        """
+        meta_patterns = [
+            "有哪些文件", "什么文件", "哪些文件", "文件列表", "文件目录",
+            "可以查看", "能查看", "有权限查看", "权限查看",
+            "能访问", "可以访问", "有权限访问",
+            "知识库有哪些", "库里有", "文档有哪些", "有哪些文档",
+            "有什么文档", "有什么文件", "包含什么", "包含哪些",
+            "你知道什么", "你都知道", "你能回答什么",
+            "系统里有什么", "库里有什么"
+        ]
+        query_lower = query.lower()
+        return any(kw in query_lower for kw in meta_patterns)
+
+    def _answer_meta_question(self, query: str, allowed_levels: list = None) -> str:
+        """
+        回答元问题（关于知识库本身的问题）
+
+        Args:
+            query: 用户查询
+            allowed_levels: 允许访问的安全级别列表
+
+        Returns:
+            回答内容
+        """
+        # 获取知识库文档列表
+        try:
+            # 从 ChromaDB 获取所有文档的来源信息
+            all_docs = collection.get(include=['metadatas'])
+
+            # 按来源分组统计
+            source_map = {}  # {source: {count, levels, pages}}
+            for meta in all_docs.get('metadatas', []):
+                source = meta.get('source', '未知')
+                level = meta.get('security_level', 'public')
+                page = meta.get('page')
+
+                if source not in source_map:
+                    source_map[source] = {'count': 0, 'levels': set(), 'pages': set()}
+
+                source_map[source]['count'] += 1
+                source_map[source]['levels'].add(level)
+                if page:
+                    source_map[source]['pages'].add(page)
+
+            # 根据用户权限过滤
+            if allowed_levels:
+                allowed_set = set(allowed_levels)
+                filtered_sources = {}
+                for source, info in source_map.items():
+                    # 只显示用户有权限访问的文档
+                    if info['levels'] & allowed_set:  # 有交集
+                        filtered_sources[source] = info
+                source_map = filtered_sources
+
+            # 构建回答
+            if not source_map:
+                return "抱歉，您当前没有权限查看任何文档，或者知识库为空。"
+
+            # 按文档数量排序
+            sorted_sources = sorted(source_map.items(), key=lambda x: x[1]['count'], reverse=True)
+
+            answer_parts = [f"📚 **知识库文档列表**（共 {len(sorted_sources)} 个文档）\n"]
+
+            for i, (source, info) in enumerate(sorted_sources, 1):
+                levels_str = '/'.join(sorted(info['levels']))
+                pages_str = ''
+                if info['pages']:
+                    pages_list = sorted(info['pages'])
+                    if len(pages_list) <= 5:
+                        pages_str = f"，页码: {', '.join(map(str, pages_list))}"
+                    else:
+                        pages_str = f"，共 {len(info['pages'])} 页"
+
+                answer_parts.append(f"{i}. **{source}** ({info['count']} 条片段，权限: {levels_str}{pages_str})")
+
+            answer_parts.append(f"\n**总计**: {sum(s[1]['count'] for s in sorted_sources)} 条知识片段")
+            answer_parts.append(f"\n**您的权限级别**: {', '.join(allowed_levels) if allowed_levels else '全部'}")
+
+            answer_parts.append("\n\n💡 **提示**: 您可以直接提问关于这些文档内容的问题，例如：")
+            answer_parts.append("\n- 「XX文档中提到的流程是什么？」")
+            answer_parts.append("\n- 「出差报销的标准是多少？」")
+
+            return '\n'.join(answer_parts)
+
+        except Exception as e:
+            return f"获取文档列表时出错: {str(e)}\n\n您可以直接提问，我会尝试从知识库中检索相关信息。"
+
+    def _graph_search(self, query: str, verbose: bool = True, allowed_levels: list = None) -> list:
         """
         执行图谱检索
 
         Args:
             query: 用户查询
             verbose: 是否打印详细过程
+            allowed_levels: 允许访问的安全级别列表
 
         Returns:
             检索结果列表
@@ -564,7 +705,8 @@ class AgenticRAG:
             return []
 
         try:
-            result = self.graph_rag.search(query, top_k=3, verbose=verbose)
+            result = self.graph_rag.search(query, top_k=3, verbose=verbose,
+                                           allowed_levels=allowed_levels)
 
             contexts = []
             if result.graph_context:
@@ -651,6 +793,11 @@ class AgenticRAG:
         # 分离不同来源
         kb_contexts = [c for c in contexts if c.get('source_type') == self.SOURCE_KB]
         web_contexts = [c for c in contexts if c.get('source_type') == self.SOURCE_WEB]
+        graph_contexts = [c for c in contexts if c.get('source_type') == self.SOURCE_GRAPH]
+
+        # 如果没有任何上下文
+        if not contexts:
+            return self._generate_no_context_answer(query)
 
         # 构建来源信息
         kb_parts = []
@@ -666,7 +813,11 @@ class AgenticRAG:
             meta = c['meta']
             web_parts.append(f"[网络-{i}] {meta.get('title', '')}\n来源:{meta.get('source', '')}\n{c['doc']}")
 
-        context_str = "\n\n".join(kb_parts + web_parts)
+        graph_parts = []
+        for i, c in enumerate(graph_contexts[:3], 1):
+            graph_parts.append(f"[图谱-{i}] {c['doc']}")
+
+        context_str = "\n\n".join(kb_parts + web_parts + graph_parts)
 
         # 使用增强的提示词
         prompt = f"""你是一个严谨的智能助手，需要综合多个信息来源回答问题。
@@ -710,6 +861,7 @@ class AgenticRAG:
 ### 来源汇总
 - 知识库：共{len(kb_contexts)}条
 - 网络搜索：共{len(web_contexts)}条
+- 知识图谱：共{len(graph_contexts)}条
 
 请回答："""
 
@@ -723,6 +875,38 @@ class AgenticRAG:
             return response.choices[0].message.content
         except Exception as e:
             return f"生成答案失败: {str(e)}"
+
+    def _generate_no_context_answer(self, query: str) -> str:
+        """
+        当没有检索到任何上下文时生成答案
+
+        Args:
+            query: 用户问题
+
+        Returns:
+            回答内容
+        """
+        prompt = f"""用户提问：「{query}」
+
+很抱歉，我在知识库中没有找到与您问题相关的信息。
+
+请尝试：
+1. 换一种方式描述您的问题
+2. 使用更具体的关键词
+3. 确认您的问题是否与公司文档、制度、流程等相关
+
+如果您想了解知识库中有哪些文档，可以问我「有哪些文件可以查看」。"""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.5,
+                max_tokens=500
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"抱歉，知识库中没有找到相关信息。请尝试换一种方式提问，或询问「有哪些文件可以查看」了解知识库内容。"
 
     def _format_source(self, meta: dict, source_type: str) -> str:
         """格式化来源信息"""

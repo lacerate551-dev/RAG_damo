@@ -1,772 +1,499 @@
 // ===== 配置 =====
 const API_BASE = 'http://localhost:5001';
-const LOG_STORAGE_KEY = 'rag_chat_logs';
-const MAX_LOGS = 1000;  // 最大日志条数限制
+const TOKEN_KEY = 'rag_auth_token';
+const USER_KEY = 'rag_auth_user';
+const LOG_KEY = 'rag_chat_logs';
 
-// ===== 状态管理 =====
-let state = {
-    currentUserId: 'test_user_001',
-    currentSessionId: null,
+// ===== 状态 =====
+const state = {
+    token: localStorage.getItem(TOKEN_KEY),
+    user: JSON.parse(localStorage.getItem(USER_KEY) || 'null'),
+    sessionId: null,
     mode: 'chat',  // 'chat' 或 'rag'
     sessions: [],
     messages: {},
-    pendingRequests: new Map(),
-    graphStats: null,
-    logs: []  // 所有会话的日志，按时间顺序累积
+    logs: JSON.parse(localStorage.getItem(LOG_KEY) || '[]'),
+    systemStatus: {
+        knowledgeBase: null,
+        bm25Index: null,
+        graph: null
+    }
 };
 
-// ===== DOM 元素 =====
-const elements = {
-    userSelect: document.getElementById('userSelect'),
-    customUserInput: document.getElementById('customUserInput'),
-    currentSessionId: document.getElementById('currentSessionId'),
-    sessionList: document.getElementById('sessionList'),
-    chatMessages: document.getElementById('chatMessages'),
-    messageInput: document.getElementById('messageInput'),
-    sendBtn: document.getElementById('sendBtn'),
-    newSessionBtn: document.getElementById('newSessionBtn'),
-    modeToggle: document.getElementById('modeToggle'),
-    modeLabel: document.getElementById('modeLabel'),
-    graphStats: document.getElementById('graphStats'),
-    graphTestBtn: document.getElementById('graphTestBtn'),
-    // 日志面板元素
-    logPanel: document.getElementById('logPanel'),
-    logPanelContent: document.getElementById('logPanelContent'),
-    clearLogBtn: document.getElementById('clearLogBtn'),
-    toggleLogPanelBtn: document.getElementById('toggleLogPanelBtn')
-};
+// ===== DOM =====
+const $ = id => document.getElementById(id);
 
-// ===== API 调用 =====
-async function apiCall(endpoint, options = {}) {
-    try {
-        const response = await fetch(`${API_BASE}${endpoint}`, {
-            ...options,
-            headers: {
-                'Content-Type': 'application/json',
-                ...options.headers
-            }
+// ===== 初始化 =====
+document.addEventListener('DOMContentLoaded', () => {
+    checkAuth();
+    initEvents();
+    renderLogs();
+});
+
+function checkAuth() {
+    if (state.token && state.user) {
+        showMain();
+    } else {
+        showLogin();
+    }
+}
+
+function showLogin() {
+    $('loginPanel').style.display = 'flex';
+    $('mainContent').style.display = 'none';
+}
+
+function showMain() {
+    $('loginPanel').style.display = 'none';
+    $('mainContent').style.display = 'flex';
+    $('username').textContent = state.user.username;
+    $('userRole').textContent = getRoleLabel(state.user.role);
+    $('userRole').className = `role ${state.user.role}`;
+    updateModeUI();
+    loadSessions();
+    loadSystemStatus();
+
+    // 显示管理员功能
+    if (state.user.role === 'admin') {
+        $('adminSection').style.display = 'block';
+    }
+}
+
+function getRoleLabel(role) {
+    const labels = { admin: '管理员', manager: '经理', user: '用户' };
+    return labels[role] || role;
+}
+
+// ===== 事件绑定 =====
+function initEvents() {
+    // 登录
+    $('loginForm').addEventListener('submit', handleLogin);
+
+    // 登出
+    $('logoutBtn').addEventListener('click', handleLogout);
+
+    // 设置弹窗
+    $('settingsBtn').addEventListener('click', () => $('settingsModal').style.display = 'flex');
+    $('closeSettingsBtn').addEventListener('click', () => $('settingsModal').style.display = 'none');
+    $('changePasswordForm').addEventListener('submit', handleChangePassword);
+
+    // 模式切换
+    $('chatModeBtn').addEventListener('click', () => setMode('chat'));
+    $('ragModeBtn').addEventListener('click', () => setMode('rag'));
+
+    // 发送消息
+    $('sendBtn').addEventListener('click', sendMessage);
+    $('messageInput').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        }
+    });
+
+    // 新建会话
+    $('newSessionBtn').addEventListener('click', newSession);
+
+    // 日志面板
+    $('clearLogBtn').addEventListener('click', clearLogs);
+    $('toggleLogPanelBtn').addEventListener('click', toggleLogPanel);
+
+    // 管理员功能
+    $('showUsersBtn')?.addEventListener('click', showUsersModal);
+    $('closeUsersBtn')?.addEventListener('click', () => $('usersModal').style.display = 'none');
+    $('showAuditLogsBtn')?.addEventListener('click', showAuditLogsModal);
+    $('closeAuditBtn')?.addEventListener('click', () => $('auditModal').style.display = 'none');
+    $('refreshAuditBtn')?.addEventListener('click', loadAuditLogs);
+    $('buildGraphBtn')?.addEventListener('click', buildKnowledgeGraph);
+
+    // 点击弹窗外部关闭
+    document.querySelectorAll('.modal').forEach(modal => {
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) modal.style.display = 'none';
         });
-
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-
-        return await response.json();
-    } catch (error) {
-        console.error('API Error:', error);
-        throw error;
-    }
-}
-
-// ===== 日志持久化 =====
-
-// 从 localStorage 加载日志
-function loadLogs() {
-    try {
-        const saved = localStorage.getItem(LOG_STORAGE_KEY);
-        if (saved) {
-            const parsed = JSON.parse(saved);
-            // 校验数据格式
-            if (Array.isArray(parsed)) {
-                state.logs = parsed;
-                console.log(`已加载 ${state.logs.length} 条历史日志`);
-            } else {
-                console.warn('日志数据格式异常，已重置');
-                state.logs = [];
-            }
-        }
-    } catch (e) {
-        console.error('加载日志失败:', e);
-        state.logs = [];
-    }
-}
-
-// 保存日志到 localStorage
-function saveLogs() {
-    try {
-        // 限制最大条数，防止存储过大
-        if (state.logs.length > MAX_LOGS) {
-            state.logs = state.logs.slice(-MAX_LOGS);
-        }
-        localStorage.setItem(LOG_STORAGE_KEY, JSON.stringify(state.logs));
-    } catch (e) {
-        console.error('保存日志失败:', e);
-    }
-}
-
-// 获取会话标签
-function getSessionLabel(sessionId) {
-    if (!sessionId || sessionId === 'new') return '新会话';
-    return sessionId.substring(0, 8);
-}
-
-// 发送消息 - RAG模式使用SSE流式
-async function sendMessage(message, targetSessionId) {
-    // 普通聊天模式使用普通API
-    if (state.mode === 'chat') {
-        const data = await apiCall('/chat', {
-            method: 'POST',
-            body: JSON.stringify({
-                user_id: state.currentUserId,
-                session_id: targetSessionId,
-                message: message
-            })
-        });
-        return data;
-    }
-
-    // RAG模式使用SSE流式API
-    return new Promise((resolve, reject) => {
-        const eventSource = new EventSource(
-            `${API_BASE}/rag/stream`,
-            { withCredentials: false }
-        );
-
-        // 由于EventSource不支持POST，我们需要用fetch
-        fetch(`${API_BASE}/rag/stream`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                user_id: state.currentUserId,
-                session_id: targetSessionId,
-                message: message
-            })
-        }).then(response => {
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-            let result = null;
-
-            function readStream() {
-                reader.read().then(({ done, value }) => {
-                    if (done) {
-                        if (result) {
-                            resolve(result);
-                        } else {
-                            reject(new Error('流式响应未完成'));
-                        }
-                        return;
-                    }
-
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\n\n');
-                    buffer = lines.pop() || '';
-
-                    for (const line of lines) {
-                        if (line.startsWith('data: ')) {
-                            try {
-                                const data = JSON.parse(line.slice(6));
-                                handleStreamEvent(data);
-
-                                if (data.type === 'result') {
-                                    result = {
-                                        session_id: data.session_id,
-                                        answer: data.answer,
-                                        mode: data.mode,
-                                        sources: data.sources,
-                                        log_trace: data.log_trace
-                                    };
-                                }
-                            } catch (e) {
-                                console.error('解析SSE数据失败:', e);
-                            }
-                        }
-                    }
-
-                    readStream();
-                }).catch(reject);
-            }
-
-            readStream();
-        }).catch(reject);
     });
 }
 
-// 处理流式事件
-function handleStreamEvent(event) {
-    const logContent = elements.logPanelContent;
+// ===== 认证处理 =====
+async function handleLogin(e) {
+    e.preventDefault();
+    const username = $('loginUsername').value.trim();
+    const password = $('loginPassword').value;
+    if (!username || !password) return;
 
-    // 移除空状态提示
-    const emptyState = logContent.querySelector('.log-empty');
-    if (emptyState) {
-        emptyState.remove();
-    }
+    try {
+        $('loginError').textContent = '';
+        const res = await fetch(`${API_BASE}/auth/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || '登录失败');
 
-    // 添加会话ID和唯一ID到事件
-    event.session_id = event.session_id || state.currentSessionId || 'new';
-    event.id = `log-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-
-    // 存储到状态和localStorage
-    state.logs.push(event);
-    saveLogs();
-
-    // 创建日志条目
-    const logEntry = createLogEntry(event);
-    if (logEntry) {
-        logContent.appendChild(logEntry);
-        // 自动滚动到底部
-        logContent.scrollTop = logContent.scrollHeight;
+        state.token = data.token;
+        state.user = data.user;
+        localStorage.setItem(TOKEN_KEY, data.token);
+        localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+        showMain();
+        showToast('登录成功', 'success');
+    } catch (err) {
+        $('loginError').textContent = err.message;
     }
 }
 
-// 创建日志条目DOM元素
-function createLogEntry(event) {
-    const logEntry = document.createElement('div');
-    logEntry.className = `log-entry log-${event.type}`;
-    logEntry.id = event.id;
-
-    const timeStr = event.timestamp ? `${event.timestamp.toFixed(2)}s` : '';
-    const sessionLabel = getSessionLabel(event.session_id);
-
-    switch (event.type) {
-        case 'start':
-            logEntry.innerHTML = `
-                <div class="log-header">
-                    <span class="log-session">[${sessionLabel}]</span>
-                    <span class="log-type">开始</span>
-                    <span class="log-time">${timeStr}</span>
-                </div>
-                <div class="log-content">开始处理查询...</div>
-            `;
-            break;
-
-        case 'decision':
-            logEntry.innerHTML = `
-                <div class="log-header">
-                    <span class="log-session">[${sessionLabel}]</span>
-                    <span class="log-type">决策</span>
-                    <span class="log-time">${timeStr}</span>
-                </div>
-                <div class="log-content">${escapeHtml(event.reason || event.action || '分析中...')}</div>
-                ${event.action ? `<div class="log-detail"><span class="log-detail-item"><strong>动作:</strong> ${event.action}</span></div>` : ''}
-            `;
-            break;
-
-        case 'rewrite':
-            logEntry.innerHTML = `
-                <div class="log-header">
-                    <span class="log-session">[${sessionLabel}]</span>
-                    <span class="log-type">改写</span>
-                    <span class="log-time">${timeStr}</span>
-                </div>
-                <div class="log-content">
-                    <div>原查询: ${escapeHtml(event.original_query || '')}</div>
-                    <div>改写为: <strong>${escapeHtml(event.rewritten_query || '')}</strong></div>
-                </div>
-            `;
-            break;
-
-        case 'decompose':
-            logEntry.innerHTML = `
-                <div class="log-header">
-                    <span class="log-session">[${sessionLabel}]</span>
-                    <span class="log-type">分解</span>
-                    <span class="log-time">${timeStr}</span>
-                </div>
-                <div class="log-content">问题被分解为多个子问题:</div>
-                <div class="log-sub-queries">
-                    ${(event.sub_queries || []).map(q => `<div class="log-sub-query">${escapeHtml(q)}</div>`).join('')}
-                </div>
-            `;
-            break;
-
-        case 'retrieve':
-            const snippets = event.snippets || [];
-            const duration = event.duration_ms ? `<span class="log-duration">${event.duration_ms}ms</span>` : '';
-            logEntry.innerHTML = `
-                <div class="log-header">
-                    <span class="log-session">[${sessionLabel}]</span>
-                    <span class="log-type">检索</span>
-                    <span class="log-time">${timeStr}${duration}</span>
-                </div>
-                <div class="log-content">找到 ${event.count || 0} 条相关文档</div>
-                ${snippets.length > 0 ? `
-                    <div class="log-snippets">
-                        ${snippets.slice(0, 3).map((s, i) => `
-                            <div class="log-snippet">
-                                <div class="snippet-source">[${i + 1}] ${escapeHtml(s.source || '未知来源')}</div>
-                                ${escapeHtml(s.text || s.content || '').substring(0, 150)}...
-                            </div>
-                        `).join('')}
-                    </div>
-                ` : ''}
-            `;
-            break;
-
-        case 'answer':
-            logEntry.innerHTML = `
-                <div class="log-header">
-                    <span class="log-session">[${sessionLabel}]</span>
-                    <span class="log-type">回答</span>
-                    <span class="log-time">${timeStr}</span>
-                </div>
-                <div class="log-content">${escapeHtml(event.answer || event.preview || '生成回答中...').substring(0, 200)}${(event.answer || event.preview || '').length > 200 ? '...' : ''}</div>
-            `;
-            break;
-
-        case 'complete':
-            const totalDuration = event.total_duration_ms ? `<span class="log-duration">${event.total_duration_ms}ms</span>` : '';
-            logEntry.innerHTML = `
-                <div class="log-header">
-                    <span class="log-session">[${sessionLabel}]</span>
-                    <span class="log-type">完成</span>
-                    <span class="log-time">${timeStr}${totalDuration}</span>
-                </div>
-                <div class="log-content">✓ 处理完成，共 ${event.iterations || 1} 轮迭代</div>
-            `;
-            break;
-
-        case 'error':
-            logEntry.innerHTML = `
-                <div class="log-header">
-                    <span class="log-session">[${sessionLabel}]</span>
-                    <span class="log-type">错误</span>
-                    <span class="log-time">${timeStr}</span>
-                </div>
-                <div class="log-content" style="color: #dc3545;">${escapeHtml(event.message || '未知错误')}</div>
-            `;
-            break;
-
-        case 'result':
-            // 最终结果，显示总结
-            logEntry.innerHTML = `
-                <div class="log-header">
-                    <span class="log-session">[${sessionLabel}]</span>
-                    <span class="log-type">结果</span>
-                    <span class="log-time">${timeStr}</span>
-                </div>
-                <div class="log-content">✓ 回答已生成</div>
-                ${event.sources && event.sources.length > 0 ? `
-                    <div class="log-detail">
-                        <span class="log-detail-item"><strong>来源:</strong> ${event.sources.map(s => s.source || s.type || '未知').join(', ')}</span>
-                    </div>
-                ` : ''}
-            `;
-            break;
-
-        default:
-            logEntry.innerHTML = `
-                <div class="log-header">
-                    <span class="log-session">[${sessionLabel}]</span>
-                    <span class="log-type">${escapeHtml(event.type)}</span>
-                    <span class="log-time">${timeStr}</span>
-                </div>
-                <div class="log-content">${escapeHtml(JSON.stringify(event, null, 2).substring(0, 200))}</div>
-            `;
-    }
-
-    return logEntry;
+function handleLogout() {
+    state.token = null;
+    state.user = null;
+    state.sessionId = null;
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(USER_KEY);
+    showLogin();
+    showToast('已退出登录');
 }
 
-// 渲染所有历史日志
-function renderAllLogs() {
-    const logContent = elements.logPanelContent;
+async function handleChangePassword(e) {
+    e.preventDefault();
+    const oldPassword = $('oldPassword').value;
+    const newPassword = $('newPassword').value;
+    const confirmPassword = $('confirmPassword').value;
 
-    if (state.logs.length === 0) {
-        logContent.innerHTML = '<div class="log-empty">暂无日志，发送消息开始对话</div>';
+    if (newPassword !== confirmPassword) {
+        $('passwordError').textContent = '两次输入的密码不一致';
         return;
     }
 
-    logContent.innerHTML = '';
-    state.logs.forEach(event => {
-        const logEntry = createLogEntry(event);
-        if (logEntry) {
-            logContent.appendChild(logEntry);
-        }
-    });
-
-    // 滚动到底部
-    logContent.scrollTop = logContent.scrollHeight;
-}
-
-// 获取会话列表
-async function fetchSessions() {
-    const data = await apiCall(`/sessions?user_id=${state.currentUserId}`);
-    state.sessions = data.sessions || [];
-    renderSessionList();
-}
-
-// 获取会话历史
-async function fetchHistory(sessionId) {
-    const data = await apiCall(`/history/${sessionId}?user_id=${state.currentUserId}`);
-    return data.history || [];
-}
-
-// 删除会话
-async function deleteSession(sessionId) {
-    await apiCall(`/session/${sessionId}?user_id=${state.currentUserId}`, {
-        method: 'DELETE'
-    });
+    try {
+        await api('/auth/change-password', {
+            method: 'POST',
+            body: JSON.stringify({ old_password: oldPassword, new_password: newPassword })
+        });
+        $('passwordError').textContent = '';
+        $('changePasswordForm').reset();
+        showToast('密码修改成功', 'success');
+    } catch (err) {
+        $('passwordError').textContent = err.message;
+    }
 }
 
 // ===== 模式切换 =====
-function toggleMode() {
-    state.mode = state.mode === 'chat' ? 'rag' : 'chat';
+function setMode(mode) {
+    state.mode = mode;
     updateModeUI();
-
-    // 切换模式时可以新建会话（可选）
-    // newSession();
 }
 
 function updateModeUI() {
+    const chatBtn = $('chatModeBtn');
+    const ragBtn = $('ragModeBtn');
     if (state.mode === 'chat') {
-        elements.modeToggle.classList.remove('rag-mode');
-        elements.modeToggle.classList.add('chat-mode');
-        elements.modeLabel.textContent = '智能聊天';
-        elements.modeLabel.title = '支持网络搜索，适合实时问题';
+        chatBtn.classList.add('chat-mode');
+        chatBtn.classList.remove('rag-mode');
+        chatBtn.style.background = '#4a90d9';
+        chatBtn.style.color = 'white';
+        ragBtn.style.background = '#ccc';
+        ragBtn.style.color = '#666';
     } else {
-        elements.modeToggle.classList.remove('chat-mode');
-        elements.modeToggle.classList.add('rag-mode');
-        elements.modeLabel.textContent = '知识库问答';
-        elements.modeLabel.title = '知识库检索 + 网络搜索 + 图谱检索';
+        ragBtn.classList.add('rag-mode');
+        ragBtn.classList.remove('chat-mode');
+        ragBtn.style.background = '#e67e22';
+        ragBtn.style.color = 'white';
+        chatBtn.style.background = '#ccc';
+        chatBtn.style.color = '#666';
     }
 }
 
-// ===== 渲染函数 =====
-
-// 获取会话的加载状态
-function isSessionLoading(sessionId) {
-    return state.pendingRequests.has(sessionId);
-}
-
-// 渲染会话列表
-function renderSessionList() {
-    if (state.sessions.length === 0) {
-        elements.sessionList.innerHTML = `
-            <div class="empty-state">
-                <h3>暂无会话</h3>
-                <p>发送消息开始新对话</p>
-            </div>
-        `;
-        return;
+// ===== API 封装 =====
+async function api(endpoint, options = {}) {
+    const headers = {
+        'Content-Type': 'application/json',
+        ...options.headers
+    };
+    if (state.token) {
+        headers['Authorization'] = `Bearer ${state.token}`;
     }
 
-    elements.sessionList.innerHTML = state.sessions.map(session => {
-        const isLoading = isSessionLoading(session.session_id);
-        const isActive = session.session_id === state.currentSessionId;
-        return `
-            <div class="session-item ${isActive ? 'active' : ''} ${isLoading ? 'loading' : ''}"
-                 data-session-id="${session.session_id}">
-                <div class="session-preview">
-                    ${isLoading ? '<span class="loading-indicator">...</span> ' : ''}
-                    ${escapeHtml(session.preview || '空会话')}
-                </div>
-                <div class="session-time">${formatTime(session.last_active)}</div>
-                <button class="delete-btn" data-delete="${session.session_id}">x</button>
-            </div>
-        `;
-    }).join('');
-
-    // 绑定点击事件
-    elements.sessionList.querySelectorAll('.session-item').forEach(item => {
-        item.addEventListener('click', async (e) => {
-            if (e.target.classList.contains('delete-btn')) return;
-            const sessionId = item.dataset.sessionId;
-            await switchSession(sessionId);
-        });
+    const res = await fetch(`${API_BASE}${endpoint}`, {
+        ...options,
+        headers
     });
 
-    // 绑定删除事件
-    elements.sessionList.querySelectorAll('.delete-btn').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            const sessionId = btn.dataset.delete;
-            if (confirm('确定删除此会话？')) {
-                await deleteSession(sessionId);
-                if (state.currentSessionId === sessionId) {
-                    newSession();
-                }
-                await fetchSessions();
+    if (res.status === 401) {
+        showToast('登录已过期，请重新登录', 'error');
+        handleLogout();
+        throw new Error('Unauthorized');
+    }
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    return data;
+}
+
+// ===== 系统状态 =====
+async function loadSystemStatus() {
+    try {
+        // 健康检查（无需认证）
+        const health = await fetch(`${API_BASE}/health`).then(r => r.json());
+        $('kbStatus').textContent = health.knowledge_base || '-';
+        $('kbStatus').className = 'status-value success';
+        $('bm25Status').textContent = health.bm25_index || '-';
+        $('bm25Status').className = health.bm25_index !== '未加载' ? 'status-value success' : 'status-value error';
+
+        // 图谱状态
+        try {
+            const graphStats = await api('/graph/stats');
+            if (graphStats.enabled && graphStats.connected) {
+                $('graphStatus').textContent = `${graphStats.nodes}节点 / ${graphStats.edges}边`;
+                $('graphStatus').className = 'status-value success';
+            } else {
+                $('graphStatus').textContent = graphStats.message || '未连接';
+                $('graphStatus').className = 'status-value error';
             }
-        });
-    });
+        } catch {
+            $('graphStatus').textContent = '未启用';
+            $('graphStatus').className = 'status-value';
+        }
+    } catch (err) {
+        console.error('加载系统状态失败:', err);
+    }
 }
 
-// 渲染消息列表
-function renderMessages() {
-    const sessionId = state.currentSessionId || 'new';
-    const messages = state.messages[sessionId] || [];
-    const isLoading = state.currentSessionId ? isSessionLoading(state.currentSessionId) : false;
+// ===== 消息发送 =====
+async function sendMessage() {
+    const input = $('messageInput');
+    const msg = input.value.trim();
+    if (!msg) return;
 
-    if (messages.length === 0 && !isLoading) {
-        elements.chatMessages.innerHTML = `
-            <div class="empty-state">
-                <h3>开始对话</h3>
-                <p>当前模式: ${state.mode === 'chat' ? '智能聊天' : '知识库问答'}</p>
-                <p class="mode-hint">${state.mode === 'chat' ? '支持网络搜索，适合天气、新闻等实时问题' : '知识库检索 + 网络搜索 + 图谱检索'}</p>
-                ${state.graphStats && state.graphStats.connected ? '<p class="graph-hint">图谱已连接，可测试多跳查询</p>' : ''}
-            </div>
-        `;
-        return;
-    }
+    input.value = '';
+    $('sendBtn').disabled = true;
 
-    let html = messages.map(msg => `
-        <div class="message ${msg.role}">
-            <div class="message-header">
-                ${msg.role === 'user' ? '用户' : '助手'}
-                ${msg.mode ? `<span class="mode-tag">${msg.mode === 'chat' ? '聊天' : '知识库'}</span>` : ''}
-                ${msg.webSearched ? '<span class="web-tag">网络搜索</span>' : ''}
-                ${msg.hasGraph ? '<span class="graph-tag">图谱</span>' : ''}
-            </div>
-            <div class="message-content">${escapeHtml(msg.content)}</div>
-            ${msg.sources && msg.sources.length > 0 ? renderSources(msg.sources) : ''}
-            ${msg.entities && msg.entities.length > 0 ? renderEntities(msg.entities) : ''}
-        </div>
-    `).join('');
-
-    // 如果当前会话正在加载，显示加载指示器
-    if (isLoading) {
-        html += `
-            <div class="message assistant loading-message">
-                <div class="loading">正在思考...</div>
-            </div>
-        `;
-    }
-
-    elements.chatMessages.innerHTML = html;
-    elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
-}
-
-// 渲染来源
-function renderSources(sources) {
-    if (!sources || sources.length === 0) return '';
-    return `
-        <div class="message-sources">
-            <strong>来源:</strong>
-            ${sources.map(s => `<span>${escapeHtml(s.source || s.type || '未知')}</span>`).join(', ')}
-        </div>
-    `;
-}
-
-// 渲染实体
-function renderEntities(entities) {
-    if (!entities || entities.length === 0) return '';
-    return `
-        <div class="message-entities">
-            <strong>相关实体:</strong>
-            ${entities.map(e => `<span class="entity-tag">${escapeHtml(e)}</span>`).join(' ')}
-        </div>
-    `;
-}
-
-// 更新发送按钮状态
-function updateSendButton() {
-    const isLoading = state.currentSessionId ? isSessionLoading(state.currentSessionId) : false;
-    elements.sendBtn.disabled = isLoading;
-    elements.sendBtn.textContent = isLoading ? '等待中...' : '发送';
-}
-
-// ===== 事件处理 =====
-
-// 切换会话
-async function switchSession(sessionId) {
-    state.currentSessionId = sessionId;
-    elements.currentSessionId.textContent = sessionId.substring(0, 8) + '...';
-
-    // 如果还没有加载过这个会话的消息，从服务器加载
-    if (!state.messages[sessionId]) {
-        const history = await fetchHistory(sessionId);
-        state.messages[sessionId] = history;
-    }
-
-    renderMessages();
-    renderSessionList();
-    updateSendButton();
-}
-
-// 新建会话
-function newSession() {
-    state.currentSessionId = null;
-    state.messages['new'] = [];
-    elements.currentSessionId.textContent = '新会话';
-    renderMessages();
-    renderSessionList();
-    updateSendButton();
-}
-
-// 发送消息处理
-async function handleSend() {
-    const message = elements.messageInput.value.trim();
-    if (!message) return;
-
-    const targetSessionId = state.currentSessionId;
-    const sessionKey = targetSessionId || 'new';
-
-    // 如果当前会话已经在加载中，不发送新请求
-    if (isSessionLoading(targetSessionId)) {
-        return;
-    }
-
-    // 初始化会话消息数组
-    if (!state.messages[sessionKey]) {
-        state.messages[sessionKey] = [];
-    }
-
-    // 添加用户消息到对应会话
-    state.messages[sessionKey].push({ role: 'user', content: message });
-
-    // 如果是当前显示的会话，立即渲染
-    const isCurrentSession = (state.currentSessionId === targetSessionId) ||
-                             (!targetSessionId && state.currentSessionId === null);
-    if (isCurrentSession) {
-        renderMessages();
-    }
-
-    elements.messageInput.value = '';
-
-    // 标记该会话为加载中
-    state.pendingRequests.set(targetSessionId, { message, startTime: Date.now() });
-
-    // 更新UI
-    renderSessionList();
-    if (isCurrentSession) {
-        renderMessages();
-        updateSendButton();
-    }
+    // 添加用户消息
+    addMessage('user', msg);
 
     try {
-        const data = await sendMessage(message, targetSessionId);
-
-        // 检查请求完成时会话是否仍然有效
-        const responseSessionKey = data.session_id || 'new';
-
-        // 如果是新会话，需要迁移消息
-        if (!targetSessionId && data.session_id) {
-            if (state.messages['new'] && state.messages['new'].length > 0) {
-                if (!state.messages[data.session_id]) {
-                    state.messages[data.session_id] = [];
-                }
-                const userMsg = state.messages['new'].pop();
-                if (userMsg && userMsg.role === 'user') {
-                    state.messages[data.session_id].push(userMsg);
-                }
-            }
-            state.currentSessionId = data.session_id;
-            elements.currentSessionId.textContent = data.session_id.substring(0, 8) + '...';
-        }
-
-        // 确保会话消息数组存在
-        if (!state.messages[data.session_id]) {
-            state.messages[data.session_id] = [];
-        }
-
-        // 添加助手消息到正确的会话
-        state.messages[data.session_id].push({
-            role: 'assistant',
-            content: data.answer,
-            sources: data.sources,
-            mode: data.mode,  // 记录回复模式
-            webSearched: data.web_searched  // 是否进行了网络搜索
-        });
-
-        // 刷新会话列表
-        await fetchSessions();
-
-    } catch (error) {
-        const errorSessionKey = targetSessionId || 'new';
-        if (!state.messages[errorSessionKey]) {
-            state.messages[errorSessionKey] = [];
-        }
-        state.messages[errorSessionKey].push({
-            role: 'assistant',
-            content: `错误: ${error.message}`
-        });
-
-        // 在日志面板显示错误
-        if (elements.logPanelContent) {
-            handleStreamEvent({
-                type: 'error',
-                message: error.message,
-                timestamp: 0
+        if (state.mode === 'chat') {
+            // 聊天模式
+            const data = await api('/chat', {
+                method: 'POST',
+                body: JSON.stringify({ session_id: state.sessionId, message: msg })
             });
+            state.sessionId = data.session_id;
+            $('currentSessionId').textContent = state.sessionId.substring(0, 8);
+            addMessage('assistant', data.answer, data.sources, data.web_searched, false);
+            loadSessions();
+        } else {
+            // RAG 模式（SSE流式）
+            await sendRagMessage(msg);
         }
-    } finally {
-        // 清除加载状态
-        state.pendingRequests.delete(targetSessionId);
-
-        // 更新UI
-        renderSessionList();
-        renderMessages();
-        updateSendButton();
+    } catch (err) {
+        addMessage('assistant', `错误: ${err.message}`);
     }
+
+    $('sendBtn').disabled = false;
+    input.focus();
 }
 
-// 用户选择变更
-elements.userSelect.addEventListener('change', async (e) => {
-    const value = e.target.value;
-    if (value === 'custom') {
-        elements.customUserInput.style.display = 'inline';
-        elements.customUserInput.focus();
-    } else {
-        elements.customUserInput.style.display = 'none';
-        state.currentUserId = value;
-        state.messages = {};
-        state.pendingRequests.clear();
-        newSession();
-        await fetchSessions();
-    }
-});
-
-elements.customUserInput.addEventListener('change', async (e) => {
-    const value = e.target.value.trim();
-    if (value) {
-        state.currentUserId = value;
-        state.messages = {};
-        state.pendingRequests.clear();
-        newSession();
-        await fetchSessions();
-    }
-});
-
-// 模式切换
-elements.modeToggle.addEventListener('click', toggleMode);
-
-// 发送按钮
-elements.sendBtn.addEventListener('click', handleSend);
-
-// 回车发送
-elements.messageInput.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        handleSend();
-    }
-});
-
-// 新建会话按钮
-elements.newSessionBtn.addEventListener('click', newSession);
-
-// 图谱测试按钮
-if (elements.graphTestBtn) {
-    elements.graphTestBtn.addEventListener('click', testGraphSearch);
-}
-
-// 日志面板控制
-if (elements.clearLogBtn) {
-    elements.clearLogBtn.addEventListener('click', () => {
-        // 清空状态和存储
-        state.logs = [];
-        localStorage.removeItem(LOG_STORAGE_KEY);
-        // 清空UI
-        elements.logPanelContent.innerHTML = '<div class="log-empty">暂无日志，发送消息开始对话</div>';
+async function sendRagMessage(msg) {
+    const res = await fetch(`${API_BASE}/rag/stream`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${state.token}`
+        },
+        body: JSON.stringify({ session_id: state.sessionId, message: msg })
     });
+
+    if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || '请求失败');
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let result = null;
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+            if (line.startsWith('data: ')) {
+                try {
+                    const event = JSON.parse(line.slice(6));
+                    handleStreamEvent(event);
+                    if (event.type === 'result') {
+                        result = event;
+                    }
+                } catch (e) {}
+            }
+        }
+    }
+
+    if (result) {
+        state.sessionId = result.session_id;
+        $('currentSessionId').textContent = state.sessionId.substring(0, 8);
+        addMessage('assistant', result.answer, result.sources, false, true);
+        loadSessions();
+    }
 }
 
-if (elements.toggleLogPanelBtn) {
-    elements.toggleLogPanelBtn.addEventListener('click', () => {
-        elements.logPanel.classList.toggle('collapsed');
-        const icon = elements.toggleLogPanelBtn.textContent;
-        elements.toggleLogPanelBtn.textContent = icon === '◀' ? '▶' : '◀';
-    });
+function handleStreamEvent(event) {
+    const type = event.type;
+    let msg = '';
+    switch (type) {
+        case 'start': msg = '开始处理...'; break;
+        case 'decision': msg = `决策: ${event.action}`; break;
+        case 'rewrite': msg = `重写: ${event.new_query || event.rewritten_query || ''}`; break;
+        case 'decompose': msg = `分解查询: ${event.sub_queries?.join(', ') || ''}`; break;
+        case 'retrieve': msg = `检索${event.source ? '(' + event.source + ')' : ''}: ${event.query || ''}`; break;
+        case 'answer': msg = '生成回答...'; break;
+        case 'warning': msg = `警告: ${event.message || ''}`; break;
+        case 'max_iterations': msg = '达到最大迭代次数'; break;
+        case 'complete': msg = '处理完成'; break;
+        default: msg = type;
+    }
+    addLog(type, msg, event);
 }
 
-// ===== 工具函数 =====
+function addMessage(role, content, sources, webSearched, isRag) {
+    const container = $('chatMessages');
+    // 移除空状态
+    const empty = container.querySelector('.empty-state');
+    if (empty) empty.remove();
+
+    const div = document.createElement('div');
+    div.className = `message ${role}`;
+
+    let html = '';
+
+    // 消息头部标签
+    if (role === 'assistant') {
+        html += '<div class="message-header">';
+        if (isRag) {
+            html += '<span class="mode-tag">知识库</span>';
+        }
+        if (webSearched) {
+            html += '<span class="web-tag">网络搜索</span>';
+        }
+        html += '</div>';
+    }
+
+    html += `<div class="message-content">${escapeHtml(content)}</div>`;
+
+    // 显示来源
+    if (sources && sources.length > 0) {
+        html += '<div class="message-sources"><strong>来源:</strong> ';
+        sources.forEach((s, i) => {
+            const level = s.security_level || s.level || '';
+            const levelTag = level ? `<span class="security-tag ${level}">${level}</span>` : '';
+            html += `<span class="source-item">${levelTag}${escapeHtml(s.source || s)}</span>`;
+            if (i < sources.length - 1) html += ', ';
+        });
+        html += '</div>';
+    }
+
+    div.innerHTML = html;
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+}
 
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// ===== 会话管理 =====
+async function loadSessions() {
+    try {
+        const data = await api('/sessions');
+        state.sessions = data.sessions || [];
+        renderSessions();
+    } catch (err) {
+        console.error('加载会话失败:', err);
+    }
+}
+
+function renderSessions() {
+    const container = $('sessionList');
+    if (!state.sessions.length) {
+        container.innerHTML = '<div class="empty-state">暂无会话</div>';
+        return;
+    }
+
+    container.innerHTML = state.sessions.map(s => `
+        <div class="session-item ${s.session_id === state.sessionId ? 'active' : ''}" data-id="${s.session_id}">
+            <span class="session-preview">${escapeHtml(s.preview || s.session_id.substring(0, 8))}</span>
+            <span class="session-time">${formatTime(s.last_active || s.created_at)}</span>
+            <button class="delete-btn" data-id="${s.session_id}" title="删除">×</button>
+        </div>
+    `).join('');
+
+    // 点击加载会话
+    container.querySelectorAll('.session-item').forEach(el => {
+        el.addEventListener('click', (e) => {
+            if (e.target.classList.contains('delete-btn')) return;
+            const id = el.dataset.id;
+            state.sessionId = id;
+            $('currentSessionId').textContent = id.substring(0, 8);
+            loadHistory(id);
+            renderSessions();
+        });
+    });
+
+    // 删除会话
+    container.querySelectorAll('.delete-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            if (!confirm('确定删除此会话？')) return;
+            try {
+                await api(`/session/${btn.dataset.id}`, { method: 'DELETE' });
+                loadSessions();
+                if (state.sessionId === btn.dataset.id) {
+                    newSession();
+                }
+                showToast('会话已删除', 'success');
+            } catch (err) {
+                showToast('删除失败: ' + err.message, 'error');
+            }
+        });
+    });
+}
+
+function newSession() {
+    state.sessionId = null;
+    $('currentSessionId').textContent = '新会话';
+    $('chatMessages').innerHTML = '<div class="empty-state"><h3>新会话</h3><p>输入问题开始对话</p></div>';
+}
+
+async function loadHistory(sessionId) {
+    try {
+        const data = await api(`/history/${sessionId}`);
+        state.messages[sessionId] = data.history || [];
+        renderMessages(sessionId);
+    } catch (err) {
+        console.error('加载历史失败:', err);
+    }
+}
+
+function renderMessages(sessionId) {
+    const container = $('chatMessages');
+    const messages = state.messages[sessionId] || [];
+
+    if (!messages.length) {
+        container.innerHTML = '<div class="empty-state"><h3>新会话</h3><p>输入问题开始对话</p></div>';
+        return;
+    }
+
+    container.innerHTML = messages.map(m => `
+        <div class="message ${m.role}">
+            <div class="message-content">${escapeHtml(m.content)}</div>
+        </div>
+    `).join('');
+    container.scrollTop = container.scrollHeight;
 }
 
 function formatTime(timestamp) {
@@ -776,142 +503,147 @@ function formatTime(timestamp) {
     const diff = now - date;
 
     if (diff < 60000) return '刚刚';
-    if (diff < 3600000) return Math.floor(diff / 60000) + '分钟前';
-    if (diff < 86400000) return Math.floor(diff / 3600000) + '小时前';
-    return date.toLocaleDateString();
+    if (diff < 3600000) return `${Math.floor(diff / 60000)}分钟前`;
+    if (diff < 86400000) return `${Math.floor(diff / 3600000)}小时前`;
+    return `${date.getMonth() + 1}/${date.getDate()}`;
 }
 
-// ===== 初始化 =====
-async function init() {
-    console.log('RAG Chat UI 初始化...');
+// ===== 日志管理 =====
+function addLog(type, msg, data) {
+    state.logs.push({
+        type, msg, data,
+        time: new Date().toLocaleTimeString()
+    });
+    if (state.logs.length > 200) state.logs = state.logs.slice(-200);
+    localStorage.setItem(LOG_KEY, JSON.stringify(state.logs));
+    renderLogs();
+}
 
-    // 检查API连接
-    try {
-        const health = await apiCall('/health');
-        console.log('API 连接正常:', health);
-    } catch (error) {
-        console.error('API 连接失败:', error);
-        elements.chatMessages.innerHTML = `
-            <div class="empty-state">
-                <h3>API 连接失败</h3>
-                <p>请确保后端服务已启动: python rag_api_server.py</p>
+function renderLogs() {
+    const container = $('logPanelContent');
+    if (!state.logs.length) {
+        container.innerHTML = '<div class="log-empty">暂无日志</div>';
+        return;
+    }
+    container.innerHTML = state.logs.slice(-50).map(l => `
+        <div class="log-entry log-${l.type}">
+            <div class="log-header">
+                <span class="log-type">${l.type}</span>
+                <span class="log-time">${l.time}</span>
             </div>
-        `;
-        return;
-    }
-
-    // 初始化
-    state.messages['new'] = [];
-    updateModeUI();
-
-    // 加载历史日志
-    loadLogs();
-    renderAllLogs();
-
-    // 加载会话列表
-    await fetchSessions();
-
-    // 加载图谱状态
-    await fetchGraphStats();
-
-    // 聚焦输入框
-    elements.messageInput.focus();
-}
-
-// ===== 图谱相关 =====
-
-// 获取图谱统计
-async function fetchGraphStats() {
-    try {
-        const data = await apiCall('/graph/stats');
-        state.graphStats = data;
-        renderGraphStats();
-    } catch (error) {
-        console.error('获取图谱状态失败:', error);
-        elements.graphStats.innerHTML = `
-            <span class="error">图谱未启用</span>
-            <p class="hint">启动Neo4j后可用</p>
-        `;
-    }
-}
-
-// 渲染图谱统计
-function renderGraphStats() {
-    if (!state.graphStats) {
-        elements.graphStats.innerHTML = '<span class="loading">加载中...</span>';
-        return;
-    }
-
-    if (!state.graphStats.enabled || !state.graphStats.connected) {
-        elements.graphStats.innerHTML = `
-            <span class="status-off">○ 未连接</span>
-            <p class="hint">启动Neo4j后可用</p>
-        `;
-        return;
-    }
-
-    const stats = state.graphStats;
-    let typesHtml = '';
-    if (stats.types) {
-        const topTypes = Object.entries(stats.types)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 4)
-            .map(([type, count]) => `<span class="type-tag">${type}: ${count}</span>`)
-            .join('');
-        typesHtml = `<div class="type-list">${topTypes}</div>`;
-    }
-
-    elements.graphStats.innerHTML = `
-        <span class="status-on">● 已连接</span>
-        <div class="stats-row">
-            <span>节点: <strong>${stats.nodes}</strong></span>
-            <span>关系: <strong>${stats.edges}</strong></span>
+            <div class="log-content">${escapeHtml(l.msg)}</div>
         </div>
-        ${typesHtml}
-    `;
+    `).join('');
+    container.scrollTop = container.scrollHeight;
 }
 
-// 测试图谱检索
-async function testGraphSearch() {
-    const testQueries = [
-        "发生一级安全事件后应该向谁报告？",
-        "导出机密级数据需要哪些人审批？",
-        "新员工入职后谁来负责信息安全培训？"
-    ];
+function clearLogs() {
+    state.logs = [];
+    localStorage.removeItem(LOG_KEY);
+    renderLogs();
+}
 
-    const query = testQueries[Math.floor(Math.random() * testQueries.length)];
+function toggleLogPanel() {
+    $('logPanel').classList.toggle('collapsed');
+    $('toggleLogPanelBtn').textContent = $('logPanel').classList.contains('collapsed') ? '▶' : '◀';
+}
 
-    // 添加用户消息
-    const sessionKey = state.currentSessionId || 'new';
-    if (!state.messages[sessionKey]) {
-        state.messages[sessionKey] = [];
-    }
-    state.messages[sessionKey].push({ role: 'user', content: query });
-    renderMessages();
-
-    // 发送请求
+// ===== 管理员功能 =====
+async function showUsersModal() {
+    $('usersModal').style.display = 'flex';
     try {
-        const data = await apiCall('/graph/search', {
-            method: 'POST',
-            body: JSON.stringify({ query: query })
-        });
-
-        state.messages[sessionKey].push({
-            role: 'assistant',
-            content: data.answer || '无答案',
-            sources: data.sources,
-            entities: data.entities,
-            hasGraph: data.has_graph_context
-        });
-        renderMessages();
-    } catch (error) {
-        state.messages[sessionKey].push({
-            role: 'assistant',
-            content: `图谱检索失败: ${error.message}`
-        });
-        renderMessages();
+        const data = await api('/auth/users');
+        renderUsers(data.users || []);
+    } catch (err) {
+        showToast('加载用户列表失败', 'error');
     }
 }
 
-// 页面加载完成后初始化
-document.addEventListener('DOMContentLoaded', init);
+function renderUsers(users) {
+    const tbody = $('usersTableBody');
+    tbody.innerHTML = users.map(u => `
+        <tr>
+            <td>${escapeHtml(u.username)}</td>
+            <td>${getRoleLabel(u.role)}</td>
+            <td>${escapeHtml(u.department || '-')}</td>
+            <td><span class="user-status ${u.is_active ? 'active' : 'inactive'}">${u.is_active ? '活跃' : '禁用'}</span></td>
+            <td>
+                <button class="btn btn-sm btn-secondary" onclick="toggleUserStatus('${u.user_id}', ${!u.is_active})">${u.is_active ? '禁用' : '启用'}</button>
+            </td>
+        </tr>
+    `).join('');
+}
+
+async function toggleUserStatus(userId, isActive) {
+    try {
+        await api(`/auth/users/${userId}`, {
+            method: 'PUT',
+            body: JSON.stringify({ is_active: isActive })
+        });
+        showUsersModal();
+        showToast(`用户已${isActive ? '启用' : '禁用'}`, 'success');
+    } catch (err) {
+        showToast('操作失败: ' + err.message, 'error');
+    }
+}
+
+async function showAuditLogsModal() {
+    $('auditModal').style.display = 'flex';
+    loadAuditLogs();
+}
+
+async function loadAuditLogs() {
+    const action = $('auditActionFilter').value;
+    try {
+        const params = new URLSearchParams({ limit: 50, days: 7 });
+        if (action) params.append('action', action);
+        const data = await api(`/audit/logs?${params}`);
+        renderAuditLogs(data.logs || []);
+    } catch (err) {
+        showToast('加载审计日志失败', 'error');
+    }
+}
+
+function renderAuditLogs(logs) {
+    const container = $('auditList');
+    if (!logs.length) {
+        container.innerHTML = '<div class="empty-state">暂无日志</div>';
+        return;
+    }
+    container.innerHTML = logs.map(log => `
+        <div class="audit-entry">
+            <div class="audit-header">
+                <span class="audit-action">${log.action || '-'}</span>
+                <span class="audit-time">${log.timestamp || '-'}</span>
+            </div>
+            <div class="audit-user">用户: ${log.username || '-'} (${log.role || '-'})</div>
+            <div class="audit-query" style="color: var(--text-color); margin-top: 4px;">${escapeHtml(log.query || '-')}</div>
+        </div>
+    `).join('');
+}
+
+async function buildKnowledgeGraph() {
+    if (!confirm('确定要重建知识图谱吗？这可能需要一些时间。')) return;
+
+    showToast('开始构建知识图谱...', 'info');
+    try {
+        const result = await api('/graph/build', { method: 'POST' });
+        showToast(result.message || '知识图谱构建完成', 'success');
+        loadSystemStatus();
+    } catch (err) {
+        showToast('构建失败: ' + err.message, 'error');
+    }
+}
+
+// ===== Toast 提示 =====
+function showToast(message, type = 'info') {
+    const toast = $('toast');
+    toast.textContent = message;
+    toast.className = `toast show ${type}`;
+    setTimeout(() => {
+        toast.className = 'toast';
+    }, 3000);
+}
+
+// 暴露给 HTML 的全局函数
+window.toggleUserStatus = toggleUserStatus;

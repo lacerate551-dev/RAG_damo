@@ -3,31 +3,80 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RAG 对话测试系统</title>
+    <title>RAG 知识库系统</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <div class="container">
+    <!-- 登录面板 -->
+    <div id="loginPanel" class="login-panel">
+        <div class="login-container">
+            <div class="login-hero">
+                <div class="login-icon">🤖</div>
+                <h2>RAG 知识库系统</h2>
+                <p>智能检索 · 知识图谱 · 多轮对话</p>
+            </div>
+            <div class="login-box">
+                <form id="loginForm">
+                    <div class="form-group">
+                        <label>用户名</label>
+                        <input type="text" id="loginUsername" placeholder="请输入用户名" required autocomplete="username">
+                    </div>
+                    <div class="form-group">
+                        <label>密码</label>
+                        <input type="password" id="loginPassword" placeholder="请输入密码" required autocomplete="current-password">
+                    </div>
+                    <div id="loginError" class="error"></div>
+                    <button type="submit" id="loginBtn">登录</button>
+                </form>
+                <div class="hint">
+                    <strong>测试账号：</strong><br>
+                    管理员：admin / admin123（可访问所有文档）<br>
+                    普通用户：testuser / test123（仅访问 public + internal）
+                </div>
+            </div>
+            <div class="login-footer">
+                <div class="feature-list">
+                    <div class="feature-item">
+                        <span class="feature-icon">💬</span>
+                        <span>双模式对话</span>
+                    </div>
+                    <div class="feature-item">
+                        <span class="feature-icon">🔍</span>
+                        <span>智能检索</span>
+                    </div>
+                    <div class="feature-item">
+                        <span class="feature-icon">📊</span>
+                        <span>知识图谱</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 主界面 -->
+    <div id="mainContent" class="container" style="display:none;">
         <!-- 顶部导航 -->
         <header class="header">
-            <h1>RAG 对话测试系统</h1>
-            <div class="user-selector">
-                <label>用户ID:</label>
-                <select id="userSelect">
-                    <option value="test_user_001">测试用户1</option>
-                    <option value="test_user_002">测试用户2</option>
-                    <option value="custom">自定义...</option>
-                </select>
-                <input type="text" id="customUserInput" placeholder="输入用户ID" style="display:none;">
+            <div class="header-left">
+                <h1>RAG 知识库系统</h1>
+                <div class="mode-switcher">
+                    <button id="chatModeBtn" class="mode-toggle chat-mode">聊天</button>
+                    <button id="ragModeBtn" class="mode-toggle rag-mode" style="background:#ccc;color:#666;">知识库</button>
+                </div>
             </div>
-            <div class="mode-switcher">
-                <button id="modeToggle" class="mode-toggle chat-mode">
-                    <span class="mode-icon">Chat</span>
-                </button>
-                <span id="modeLabel" class="mode-label">普通聊天</span>
-            </div>
-            <div class="session-info">
-                <span>当前会话: <code id="currentSessionId">新会话</code></span>
+            <div class="header-right">
+                <div class="session-info">
+                    <span>会话: <code id="currentSessionId">新会话</code></span>
+                </div>
+                <div id="userInfo" class="user-info">
+                    <span class="username" id="username">-</span>
+                    <span class="role" id="userRole">-</span>
+                </div>
+                <div class="header-actions">
+                    <a href="exam.html" class="btn-icon" title="出题系统" style="text-decoration:none;">📝</a>
+                    <button id="settingsBtn" class="btn-icon" title="设置">⚙</button>
+                    <button id="logoutBtn" class="btn-icon btn-danger" title="退出">⏻</button>
+                </div>
             </div>
         </header>
 
@@ -35,51 +84,154 @@
             <!-- 左侧会话列表 -->
             <aside class="sidebar">
                 <div class="sidebar-header">
-                    <h2>会话列表</h2>
-                    <button id="newSessionBtn" class="btn btn-primary">+ 新建会话</button>
+                    <h2>会话历史</h2>
+                    <button id="newSessionBtn" class="btn btn-primary btn-sm">+ 新建</button>
                 </div>
                 <div id="sessionList" class="session-list">
-                    <!-- 会话列表动态生成 -->
+                    <div class="empty-state">暂无会话</div>
                 </div>
 
-                <!-- 图谱状态面板 -->
-                <div class="graph-panel">
-                    <h3>知识图谱</h3>
-                    <div id="graphStats" class="graph-stats">
-                        <span class="loading">加载中...</span>
+                <!-- 系统状态面板 -->
+                <div class="status-panel">
+                    <h3>系统状态</h3>
+                    <div id="systemStatus" class="status-content">
+                        <div class="status-item">
+                            <span class="status-label">知识库</span>
+                            <span class="status-value" id="kbStatus">-</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">BM25索引</span>
+                            <span class="status-value" id="bm25Status">-</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">图谱</span>
+                            <span class="status-value" id="graphStatus">-</span>
+                        </div>
                     </div>
-                    <button id="graphTestBtn" class="btn btn-secondary" style="margin-top:8px;width:100%;">
-                        测试图谱检索
-                    </button>
                 </div>
             </aside>
 
-            <!-- 右侧聊天区域 -->
+            <!-- 中间聊天区域 -->
             <main class="chat-area">
                 <div id="chatMessages" class="chat-messages">
-                    <!-- 消息动态生成 -->
+                    <div class="empty-state">
+                        <h3>欢迎使用 RAG 知识库系统</h3>
+                        <p>输入问题开始对话</p>
+                    </div>
                 </div>
                 <div class="chat-input-area">
-                    <input type="text" id="messageInput" placeholder="输入消息..." />
+                    <input type="text" id="messageInput" placeholder="输入消息... (Enter发送)" />
                     <button id="sendBtn" class="btn btn-primary">发送</button>
                 </div>
             </main>
 
-            <!-- 日志面板 -->
+            <!-- 右侧日志面板 -->
             <aside class="log-panel" id="logPanel">
                 <div class="log-panel-header">
-                    <h3>🔍 思考过程</h3>
+                    <h3>思考过程</h3>
                     <div class="log-panel-controls">
-                        <button id="clearLogBtn" class="btn btn-sm btn-secondary" title="清空日志">清空</button>
-                        <button id="toggleLogPanelBtn" class="btn btn-sm btn-secondary" title="折叠/展开">◀</button>
+                        <button id="clearLogBtn" class="btn-sm" title="清空日志">🗑</button>
+                        <button id="toggleLogPanelBtn" class="btn-sm" title="折叠">◀</button>
                     </div>
                 </div>
                 <div class="log-panel-content" id="logPanelContent">
-                    <div class="log-empty">暂无日志，发送消息开始对话</div>
+                    <div class="log-empty">暂无日志</div>
                 </div>
             </aside>
         </div>
     </div>
+
+    <!-- 设置弹窗 -->
+    <div id="settingsModal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>设置</h2>
+                <button class="modal-close" id="closeSettingsBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="settings-section">
+                    <h3>修改密码</h3>
+                    <form id="changePasswordForm">
+                        <div class="form-group">
+                            <label>当前密码</label>
+                            <input type="password" id="oldPassword" placeholder="当前密码">
+                        </div>
+                        <div class="form-group">
+                            <label>新密码</label>
+                            <input type="password" id="newPassword" placeholder="新密码">
+                        </div>
+                        <div class="form-group">
+                            <label>确认新密码</label>
+                            <input type="password" id="confirmPassword" placeholder="确认新密码">
+                        </div>
+                        <button type="submit" class="btn btn-primary">修改密码</button>
+                    </form>
+                    <div id="passwordError" class="error"></div>
+                </div>
+
+                <!-- 管理员功能 -->
+                <div id="adminSection" class="settings-section" style="display:none;">
+                    <h3>用户管理 <span class="admin-badge">管理员</span></h3>
+                    <button id="showUsersBtn" class="btn btn-secondary">查看用户列表</button>
+                    <button id="showAuditLogsBtn" class="btn btn-secondary">查看审计日志</button>
+                    <button id="buildGraphBtn" class="btn btn-secondary">重建知识图谱</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 用户列表弹窗 -->
+    <div id="usersModal" class="modal" style="display:none;">
+        <div class="modal-content modal-lg">
+            <div class="modal-header">
+                <h2>用户列表</h2>
+                <button class="modal-close" id="closeUsersBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="usersList" class="users-table-container">
+                    <table class="users-table">
+                        <thead>
+                            <tr>
+                                <th>用户名</th>
+                                <th>角色</th>
+                                <th>部门</th>
+                                <th>状态</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="usersTableBody">
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 审计日志弹窗 -->
+    <div id="auditModal" class="modal" style="display:none;">
+        <div class="modal-content modal-lg">
+            <div class="modal-header">
+                <h2>审计日志</h2>
+                <button class="modal-close" id="closeAuditBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="audit-filters">
+                    <select id="auditActionFilter">
+                        <option value="">全部操作</option>
+                        <option value="login">登录</option>
+                        <option value="rag_query">知识库查询</option>
+                        <option value="chat_query">聊天查询</option>
+                    </select>
+                    <button id="refreshAuditBtn" class="btn btn-sm">刷新</button>
+                </div>
+                <div id="auditList" class="audit-list">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast 提示 -->
+    <div id="toast" class="toast"></div>
 
     <script src="app.js"></script>
 </body>
