@@ -61,62 +61,25 @@ except ImportError:
 
 # 导入配置
 try:
-    from config import API_KEY, BASE_URL, MODEL
+    from config import (
+        API_KEY, BASE_URL, MODEL,
+        PROJECT_ROOT, MODELS_DIR, EMBEDDING_MODEL_PATH, RERANK_MODEL_PATH,
+        VECTOR_STORE_PATH, CHROMA_DB_PATH, DOCUMENTS_PATH, BM25_INDEXES_PATH,
+        USE_MULTI_KB, USE_HYBRID_SEARCH, VECTOR_WEIGHT, BM25_WEIGHT,
+        USE_RERANK, RERANK_CANDIDATES, RERANK_TOP_K,
+        USE_ODL_PARSER, ODL_USE_STRUCT_TREE, ODL_USE_HYBRID,
+        USE_DOCLING_PARSER,
+        USE_EXCEL_ENHANCED, EXCEL_MAX_ROWS_PER_CHUNK, EXCEL_MIN_ROWS_PER_CHUNK,
+        USE_SEMANTIC_CHUNK, SEMANTIC_BREAKPOINT_THRESHOLD,
+        SEMANTIC_MIN_CHUNK_SIZE, SEMANTIC_MAX_CHUNK_SIZE
+    )
 except ImportError:
     print("错误: 未找到config.py文件")
     print("请复制config.example.py为config.py并填入你的API Key")
     exit(1)
 
-# ========== 路径配置 ==========
-# 项目根目录
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-
-# 模型目录（统一管理）
-MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
-
-# 向量模型路径（必需，需手动下载）
-EMBEDDING_MODEL_PATH = os.path.join(MODELS_DIR, "bge-base-zh-v1.5")
-
-# 重排序模型路径（首次运行自动下载到此目录）
-RERANK_MODEL_PATH = os.path.join(MODELS_DIR, "bge-reranker-base")
-
-# 数据目录
-VECTOR_STORE_PATH = os.path.join(PROJECT_ROOT, "vector_store")
-CHROMA_DB_PATH = os.path.join(VECTOR_STORE_PATH, "chroma")
-DOCUMENTS_PATH = os.path.join(PROJECT_ROOT, "documents")
-BM25_INDEXES_PATH = os.path.join(VECTOR_STORE_PATH, "bm25")
-
-# 多向量库配置
-USE_MULTI_KB = True  # 是否使用多向量库模式
-
-# 混合检索配置
-USE_HYBRID_SEARCH = True  # 是否启用混合检索
-VECTOR_WEIGHT = 0.5  # 向量检索权重
-BM25_WEIGHT = 0.5  # BM25检索权重
-
-# Rerank配置
-USE_RERANK = True  # 是否启用重排序
-RERANK_CANDIDATES = 20  # 重排序前的候选数量（混合检索后）
-RERANK_TOP_K = 5  # 重排序后返回的数量
-
-# PDF 解析配置
-USE_ODL_PARSER = True  # 是否使用 OpenDataLoader PDF 解析器（更高质量）
-ODL_USE_STRUCT_TREE = True  # 是否使用 PDF 结构树（Tagged PDF）
-ODL_USE_HYBRID = False  # 是否使用混合模式（需要后端服务）
-
-# Docling 文档解析配置
-USE_DOCLING_PARSER = True  # 是否使用 Docling 解析 Word（更高质量）
-
-# Excel 解析配置
-USE_EXCEL_ENHANCED = True  # 是否使用增强版 Excel 解析器
-EXCEL_MAX_ROWS_PER_CHUNK = 50  # 每个分块的最大行数
-EXCEL_MIN_ROWS_PER_CHUNK = 2   # 每个分块的最小行数
-
-# 分块配置
-USE_SEMANTIC_CHUNK = True  # 是否使用语义分块（替代固定字符切分）
-SEMANTIC_BREAKPOINT_THRESHOLD = 0.5  # 语义分块阈值（值越大分块越少）
-SEMANTIC_MIN_CHUNK_SIZE = 50  # 最小分块字符数
-SEMANTIC_MAX_CHUNK_SIZE = 800  # 最大分块字符数
+# BM25 索引路径
+BM25_INDEX_PATH = os.path.join(BM25_INDEXES_PATH, "default_bm25.pkl")
 
 
 # ========== 模型初始化辅助函数 ==========
