@@ -10,7 +10,7 @@
 6. 推送通知 - 变更时通知订阅用户
 
 使用方式：
-    from knowledge_sync import KnowledgeSyncService
+    from knowledge.sync import KnowledgeSyncService
 
     # 启动同步服务
     sync_service = KnowledgeSyncService()
@@ -752,7 +752,7 @@ class KnowledgeSyncService:
             kb_name = self._get_kb_name_from_path(change.document_id)
 
             # 导入知识库管理器
-            from knowledge_base_manager import get_kb_manager
+            from knowledge.manager import get_kb_manager
             kb_manager = get_kb_manager()
 
             if change.change_type == ChangeType.ADDED:

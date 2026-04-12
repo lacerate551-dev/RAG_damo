@@ -32,21 +32,21 @@ import jieba
 
 # OpenDataLoader PDF 解析器（可选）
 try:
-    from pdf_parser_odl import parse_pdf_with_odl, ChunkMetadata
+    from parsers.pdf_odl import parse_pdf_with_odl, ChunkMetadata
     ODL_AVAILABLE = True
 except ImportError:
     ODL_AVAILABLE = False
 
 # 语义分块器（可选）
 try:
-    from semantic_chunker import SemanticChunker, HybridChunker
+    from core.chunker import SemanticChunker, HybridChunker
     SEMANTIC_CHUNKER_AVAILABLE = True
 except ImportError:
     SEMANTIC_CHUNKER_AVAILABLE = False
 
 # Docling 文档解析器（可选）
 try:
-    from doc_parser_docling import DoclingParser, DOCLING_AVAILABLE, DocChunk
+    from parsers.docx_docling import DoclingParser, DOCLING_AVAILABLE, DocChunk
     if not DOCLING_AVAILABLE:
         DOCLING_AVAILABLE = False
 except ImportError:
@@ -54,7 +54,7 @@ except ImportError:
 
 # Excel 增强解析器（可选）
 try:
-    from excel_parser_enhanced import ExcelParserEnhanced, ExcelChunk
+    from parsers.excel_parser import ExcelParserEnhanced, ExcelChunk
     EXCEL_ENHANCED_AVAILABLE = True
 except ImportError:
     EXCEL_ENHANCED_AVAILABLE = False
@@ -283,9 +283,9 @@ elif USE_SEMANTIC_CHUNK and not SEMANTIC_CHUNKER_AVAILABLE:
 print("\n[2/5] 初始化向量数据库...")
 # 多向量库模式
 if USE_MULTI_KB:
-    from knowledge_base_manager import KnowledgeBaseManager
-    from kb_router import KnowledgeBaseRouter
-    from auth_gateway import get_accessible_collections
+    from knowledge.manager import KnowledgeBaseManager
+    from knowledge.router import KnowledgeBaseRouter
+    from auth.gateway import get_accessible_collections
 
     kb_manager = KnowledgeBaseManager(CHROMA_DB_PATH)
     kb_router = KnowledgeBaseRouter(use_llm=False)
@@ -708,7 +708,7 @@ def extract_text_from_docx_docling(filepath):
     """使用 Docling 解析 Word 文档"""
     content_blocks = []
     try:
-        from doc_parser_docling import DoclingParser
+        from parsers.docx_docling import DoclingParser
 
         parser = DoclingParser()
         result = parser.parse(filepath)
@@ -823,7 +823,7 @@ def extract_text_from_xlsx_enhanced(filepath):
     """使用增强解析器处理 Excel"""
     content_blocks = []
     try:
-        from excel_parser_enhanced import ExcelParserEnhanced
+        from parsers.excel_parser import ExcelParserEnhanced
 
         parser = ExcelParserEnhanced(
             max_rows_per_chunk=EXCEL_MAX_ROWS_PER_CHUNK,
@@ -1697,7 +1697,7 @@ def check_restricted_documents(query, allowed_levels, top_k=3, role=None, depart
 
 def _check_restricted_multi_kb(query, role, department, top_k=3):
     """多向量库模式下的受限文档检测"""
-    from auth_gateway import get_accessible_collections
+    from auth.gateway import get_accessible_collections
 
     # 获取所有向量库和可访问向量库
     all_collections = [c.name for c in kb_manager.list_collections()]

@@ -8,7 +8,7 @@
 4. 版本对比 - 对比不同版本的差异
 
 使用方式：
-    from document_lifecycle import DocumentLifecycleManager, DocumentStatus
+    from knowledge.lifecycle import DocumentLifecycleManager, DocumentStatus
 
     manager = DocumentLifecycleManager()
 
@@ -195,7 +195,7 @@ class DocumentLifecycleManager:
                 "affected_questions": [...]
             }
         """
-        from knowledge_base_manager import get_kb_manager
+        from knowledge.manager import get_kb_manager
 
         kb_manager = get_kb_manager()
 
@@ -648,7 +648,7 @@ class DocumentLifecycleManager:
             受影响的题目列表
         """
         try:
-            from question_maintenance_hook import on_knowledge_base_change
+            from exam_pkg.question_hook import on_knowledge_base_change
 
             result = on_knowledge_base_change(
                 collection=collection,

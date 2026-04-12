@@ -8,7 +8,7 @@
 4. 支持按用户、时间范围查询日志
 
 使用方式：
-    from audit_logger import AuditLogger
+    from services.audit import AuditLogger
 
     logger = AuditLogger()
     logger.log_query(user_id, query, result_summary, sources)

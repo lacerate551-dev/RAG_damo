@@ -7,7 +7,7 @@ Chunk级别差异检测 - 支持增量更新
 3. 影响评估 - 分析变更对题目的影响级别
 
 使用方式：
-    from document_diff import DocumentDiffAnalyzer, ChunkDiff
+    from knowledge.diff import DocumentDiffAnalyzer, ChunkDiff
 
     analyzer = DocumentDiffAnalyzer()
 

@@ -12,7 +12,7 @@
 - dept_{部门名}: 部门知识库，如 dept_finance, dept_hr, dept_tech
 
 使用方式：
-    from knowledge_base_manager import KnowledgeBaseManager
+    from knowledge.manager import KnowledgeBaseManager
 
     kb_manager = KnowledgeBaseManager()
 

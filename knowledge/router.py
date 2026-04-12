@@ -7,7 +7,7 @@
 3. 单库优化 - 如果只需查询单库，避免不必要的并行检索
 
 使用方式：
-    from kb_router import KnowledgeBaseRouter
+    from knowledge.router import KnowledgeBaseRouter
 
     router = KnowledgeBaseRouter()
 
@@ -35,7 +35,7 @@ except ImportError:
     from rag_demo import API_KEY, BASE_URL, MODEL
 
 # 导入权限管理
-from auth_gateway import get_accessible_collections
+from auth.gateway import get_accessible_collections
 
 # 设置日志
 logging.basicConfig(
@@ -472,7 +472,7 @@ class KnowledgeBaseRouter:
             已废止版本提示列表
         """
         try:
-            from knowledge_base_manager import get_kb_manager
+            from knowledge.manager import get_kb_manager
 
             kb_manager = get_kb_manager()
 
@@ -559,7 +559,7 @@ class KnowledgeBaseRouter:
                 "target_collections": [...]
             }
         """
-        from knowledge_base_manager import get_kb_manager
+        from knowledge.manager import get_kb_manager
 
         kb_manager = get_kb_manager()
 

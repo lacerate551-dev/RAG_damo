@@ -6,7 +6,7 @@
 - 批卷：提交答案、批阅、报告
 
 使用方式：
-    from exam_api import exam_bp
+    from exam_pkg.api import exam_bp
     app.register_blueprint(exam_bp, url_prefix='/exam')
 """
 
@@ -16,7 +16,7 @@ import jwt
 import os
 
 # 导入考试管理模块
-from exam_manager import (
+from exam_pkg.manager import (
     generate_exam, save_exam, load_exam, delete_exam,
     list_exams, get_exam_by_id, update_exam,
     review_exam, submit_for_review, search_questions,
@@ -26,7 +26,7 @@ from exam_manager import (
 )
 
 # 导入网关认证模块
-from auth_gateway import (
+from auth.gateway import (
     require_gateway_auth, check_collection_permission, get_current_user
 )
 

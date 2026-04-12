@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG 系统 API 测试终端</title>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        /* 追加和覆盖针对 API 页面特有的柔性样式 */
+        body { padding: 0; margin: 0; background-color: var(--bg-color); }
+        .api-container {
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+            background: var(--glass-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+        }
+        
+        .api-sidebar {
+            width: 320px;
+            background: rgba(255, 255, 255, 0.05);
+            border-right: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+        }
+
+        .api-sidebar-header {
+            padding: 20px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .api-sidebar-header h2 { margin: 0; font-size: 1.2rem; }
+        .back-btn { 
+            text-decoration: none; 
+            color: var(--text-color); 
+            font-size: 1.2rem; 
+            opacity: 0.7; 
+            transition: opacity 0.2s;
+        }
+        .back-btn:hover { opacity: 1; }
+
+        .api-group {
+            margin: 10px 0;
+        }
+        .api-group-title {
+            padding: 10px 20px;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            color: #888;
+            letter-spacing: 1px;
+            font-weight: 600;
+        }
+
+        .api-item {
+            padding: 12px 20px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            border-left: 3px solid transparent;
+        }
+        .api-item:hover { background: rgba(0,0,0,0.03); }
+        .api-item.active {
+            background: rgba(var(--primary-color-rgb, 74, 144, 217), 0.1);
+            border-left-color: var(--primary-color);
+        }
+
+        .api-method {
+            font-size: 0.7rem;
+            font-weight: bold;
+            padding: 3px 6px;
+            border-radius: 4px;
+            margin-right: 10px;
+            width: 45px;
+            text-align: center;
+        }
+        .method-GET { background: #e8f5e9; color: #2e7d32; }
+        .method-POST { background: #e3f2fd; color: #1565c0; }
+        .method-PUT { background: #fff3e0; color: #e65100; }
+        .method-DELETE { background: #ffebee; color: #c62828; }
+
+        .dark-mode .method-GET { background: rgba(46,125,50,0.2); }
+        .dark-mode .method-POST { background: rgba(21,101,192,0.2); }
+        .dark-mode .method-PUT { background: rgba(230,81,0,0.2); }
+        .dark-mode .method-DELETE { background: rgba(198,40,40,0.2); }
+
+        .api-path { 
+            font-size: 0.85rem; 
+            font-family: monospace; 
+            white-space: nowrap; 
+            overflow: hidden; 
+            text-overflow: ellipsis; 
+            flex: 1;
+        }
+
+        /* 主体测试区域 */
+        .api-main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+            position: relative;
+        }
+
+        .api-topbar {
+            padding: 20px 30px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .api-topbar h1 { margin: 0; font-size: 1.5rem; display: flex; align-items: center; gap: 15px;}
+        .api-desc {
+            color: #666;
+            margin-top: 10px;
+            font-size: 0.95rem;
+        }
+        .dark-mode .api-desc { color: #aaa; }
+
+        .api-content-wrap {
+            padding: 30px;
+            display: flex;
+            flex-direction: column;
+            gap: 25px;
+            max-width: 1000px;
+            margin: 0 auto;
+            width: 100%;
+        }
+
+        .request-panel, .response-panel {
+            background: var(--message-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.03);
+        }
+
+        .panel-title {
+            font-size: 1.1rem;
+            margin-top: 0;
+            margin-bottom: 15px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 10px;
+            font-weight: 600;
+        }
+
+        .param-group {
+            margin-bottom: 15px;
+        }
+        .param-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--text-color);
+        }
+        .param-group input, .param-group select, .param-group textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            background: var(--bg-color);
+            color: var(--text-color);
+            font-family: inherit;
+        }
+        .param-group textarea {
+            resize: vertical;
+            min-height: 100px;
+            font-family: monospace;
+        }
+        .param-group input:focus, .param-group textarea:focus {
+            outline: none;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 2px rgba(74, 144, 217, 0.2);
+        }
+
+        .action-row {
+            display: flex;
+            justify-content: flex-end;
+            margin-top: 20px;
+        }
+
+        .action-row button {
+            padding: 10px 30px;
+            font-size: 1rem;
+        }
+
+        /* JSON 显示区 */
+        .json-viewer {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.9rem;
+            min-height: 100px;
+            max-height: 600px;
+            white-space: pre-wrap;
+            margin: 0;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        .status-ok { background: #e8f5e9; color: #2e7d32; }
+        .status-error { background: #ffebee; color: #c62828; }
+        .status-loading { background: #e3f2fd; color: #1565c0; }
+
+        .api-url-preview {
+            background: rgba(0,0,0,0.05);
+            padding: 10px;
+            border-radius: 6px;
+            font-family: monospace;
+            word-break: break-all;
+            margin-bottom: 20px;
+            border: 1px solid var(--border-color);
+        }
+        .dark-mode .api-url-preview { background: rgba(255,255,255,0.05); }
+
+    </style>
+</head>
+<body>
+    <div class="api-container">
+        <!-- 左侧菜单栏 -->
+        <aside class="api-sidebar">
+            <div class="api-sidebar-header">
+                <h2>API 终端</h2>
+                <a href="index.html" class="back-btn" title="返回主页">🏠</a>
+            </div>
+            <div id="apiListContainer">
+                <!-- 动态渲染的 API 分类列表 -->
+            </div>
+        </aside>
+
+        <!-- 主测区 -->
+        <main class="api-main">
+            <div class="api-topbar">
+                <div>
+                    <h1 id="apiTitle">
+                        <span id="apiMethodBadge" class="api-method" style="display:none;"></span>
+                        <span id="apiName">请选择一个 API 进行测试</span>
+                    </h1>
+                    <div id="apiDesc" class="api-desc">支持实时组装参数并进行接口直接调试</div>
+                </div>
+                <div id="userInfo" class="user-info">
+                    <span class="username" id="username">-</span>
+                    <span class="role" id="userRole">-</span>
+                </div>
+            </div>
+
+            <div class="api-content-wrap" id="apiContentWrap" style="display: none;">
+                <!-- 请求表单面板 -->
+                <div class="request-panel">
+                    <h3 class="panel-title">Request</h3>
+                    <div class="api-url-preview" id="urlPreview"></div>
+                    
+                    <form id="apiForm">
+                        <div id="pathParamsContainer"></div>
+                        <div id="bodyParamsContainer"></div>
+
+                        <div class="action-row">
+                            <button type="submit" id="sendBtn" class="btn btn-primary">发送请求 🚀</button>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- 响应面板 -->
+                <div class="response-panel">
+                    <h3 class="panel-title">Response</h3>
+                    <div id="responseStatus" class="status-badge" style="display:none;"></div>
+                    <pre id="jsonOutput" class="json-viewer">// 结果将显示在此处</pre>
+                </div>
+            </div>
+            
+            <div id="apiEmptyState" style="display:flex; flex:1; justify-content:center; align-items:center; color:#888; flex-direction:column; gap:20px;">
+                <div style="font-size: 4rem;">🔌</div>
+                <h2>欢迎使用系统 API 调试集成终端</h2>
+                <p>请在左侧侧边栏选择您需要验证调试的接口</p>
+                <div style="font-size: 0.9rem; text-align:center;">
+                    当前账号权限: <strong id="welcomeRole">-</strong><br>
+                    您可以在此执行如 向量库重建、知识大纲生成 甚至 直接反馈建议 等高级功能
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Toast 提示 -->
+    <div id="toast" class="toast"></div>
+
+    <script src="api-test.js"></script>
+</body>
+</html>

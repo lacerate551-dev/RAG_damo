@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # OpenDataLoader PDF 解析器（可选）
 try:
-    from pdf_parser_odl import parse_pdf_with_odl, get_chapter_content_for_exam
+    from parsers.pdf_odl import parse_pdf_with_odl, get_chapter_content_for_exam
     ODL_AVAILABLE = True
 except ImportError:
     ODL_AVAILABLE = False

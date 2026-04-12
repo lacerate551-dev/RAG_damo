@@ -8,7 +8,7 @@
 4. 会话过期清理
 
 使用方式：
-    from session_manager import SessionManager
+    from services.session import SessionManager
 
     sm = SessionManager()
     session_id = sm.create_session("user_123")

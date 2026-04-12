@@ -8,7 +8,7 @@
 4. 建议生成 - 生成新题建议
 
 使用方式：
-    from question_maintenance_hook import on_knowledge_base_change
+    from exam_pkg.question_hook import on_knowledge_base_change
 
     # 触发钩子
     result = on_knowledge_base_change(
@@ -90,7 +90,7 @@ def on_knowledge_base_change(
     suggestions = []
 
     try:
-        from exam_analysis import ExamAnalysisDB
+        from exam_pkg.analysis import ExamAnalysisDB
 
         exam_db = ExamAnalysisDB("./data/exam_analysis.db")
 
@@ -406,7 +406,7 @@ def _update_question_status(
     """
     try:
         # 尝试使用 exam_analysis 的更新方法
-        from exam_analysis import QuestionStatus
+        from exam_pkg.analysis import QuestionStatus
 
         exam_db.update_question_status(
             question_id=question_id,

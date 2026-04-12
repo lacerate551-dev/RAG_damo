@@ -726,8 +726,8 @@ class AgenticRAG:
 
             # 多向量库模式：遍历用户可访问的所有向量库
             try:
-                from knowledge_base_manager import get_kb_manager
-                from auth_gateway import get_accessible_collections as _get_accessible
+                from knowledge.manager import get_kb_manager
+                from auth.gateway import get_accessible_collections as _get_accessible
 
                 kb_mgr = get_kb_manager()
                 accessible = _get_accessible(role or 'user', department or '', 'read')

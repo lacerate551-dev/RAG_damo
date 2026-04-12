@@ -35,10 +35,10 @@ from datetime import datetime
 # 添加当前目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from session_manager import SessionManager
-from auth_gateway import require_gateway_auth, require_role, get_user_permissions, get_auth_manager
-from audit_logger import AuditLogger
-from security import validate_query, sanitize_user_input, filter_response, AgentConstraints
+from services.session import SessionManager
+from auth.gateway import require_gateway_auth, require_role, get_user_permissions, get_auth_manager
+from services.audit import AuditLogger
+from auth.security import validate_query, sanitize_user_input, filter_response, AgentConstraints
 from agentic_rag import AgenticRAG
 from rag_demo import (
     collection, API_KEY, BASE_URL, MODEL,
@@ -51,7 +51,7 @@ import jieba
 
 # 导入出题系统 API 蓝图
 try:
-    from exam_api import exam_bp
+    from exam_pkg.api import exam_bp
     HAS_EXAM_API = True
 except ImportError as e:
     print(f"警告: 出题系统模块导入失败: {e}")
@@ -144,7 +144,7 @@ def search_hybrid(query: str, top_k: int = 5, candidates: int = 15, allowed_leve
     """混合检索 + Rerank，支持多向量库模式"""
     # 尝试使用最新的多数据库管理器
     try:
-        from knowledge_base_manager import get_kb_manager
+        from knowledge.manager import get_kb_manager
         kb_manager = get_kb_manager()
         
         target_kbs = allowed_collections if allowed_collections else ["public_kb"]
@@ -481,7 +481,7 @@ def search():
     
     # 获取允许访问的 collection 列表 (用于多向量库)
     try:
-        from auth_gateway import get_accessible_collections
+        from auth.gateway import get_accessible_collections
         role = request.current_user["role"]
         department = request.current_user.get("department", "")
         allowed_collections = get_accessible_collections(role, department, "read")
@@ -641,9 +641,9 @@ def get_current_user():
 
 # 导入多向量库管理器
 try:
-    from knowledge_base_manager import get_kb_manager, KnowledgeBaseManager
-    from kb_router import get_kb_router, route_query
-    from auth_gateway import (
+    from knowledge.manager import get_kb_manager, KnowledgeBaseManager
+    from knowledge.router import get_kb_router, route_query
+    from auth.gateway import (
         get_accessible_collections, check_collection_permission,
         can_create_collection, can_delete_collection,
         require_collection_permission
@@ -1089,7 +1089,7 @@ def get_audit_logs():
 
 # 导入同步服务
 try:
-    from knowledge_sync import KnowledgeSyncService, SyncStatus, ChangeType
+    from knowledge.sync import KnowledgeSyncService, SyncStatus, ChangeType
     HAS_SYNC_SERVICE = True
 except ImportError as e:
     print(f"警告: 知识库同步服务导入失败: {e}")
@@ -1292,7 +1292,7 @@ def upload_document():
     - manager: 只能上传到本部门向量库
     - user: 无上传权限
     """
-    from auth_gateway import check_collection_permission, can_create_collection
+    from auth.gateway import check_collection_permission, can_create_collection
 
     # 1. 检查文件
     if 'file' not in request.files:
@@ -1358,7 +1358,7 @@ def upload_document():
     sync_status = "已保存，等待手动同步"
     if sync_service:
         try:
-            from knowledge_sync import DocumentChange, ChangeType
+            from knowledge.sync import DocumentChange, ChangeType
             change = DocumentChange(
                 document_id=f"{target_subdir}/{filename}",
                 document_name=filename,
@@ -1405,7 +1405,7 @@ def list_documents():
     - admin: 可查看所有
     - manager/user: 只能查看 public + 本部门
     """
-    from auth_gateway import get_accessible_collections
+    from auth.gateway import get_accessible_collections
 
     user = request.current_user
     accessible_collections = get_accessible_collections(user['role'], user.get('department', ''), 'read')
@@ -1477,7 +1477,7 @@ def delete_document(doc_path):
     - manager: 只能删除本部门文档
     - user: 无删除权限
     """
-    from auth_gateway import check_collection_permission
+    from auth.gateway import check_collection_permission
 
     user = request.current_user
 
@@ -1514,7 +1514,7 @@ def delete_document(doc_path):
         # 1. 从向量库删除
         if sync_service:
             try:
-                from knowledge_sync import DocumentChange, ChangeType
+                from knowledge.sync import DocumentChange, ChangeType
                 change = DocumentChange(
                     document_id=doc_path,
                     document_name=filename,
@@ -1686,7 +1686,7 @@ def mark_all_notifications_read():
 
 # 导入题库分析模块
 try:
-    from exam_analysis import ExamAnalysisDB, QuestionMaintenanceService, ExamAnalysisService
+    from exam_pkg.analysis import ExamAnalysisDB, QuestionMaintenanceService, ExamAnalysisService
     exam_analysis_db = ExamAnalysisDB("./data/exam_analysis.db")
     maintenance_service = QuestionMaintenanceService(exam_analysis_db)
     analysis_service = ExamAnalysisService(exam_analysis_db)
@@ -1950,8 +1950,8 @@ if HAS_EXAM_ANALYSIS:
 
 # 导入版本管理模块
 try:
-    from document_lifecycle import DocumentLifecycleManager, get_lifecycle_manager
-    from document_diff import DocumentDiffAnalyzer, get_diff_analyzer
+    from knowledge.lifecycle import DocumentLifecycleManager, get_lifecycle_manager
+    from knowledge.diff import DocumentDiffAnalyzer, get_diff_analyzer
     HAS_VERSION_MANAGEMENT = True
     lifecycle_manager = get_lifecycle_manager()
     diff_analyzer = get_diff_analyzer()
@@ -2063,7 +2063,7 @@ if HAS_VERSION_MANAGEMENT:
         if not check_collection_permission(user['role'], user.get('department', ''), collection, 'read'):
             return jsonify({"error": "权限不足"}), 403
 
-        from knowledge_base_manager import get_kb_manager
+        from knowledge.manager import get_kb_manager
         kb_manager = get_kb_manager()
 
         info = kb_manager.get_document_info(collection, doc_path)
@@ -2118,7 +2118,7 @@ if HAS_VERSION_MANAGEMENT:
             "include_deprecated": false
         }
         """
-        from kb_router import search_with_version_context
+        from knowledge.router import search_with_version_context
 
         user = request.current_user
         data = request.json or {}
@@ -2168,7 +2168,7 @@ if HAS_VERSION_MANAGEMENT:
 
         # 如果没有提供旧chunks，从向量库获取
         if old_chunks is None:
-            from knowledge_base_manager import get_kb_manager
+            from knowledge.manager import get_kb_manager
             kb_manager = get_kb_manager()
             old_chunks_data = kb_manager.get_document_chunks(collection, doc_path, status='active')
 
@@ -2203,7 +2203,7 @@ if HAS_VERSION_MANAGEMENT:
 
 # 导入纲要生成模块
 try:
-    from outline_generator import OutlineDB, OutlineGenerator, RecommendationService
+    from services.outline import OutlineDB, OutlineGenerator, RecommendationService
     outline_db = OutlineDB("./data/outline_cache.db")
     outline_generator = OutlineGenerator(outline_db, DOCUMENTS_PATH)
     recommendation_service = RecommendationService(
@@ -2453,7 +2453,7 @@ if __name__ == '__main__':
 
     # 导入问答质量闭环模块
     try:
-        from feedback_service import FeedbackDB, FeedbackService
+        from services.feedback import FeedbackDB, FeedbackService
         feedback_db = FeedbackDB("./data/feedback.db")
         feedback_service = FeedbackService(feedback_db)
         HAS_FEEDBACK_SERVICE = True
@@ -2600,7 +2600,7 @@ if __name__ == '__main__':
                 return jsonify({"error": "缺少问题或答案"}), 400
 
             try:
-                from feedback_service import FAQ
+                from services.feedback import FAQ
                 faq = FAQ(
                     question=question,
                     answer=answer,
