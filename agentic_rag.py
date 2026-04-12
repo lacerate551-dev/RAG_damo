@@ -32,7 +32,8 @@ from rag_demo import (
     collection,
     API_KEY,
     BASE_URL,
-    MODEL
+    MODEL,
+    check_restricted_documents
 )
 
 # 尝试导入搜索API配置
@@ -50,7 +51,7 @@ except ImportError:
     USE_GRAPH_RAG = False
 
 try:
-    from graph_rag import GraphRAG, should_use_graph
+    from graph import GraphRAG, should_use_graph
     HAS_GRAPH_RAG = True
 except ImportError:
     HAS_GRAPH_RAG = False
@@ -108,7 +109,9 @@ class AgenticRAG:
         self.SOURCE_GRAPH = "知识图谱"
 
     def process(self, query: str, verbose: bool = True, history: list = None,
-                log_callback=None, allowed_levels: list = None) -> dict:
+                log_callback=None, allowed_levels: list = None,
+                role: str = None, department: str = None,
+                collections: list = None) -> dict:
         """
         主处理流程
 
@@ -118,6 +121,9 @@ class AgenticRAG:
             history: 对话历史 [{"role": "user/assistant", "content": "..."}]
             log_callback: 日志回调函数，用于实时推送思考过程
             allowed_levels: 允许访问的安全级别列表，如 ["public", "internal"]
+            role: 用户角色（多向量库模式），如 "admin", "manager", "user"
+            department: 用户部门（多向量库模式），如 "tech", "finance"
+            collections: 指定查询的向量库列表（可选，不传则自动路由）
 
         Returns:
             {
@@ -157,7 +163,7 @@ class AgenticRAG:
                 print("\n[元问题] 检测到关于知识库本身的问题")
             emit_log("decision", {"action": "meta_query", "reason": "检测到元问题，直接回答"})
 
-            answer = self._answer_meta_question(query, allowed_levels)
+            answer = self._answer_meta_question(query, allowed_levels, role=role, department=department)
             emit_log("answer", {"reason": "元问题直接回答"})
 
             return {
@@ -212,7 +218,7 @@ class AgenticRAG:
             if decision["action"] == "answer":
                 # 生成答案
                 answer_start = time.time()
-                answer = self._generate_fused_answer(query, all_contexts)
+                answer = self._generate_fused_answer(query, all_contexts, allowed_levels)
                 answer_duration = (time.time() - answer_start) * 1000
 
                 emit_log("answer", {
@@ -236,7 +242,8 @@ class AgenticRAG:
                 if verbose:
                     print(f"[知识库检索] {current_query}")
 
-                results = search_knowledge(current_query, top_k=5, allowed_levels=allowed_levels)
+                results = search_knowledge(current_query, top_k=5, allowed_levels=allowed_levels,
+                                           role=role, department=department, collections=collections)
                 docs = results.get('documents', [[]])[0]
                 metas = results.get('metadatas', [[]])[0]
 
@@ -263,6 +270,13 @@ class AgenticRAG:
                 if verbose:
                     print(f"   找到 {len(docs)} 个片段")
 
+                # 评估知识库检索结果是否足够
+                if docs and self._is_kb_result_sufficient(current_query, docs):
+                    if verbose:
+                        print("   [评估] 知识库结果足够，跳过网络搜索")
+                    # 标记跳过网络搜索
+                    reasoning_trace[-1]["skip_web_search"] = True
+
             elif decision["action"] == "web_search":
                 # 网络搜索
                 if not self.enable_web_search:
@@ -270,6 +284,23 @@ class AgenticRAG:
                         print("[警告] 网络搜索未配置，跳过")
                     emit_log("warning", {"message": "网络搜索未配置"})
                     continue
+
+                # 检查是否已经跳过网络搜索（知识库结果足够）
+                if reasoning_trace and reasoning_trace[-1].get("skip_web_search"):
+                    if verbose:
+                        print("[跳过] 知识库结果已足够，无需网络搜索")
+                    emit_log("skip", {"reason": "知识库结果足够，跳过网络搜索"})
+                    continue
+
+                # 检查知识库是否有足够结果
+                if kb_count > 0:
+                    # 获取知识库文档内容
+                    kb_docs = [c['doc'] for c in all_contexts if c.get('source_type') == self.SOURCE_KB]
+                    if self._is_kb_result_sufficient(current_query, kb_docs):
+                        if verbose:
+                            print("[跳过] 知识库结果已足够，无需网络搜索")
+                        emit_log("skip", {"reason": "知识库结果足够，跳过网络搜索"})
+                        continue
 
                 search_query = decision.get('search_query', current_query)
                 search_start = time.time()
@@ -350,7 +381,8 @@ class AgenticRAG:
                     print(f"[分解问题] {len(sub_queries)} 个子问题")
 
                 for sub_q in sub_queries:
-                    results = search_knowledge(sub_q, top_k=3)
+                    results = search_knowledge(sub_q, top_k=3, allowed_levels=allowed_levels,
+                                                role=role, department=department, collections=collections)
                     docs = results.get('documents', [[]])[0]
                     metas = results.get('metadatas', [[]])[0]
                     for doc, meta in zip(docs, metas):
@@ -363,7 +395,7 @@ class AgenticRAG:
 
         # 达到迭代上限
         emit_log("max_iterations", {"iterations": iteration})
-        answer = self._generate_fused_answer(query, all_contexts)
+        answer = self._generate_fused_answer(query, all_contexts, allowed_levels)
         sources = self._extract_sources(all_contexts)
 
         emit_log("complete", {
@@ -530,14 +562,20 @@ class AgenticRAG:
    - 涉及部门职责、流程步骤、制度关系等问题，优先图谱检索（graph_search）
    - 只有当知识库明显无法回答（如实时信息、外部知识）时才用 web_search
 
-3. **效率原则**
+3. **知识库结果评估**（关键！）
+   - 如果知识库检索结果已经能回答问题，直接选择 answer
+   - 评估标准：检索内容是否包含问题关键词、是否直接相关
+   - 不要为了"补充信息"而进行不必要的网络搜索
+
+4. **效率原则**
    - 信息足够时立即 answer，不要浪费轮次
    - 避免重复检索相同内容
    - 如果检索结果已经包含了文档来源信息，可以直接回答元问题
 
-4. **网络搜索谨慎使用**
-   - 网络搜索仅用于：实时信息、外部知识、知识库确实没有的内容
-   - 内部文档、公司制度、业务流程等问题不应使用网络搜索
+5. **网络搜索谨慎使用**（非常重要！）
+   - 网络搜索仅用于：实时信息（天气、新闻）、外部知识、知识库确实没有的内容
+   - 内部文档、公司制度、业务流程、薪酬标准等问题绝不应使用网络搜索
+   - 如果知识库检索结果能回答问题，就不要使用网络搜索
 
 请输出JSON格式的决策（只输出JSON）:"""
 
@@ -593,6 +631,58 @@ class AgenticRAG:
         query_lower = query.lower()
         return any(kw in query_lower for kw in graph_keywords)
 
+    def _is_kb_result_sufficient(self, query: str, docs: list) -> bool:
+        """
+        评估知识库检索结果是否足够回答问题
+
+        Args:
+            query: 用户查询
+            docs: 检索到的文档列表
+
+        Returns:
+            知识库结果是否足够
+        """
+        if not docs:
+            return False
+
+        # 提取查询关键词
+        query_keywords = set()
+        stop_words = {"的", "是", "有", "在", "和", "了", "吗", "什么", "怎么", "如何", "哪", "谁", "吗", "呢", "啊"}
+
+        # 分词（简单处理）
+        import jieba
+        for word in jieba.cut(query):
+            word = word.strip()
+            if len(word) >= 2 and word not in stop_words:
+                query_keywords.add(word)
+
+        if not query_keywords:
+            return len(docs) > 0
+
+        # 计算文档与查询的相关性
+        matched_count = 0
+        for doc in docs[:3]:  # 只看前3个文档
+            doc_text = doc.lower() if isinstance(doc, str) else ""
+            for keyword in query_keywords:
+                if keyword in doc_text:
+                    matched_count += 1
+
+        # 如果超过一半的关键词在文档中出现，认为结果足够
+        match_ratio = matched_count / len(query_keywords) if query_keywords else 0
+
+        # 判断是否需要网络搜索的问题类型
+        web_search_indicators = [
+            "今天", "昨天", "最新", "最近", "新闻", "天气",
+            "股价", "汇率", "实时", "当前", "现在",
+            "2024年", "2025年", "2026年"  # 年份相关的实时信息
+        ]
+        needs_realtime = any(ind in query for ind in web_search_indicators)
+
+        if needs_realtime:
+            return False  # 需要实时信息，知识库不够
+
+        return match_ratio >= 0.5  # 50%以上关键词匹配即可
+
     def _is_meta_question(self, query: str) -> bool:
         """
         判断是否为元问题（关于知识库本身的问题）
@@ -615,44 +705,84 @@ class AgenticRAG:
         query_lower = query.lower()
         return any(kw in query_lower for kw in meta_patterns)
 
-    def _answer_meta_question(self, query: str, allowed_levels: list = None) -> str:
+    def _answer_meta_question(self, query: str, allowed_levels: list = None,
+                              role: str = None, department: str = None) -> str:
         """
         回答元问题（关于知识库本身的问题）
+
+        多向量库模式下，遍历用户有权限访问的所有向量库来列出文档。
 
         Args:
             query: 用户查询
             allowed_levels: 允许访问的安全级别列表
+            role: 用户角色（多向量库模式）
+            department: 用户部门（多向量库模式）
 
         Returns:
             回答内容
         """
-        # 获取知识库文档列表
         try:
-            # 从 ChromaDB 获取所有文档的来源信息
-            all_docs = collection.get(include=['metadatas'])
+            source_map = {}  # {source: {count, levels, pages, collections}}
 
-            # 按来源分组统计
-            source_map = {}  # {source: {count, levels, pages}}
-            for meta in all_docs.get('metadatas', []):
-                source = meta.get('source', '未知')
-                level = meta.get('security_level', 'public')
-                page = meta.get('page')
+            # 多向量库模式：遍历用户可访问的所有向量库
+            try:
+                from knowledge_base_manager import get_kb_manager
+                from auth_gateway import get_accessible_collections as _get_accessible
 
-                if source not in source_map:
-                    source_map[source] = {'count': 0, 'levels': set(), 'pages': set()}
+                kb_mgr = get_kb_manager()
+                accessible = _get_accessible(role or 'user', department or '', 'read')
 
-                source_map[source]['count'] += 1
-                source_map[source]['levels'].add(level)
-                if page:
-                    source_map[source]['pages'].add(page)
+                for kb_name in accessible:
+                    coll = kb_mgr.get_collection(kb_name)
+                    if not coll:
+                        continue
+                    try:
+                        result = coll.get(include=['metadatas'])
+                    except Exception:
+                        continue
 
-            # 根据用户权限过滤
+                    for meta in result.get('metadatas', []):
+                        source = meta.get('source', '未知')
+                        level = meta.get('security_level', 'public')
+                        page = meta.get('page')
+
+                        if source not in source_map:
+                            source_map[source] = {
+                                'count': 0, 'levels': set(),
+                                'pages': set(), 'collections': set()
+                            }
+
+                        source_map[source]['count'] += 1
+                        source_map[source]['levels'].add(level)
+                        source_map[source]['collections'].add(kb_name)
+                        if page:
+                            source_map[source]['pages'].add(page)
+
+            except ImportError:
+                # 降级：单向量库模式
+                all_docs = collection.get(include=['metadatas'])
+                for meta in all_docs.get('metadatas', []):
+                    source = meta.get('source', '未知')
+                    level = meta.get('security_level', 'public')
+                    page = meta.get('page')
+
+                    if source not in source_map:
+                        source_map[source] = {
+                            'count': 0, 'levels': set(),
+                            'pages': set(), 'collections': set()
+                        }
+
+                    source_map[source]['count'] += 1
+                    source_map[source]['levels'].add(level)
+                    if page:
+                        source_map[source]['pages'].add(page)
+
+            # 根据安全级别过滤
             if allowed_levels:
                 allowed_set = set(allowed_levels)
                 filtered_sources = {}
                 for source, info in source_map.items():
-                    # 只显示用户有权限访问的文档
-                    if info['levels'] & allowed_set:  # 有交集
+                    if info['levels'] & allowed_set:
                         filtered_sources[source] = info
                 source_map = filtered_sources
 
@@ -660,13 +790,14 @@ class AgenticRAG:
             if not source_map:
                 return "抱歉，您当前没有权限查看任何文档，或者知识库为空。"
 
-            # 按文档数量排序
             sorted_sources = sorted(source_map.items(), key=lambda x: x[1]['count'], reverse=True)
 
             answer_parts = [f"📚 **知识库文档列表**（共 {len(sorted_sources)} 个文档）\n"]
 
             for i, (source, info) in enumerate(sorted_sources, 1):
-                levels_str = '/'.join(sorted(info['levels']))
+                # 显示所属知识库
+                colls = info.get('collections', set())
+                coll_str = f"，所属: {', '.join(sorted(colls))}" if colls else ""
                 pages_str = ''
                 if info['pages']:
                     pages_list = sorted(info['pages'])
@@ -675,7 +806,7 @@ class AgenticRAG:
                     else:
                         pages_str = f"，共 {len(info['pages'])} 页"
 
-                answer_parts.append(f"{i}. **{source}** ({info['count']} 条片段，权限: {levels_str}{pages_str})")
+                answer_parts.append(f"{i}. **{source}** ({info['count']} 条片段{coll_str}{pages_str})")
 
             answer_parts.append(f"\n**总计**: {sum(s[1]['count'] for s in sorted_sources)} 条知识片段")
             answer_parts.append(f"\n**您的权限级别**: {', '.join(allowed_levels) if allowed_levels else '全部'}")
@@ -780,7 +911,7 @@ class AgenticRAG:
             print(f"网络搜索失败: {e}")
             return []
 
-    def _generate_fused_answer(self, query: str, contexts: list) -> str:
+    def _generate_fused_answer(self, query: str, contexts: list, allowed_levels: list = None) -> str:
         """
         生成融合答案 - 智能处理多源信息
 
@@ -789,17 +920,68 @@ class AgenticRAG:
         2. 检测内容冲突
         3. 判断时效性
         4. 智能融合
+        5. 权限限制检测
         """
         # 分离不同来源
         kb_contexts = [c for c in contexts if c.get('source_type') == self.SOURCE_KB]
         web_contexts = [c for c in contexts if c.get('source_type') == self.SOURCE_WEB]
         graph_contexts = [c for c in contexts if c.get('source_type') == self.SOURCE_GRAPH]
 
-        # 如果没有任何上下文
+        # 如果没有任何上下文，检测是否因权限限制
         if not contexts:
-            return self._generate_no_context_answer(query)
+            return self._generate_no_context_answer(query, allowed_levels)
 
-        # 构建来源信息
+        # 如果只有知识库结果且相关性较低，检测是否存在权限限制的相关文档
+        if kb_contexts and not web_contexts and allowed_levels:
+            # 评估当前知识库结果的相关性
+            kb_docs = [c['doc'] for c in kb_contexts]
+            if not self._is_kb_result_sufficient(query, kb_docs):
+                # 结果不够相关，检查是否存在权限限制的文档
+                restricted_info = check_restricted_documents(query, allowed_levels)
+                if restricted_info.get("has_restricted"):
+                    # 存在超出权限的相关文档，在回答中添加提示
+                    levels_str = "、".join(restricted_info["restricted_levels"])
+                    sources_str = "、".join(restricted_info["restricted_sources"][:2])
+
+                    # 在上下文中添加权限提示
+                    permission_notice = f"""
+【重要提示】
+检测到与您问题更相关的信息可能存在于「{levels_str}」级别的文档中（如：{sources_str}），但您当前的权限级别无法访问。
+以下是根据您可访问的信息生成的回答，可能不够完整或准确：
+"""
+                    context_str = permission_notice + self._build_context_string(kb_contexts, web_contexts, graph_contexts)
+
+                    # 使用带权限提示的提示词
+                    prompt = self._build_answer_prompt_with_permission(query, context_str, levels_str, sources_str, kb_contexts, web_contexts, graph_contexts)
+
+                    try:
+                        response = self.client.chat.completions.create(
+                            model=MODEL,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.7,
+                            max_tokens=2000
+                        )
+                        return response.choices[0].message.content
+                    except Exception as e:
+                        return f"生成答案失败: {str(e)}"
+
+        # 正常生成答案
+        context_str = self._build_context_string(kb_contexts, web_contexts, graph_contexts)
+        prompt = self._build_normal_answer_prompt(query, context_str, kb_contexts, web_contexts, graph_contexts)
+
+        try:
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=2000
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"生成答案失败: {str(e)}"
+
+    def _build_context_string(self, kb_contexts, web_contexts, graph_contexts):
+        """构建上下文字符串"""
         kb_parts = []
         for i, c in enumerate(kb_contexts[:5], 1):
             meta = c['meta']
@@ -817,10 +999,11 @@ class AgenticRAG:
         for i, c in enumerate(graph_contexts[:3], 1):
             graph_parts.append(f"[图谱-{i}] {c['doc']}")
 
-        context_str = "\n\n".join(kb_parts + web_parts + graph_parts)
+        return "\n\n".join(kb_parts + web_parts + graph_parts)
 
-        # 使用增强的提示词
-        prompt = f"""你是一个严谨的智能助手，需要综合多个信息来源回答问题。
+    def _build_normal_answer_prompt(self, query, context_str, kb_contexts, web_contexts, graph_contexts):
+        """构建正常回答的提示词"""
+        return f"""你是一个严谨的智能助手，需要综合多个信息来源回答问题。
 
 【用户问题】
 {query}
@@ -865,27 +1048,92 @@ class AgenticRAG:
 
 请回答："""
 
-        try:
-            response = self.client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=2000
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            return f"生成答案失败: {str(e)}"
+    def _build_answer_prompt_with_permission(self, query, context_str, levels_str, sources_str, kb_contexts, web_contexts, graph_contexts):
+        """构建带权限提示的回答提示词"""
+        return f"""你是一个严谨的智能助手，需要综合多个信息来源回答问题。
 
-    def _generate_no_context_answer(self, query: str) -> str:
+【用户问题】
+{query}
+
+【重要提示】
+检测到与用户问题更相关的信息可能存在于「{levels_str}」级别的文档中（如：{sources_str}），但用户当前的权限级别无法访问这些文档。
+请基于当前可访问的信息回答，并在回答开头明确说明信息可能不完整。
+
+【可访问的信息来源】
+{context_str}
+
+【回答要求】
+
+1. **开头说明**
+   - 首先明确告知用户：当前回答基于您有权限访问的文档，可能不完整
+   - 说明更详细的信息位于「{levels_str}」级别文档中
+   - 建议用户如需完整信息，请联系管理员申请相应权限
+
+2. **基于现有信息回答**
+   - 如实告知目前可访问文档中的相关内容
+   - 如果可访问文档没有相关信息，明确说明"根据您可访问的文档，未找到直接相关信息"
+
+3. **回答格式**
+
+### 权限说明
+（说明用户当前权限级别无法访问更完整的信息）
+
+### 基于可访问信息的回答
+（基于当前权限可访问的文档回答，或说明无相关信息）
+
+### 来源汇总
+- 知识库：共{len(kb_contexts)}条
+
+请回答："""
+
+    def _generate_no_context_answer(self, query: str, allowed_levels: list = None) -> str:
         """
         当没有检索到任何上下文时生成答案
 
         Args:
             query: 用户问题
+            allowed_levels: 用户允许访问的安全级别列表
 
         Returns:
             回答内容
         """
+        # 检测是否存在超出权限的相关文档
+        restricted_info = None
+        if allowed_levels:
+            restricted_info = check_restricted_documents(query, allowed_levels)
+
+        # 如果存在超出权限的相关文档，给出明确提示
+        if restricted_info and restricted_info.get("has_restricted"):
+            levels_str = "、".join(restricted_info["restricted_levels"])
+            sources_str = "、".join(restricted_info["restricted_sources"][:2])
+
+            prompt = f"""用户提问：「{query}」
+
+检测到相关信息存在于您当前权限级别无法访问的文档中。
+
+相关信息：
+- 权限级别：{levels_str}
+- 可能来源：{sources_str} 等
+
+请生成一个友好且明确的回复，告知用户：
+1. 知识库中存在相关信息，但用户当前权限无法访问
+2. 相关信息所属的权限级别（{levels_str}）
+3. 如需访问，建议联系管理员申请相应权限
+
+回复要简洁专业，不超过100字。"""
+
+            try:
+                response = self.client.chat.completions.create(
+                    model=MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.5,
+                    max_tokens=200
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                return f"您好，知识库中存在与您查询相关的信息，但这些信息位于「{levels_str}」级别的文档中，您当前的权限级别无法访问。如需查看，请联系管理员申请相应权限。"
+
+        # 没有权限限制，确实没有相关信息
         prompt = f"""用户提问：「{query}」
 
 很抱歉，我在知识库中没有找到与您问题相关的信息。

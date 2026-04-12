@@ -1,6 +1,10 @@
 """
 智能出题系统 - 整合管理器
 整合出题工作流和批阅工作流
+
+支持两种出题模式：
+1. 传统模式：通过 Dify 工作流从向量库检索片段出题
+2. 章节模式：使用 OpenDataLoader 解析完整章节内容出题（更完整）
 """
 import json
 import os
@@ -8,6 +12,14 @@ import requests
 import uuid
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# OpenDataLoader PDF 解析器（可选）
+try:
+    from pdf_parser_odl import parse_pdf_with_odl, get_chapter_content_for_exam
+    ODL_AVAILABLE = True
+except ImportError:
+    ODL_AVAILABLE = False
 
 # 导入配置
 try:
@@ -21,6 +33,7 @@ except ImportError:
 
 # 题库目录
 QUESTION_BANK_DIR = "./题库"
+DRAFT_DIR = "./题库/草稿"  # 草稿文件夹
 REPORT_DIR = "./批阅报告"
 
 # 试卷状态
@@ -43,9 +56,32 @@ def call_dify_workflow(api_key: str, inputs: dict) -> dict:
         "user": "exam-system"
     }
 
-    response = requests.post(url, json=payload, headers=headers)
-    response.raise_for_status()
-    return response.json()
+    print(f"[DEBUG] 调用 Dify 工作流: {url}")
+    print(f"[DEBUG] inputs: {json.dumps(inputs, ensure_ascii=False)[:500]}...")
+
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=120)
+        response.raise_for_status()
+        result = response.json()
+        print(f"[DEBUG] Dify 响应成功")
+        return result
+    except requests.exceptions.Timeout:
+        print(f"[ERROR] Dify API 请求超时")
+        raise Exception("Dify API 请求超时，请检查网络连接或稍后重试")
+    except requests.exceptions.ConnectionError as e:
+        print(f"[ERROR] Dify API 连接失败: {e}")
+        raise Exception(f"Dify API 连接失败，请检查网络或 API 地址: {DIFY_API_URL}")
+    except requests.exceptions.HTTPError as e:
+        error_detail = ""
+        try:
+            error_detail = response.json().get("message", str(e))
+        except:
+            error_detail = str(e)
+        print(f"[ERROR] Dify API 返回错误: {error_detail}")
+        raise Exception(f"Dify API 返回错误: {error_detail}")
+    except Exception as e:
+        print(f"[ERROR] Dify API 调用失败: {str(e)}")
+        raise Exception(f"Dify API 调用失败: {str(e)}")
 
 
 def parse_json_response(result: dict) -> dict:
@@ -157,30 +193,403 @@ def generate_exam(topic: str, choice_count: int = 3, blank_count: int = 2,
     return questions_json
 
 
+def generate_exam_by_file(
+    file_path: str,
+    collection: str,
+    user_id: str = None,
+    user_role: str = None,
+    user_department: str = None,
+    choice_count: int = 3,
+    blank_count: int = 2,
+    short_answer_count: int = 2,
+    difficulty: int = 3,
+    choice_score: int = 2,
+    blank_score: int = 3,
+    created_by: str = None,
+    name: str = None
+) -> dict:
+    """
+    按文件生成题目（带溯源信息）
+
+    Args:
+        file_path: 来源文件路径（如 "public/产品手册.pdf"）
+        collection: 向量库名称（如 "public_kb"）
+        user_id: 用户ID（用于工作流认证）
+        user_role: 用户角色（admin/manager/user）
+        user_department: 用户部门
+        choice_count: 选择题数量
+        blank_count: 填空题数量
+        short_answer_count: 简答题数量
+        difficulty: 难度(1-5)
+        choice_score: 选择题每题分值（默认2分）
+        blank_score: 填空题每题分值（默认3分）
+        created_by: 创建者用户名
+        name: 试卷名称（可选，默认为 "{文件名}试卷"）
+
+    Returns:
+        {
+            "source_file": {"path": "...", "collection": "..."},
+            "choice_questions": [...],  # 每题含 source_file, source_snippet
+            "blank_questions": [...],
+            "short_answer_questions": [...],
+            "total_count": 9,
+            "total_score": 22
+        }
+    """
+    print(f"正在按文件生成题目: {file_path}")
+
+    # 提取文件名作为默认试卷名
+    if name is None:
+        import os
+        filename = os.path.basename(file_path)
+        name = os.path.splitext(filename)[0] + "试卷"
+
+    inputs = {
+        "file_path": file_path,
+        "collection": collection,
+        "user_id": user_id or "exam-system",
+        "user_role": user_role or "admin",
+        "user_department": user_department or "",
+        "choice_count": choice_count,
+        "blank_count": blank_count,
+        "short_answer_count": short_answer_count,
+        "difficulty": difficulty
+    }
+
+    result = call_dify_workflow(DIFY_QUESTION_API_KEY, inputs)
+
+    # 打印完整响应用于调试
+    print(f"API响应: {json.dumps(result, ensure_ascii=False, indent=2)[:500]}...")
+
+    # 解析返回结果
+    outputs = result.get("data", {}).get("outputs", {})
+    questions_json = outputs.get("questions", "{}")
+
+    # 如果是字符串，解析为JSON
+    if isinstance(questions_json, str):
+        # 去掉可能的markdown代码块
+        questions_json = questions_json.strip()
+        if questions_json.startswith("```json"):
+            questions_json = questions_json[7:]
+        if questions_json.startswith("```"):
+            questions_json = questions_json[3:]
+        if questions_json.endswith("```"):
+            questions_json = questions_json[:-3]
+        questions_json = questions_json.strip()
+        questions_json = json.loads(questions_json)
+
+    # 添加分值字段和溯源信息
+    for q in questions_json.get("choice_questions", []):
+        q["score"] = choice_score
+        q["source_file"] = file_path
+        q["source_collection"] = collection
+        # 如果 Dify 返回了 source_snippet，保留；否则设为空
+        if "source_snippet" not in q:
+            q["source_snippet"] = ""
+
+    for q in questions_json.get("blank_questions", []):
+        q["score"] = blank_score
+        q["source_file"] = file_path
+        q["source_collection"] = collection
+        if "source_snippet" not in q:
+            q["source_snippet"] = ""
+
+    # 简答题分值由LLM生成，保留reference_answer中的total_score
+    for q in questions_json.get("short_answer_questions", []):
+        q["source_file"] = file_path
+        q["source_collection"] = collection
+        if "source_snippet" not in q:
+            q["source_snippet"] = ""
+
+    # 重新计算总分
+    total_score = 0
+    total_score += len(questions_json.get("choice_questions", [])) * choice_score
+    total_score += len(questions_json.get("blank_questions", [])) * blank_score
+    for q in questions_json.get("short_answer_questions", []):
+        total_score += q.get("reference_answer", {}).get("total_score", 0)
+    questions_json["total_score"] = total_score
+
+    # 添加元数据
+    questions_json["source_file"] = {
+        "path": file_path,
+        "collection": collection
+    }
+    questions_json["generated_at"] = datetime.now().isoformat()
+    questions_json["created_by"] = created_by
+    questions_json["name"] = name
+    questions_json["total_count"] = (
+        len(questions_json.get("choice_questions", [])) +
+        len(questions_json.get("blank_questions", [])) +
+        len(questions_json.get("short_answer_questions", []))
+    )
+
+    return questions_json
+
+
+def generate_exam_by_file_with_chapters(
+    file_path: str,
+    keywords: List[str] = None,
+    choice_count: int = 3,
+    blank_count: int = 2,
+    short_answer_count: int = 2,
+    difficulty: int = 3,
+    choice_score: int = 2,
+    blank_score: int = 3,
+    created_by: str = None,
+    name: str = None,
+    max_chapters: int = 5
+) -> dict:
+    """
+    按文件生成题目（使用完整章节内容，无信息缺失）
+
+    使用 OpenDataLoader 解析 PDF，获取完整章节内容作为出题素材。
+    相比向量片段检索，可以获取完整的上下文，避免信息缺失。
+
+    Args:
+        file_path: PDF 文件完整路径
+        keywords: 关键词列表，用于定位相关章节（可选）
+        choice_count: 选择题数量
+        blank_count: 填空题数量
+        short_answer_count: 简答题数量
+        difficulty: 难度(1-5)
+        choice_score: 选择题每题分值（默认2分）
+        blank_score: 填空题每题分值（默认3分）
+        created_by: 创建者用户名
+        name: 试卷名称（可选）
+        max_chapters: 最多使用多少个章节（默认5个）
+
+    Returns:
+        {
+            "source_file": {"path": "...", "chapters": [...]},
+            "choice_questions": [...],
+            "blank_questions": [...],
+            "short_answer_questions": [...],
+            "total_count": 9,
+            "total_score": 22
+        }
+    """
+    if not ODL_AVAILABLE:
+        raise ImportError("OpenDataLoader PDF 解析器不可用，请安装 opendataloader-pdf")
+
+    print(f"正在解析 PDF 文件: {file_path}")
+
+    # 解析 PDF 获取章节内容
+    result = parse_pdf_with_odl(file_path)
+    chunks = result['chunks']
+
+    print(f"解析完成: {len(chunks)} 个章节")
+
+    # 如果有关键词，筛选相关章节
+    if keywords:
+        chapter_contents = get_chapter_content_for_exam(
+            chunks,
+            keywords=keywords,
+            max_chunks=max_chapters
+        )
+        print(f"根据关键词筛选出 {len(chapter_contents)} 个相关章节")
+    else:
+        # 使用所有章节（按内容长度排序，取前N个）
+        sorted_chunks = sorted(chunks, key=lambda x: len(x.content), reverse=True)[:max_chapters]
+        chapter_contents = [
+            {
+                "title": c.title,
+                "content": c.content.strip(),
+                "section_path": c.section_path,
+                "page_range": f"{c.page_start}-{c.page_end}",
+                "source_file": c.source_file
+            }
+            for c in sorted_chunks
+        ]
+
+    if not chapter_contents:
+        raise ValueError("未找到有效的章节内容用于出题")
+
+    # 构建出题素材
+    materials_text = "\n\n---\n\n".join([
+        f"【章节：{c['section_path']}】（页码：{c['page_range']}）\n{c['content']}"
+        for c in chapter_contents
+    ])
+
+    # 提取文件名作为默认试卷名
+    if name is None:
+        filename = os.path.basename(file_path)
+        name = os.path.splitext(filename)[0] + "试卷"
+
+    # 调用 Dify 工作流出题（传入完整章节内容）
+    inputs = {
+        "material_content": materials_text,
+        "choice_count": choice_count,
+        "blank_count": blank_count,
+        "short_answer_count": short_answer_count,
+        "difficulty": difficulty
+    }
+
+    result = call_dify_workflow(DIFY_QUESTION_API_KEY, inputs)
+
+    # 解析返回结果
+    outputs = result.get("data", {}).get("outputs", {})
+    questions_json = outputs.get("questions", "{}")
+
+    # 如果是字符串，解析为JSON
+    if isinstance(questions_json, str):
+        questions_json = questions_json.strip()
+        if questions_json.startswith("```json"):
+            questions_json = questions_json[7:]
+        if questions_json.startswith("```"):
+            questions_json = questions_json[3:]
+        if questions_json.endswith("```"):
+            questions_json = questions_json[:-3]
+        questions_json = questions_json.strip()
+        questions_json = json.loads(questions_json)
+
+    # 添加分值字段和溯源信息
+    for q in questions_json.get("choice_questions", []):
+        q["score"] = choice_score
+        q["source_file"] = file_path
+        q["source_type"] = "chapter"
+        if "source_snippet" not in q:
+            q["source_snippet"] = ""
+
+    for q in questions_json.get("blank_questions", []):
+        q["score"] = blank_score
+        q["source_file"] = file_path
+        q["source_type"] = "chapter"
+        if "source_snippet" not in q:
+            q["source_snippet"] = ""
+
+    for q in questions_json.get("short_answer_questions", []):
+        q["source_file"] = file_path
+        q["source_type"] = "chapter"
+        if "source_snippet" not in q:
+            q["source_snippet"] = ""
+
+    # 计算总分
+    total_score = 0
+    total_score += len(questions_json.get("choice_questions", [])) * choice_score
+    total_score += len(questions_json.get("blank_questions", [])) * blank_score
+    for q in questions_json.get("short_answer_questions", []):
+        total_score += q.get("reference_answer", {}).get("total_score", 0)
+    questions_json["total_score"] = total_score
+
+    # 添加元数据
+    questions_json["source_file"] = {
+        "path": file_path,
+        "chapters": [c["section_path"] for c in chapter_contents],
+        "page_ranges": [c["page_range"] for c in chapter_contents]
+    }
+    questions_json["generated_at"] = datetime.now().isoformat()
+    questions_json["created_by"] = created_by
+    questions_json["name"] = name
+    questions_json["generation_mode"] = "chapter_based"  # 标记为章节模式
+    questions_json["total_count"] = (
+        len(questions_json.get("choice_questions", [])) +
+        len(questions_json.get("blank_questions", [])) +
+        len(questions_json.get("short_answer_questions", []))
+    )
+
+    return questions_json
+
+
+def get_source_chapters_for_question(
+    file_path: str,
+    question_topic: str,
+    top_k: int = 3
+) -> List[Dict[str, Any]]:
+    """
+    获取与问题主题相关的章节内容（用于出题或批阅参考）
+
+    Args:
+        file_path: PDF 文件路径
+        question_topic: 问题主题或关键词
+        top_k: 返回的章节数量
+
+    Returns:
+        [
+            {
+                "title": "章节标题",
+                "content": "完整内容",
+                "section_path": "章节路径",
+                "page_range": "1-2"
+            }
+        ]
+    """
+    if not ODL_AVAILABLE:
+        raise ImportError("OpenDataLoader PDF 解析器不可用")
+
+    result = parse_pdf_with_odl(file_path)
+    chunks = result['chunks']
+
+    # 使用关键词检索相关章节
+    keywords = question_topic.split() if question_topic else []
+    return get_chapter_content_for_exam(chunks, keywords, max_chunks=top_k)
+    """
+    清理文件名，移除非法字符
+
+    Args:
+        name: 原始文件名
+
+    Returns:
+        安全的文件名
+    """
+    import re
+    # 移除或替换非法字符
+    illegal_chars = r'[<>:"/\\|?*\x00-\x1f]'
+    safe_name = re.sub(illegal_chars, '_', name)
+    # 移除首尾空格和点
+    safe_name = safe_name.strip('. ')
+    # 限制长度
+    if len(safe_name) > 100:
+        safe_name = safe_name[:100]
+    # 如果清理后为空，使用时间戳
+    if not safe_name:
+        safe_name = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return safe_name
+
+
 def save_exam(exam: dict, name: str = None) -> str:
     """
-    保存试卷到题库
+    保存试卷到对应目录
+
+    - draft 状态：保存到 题库/草稿/ 目录
+    - approved 状态：保存到 题库/ 目录
 
     Args:
         exam: 试卷JSON
-        name: 文件名(不含扩展名)
+        name: 文件名(不含扩展名)，默认使用试卷名称
 
     Returns:
         保存的文件路径
     """
-    os.makedirs(QUESTION_BANK_DIR, exist_ok=True)
+    # 根据状态确定保存目录
+    status = exam.get("status", EXAM_STATUS_DRAFT)
+    if status == EXAM_STATUS_APPROVED:
+        save_dir = QUESTION_BANK_DIR
+    else:
+        save_dir = DRAFT_DIR
 
-    # 使用 exam_id 作为文件名
+    # 确保目录存在
+    os.makedirs(save_dir, exist_ok=True)
+    # 确保草稿目录存在
+    os.makedirs(DRAFT_DIR, exist_ok=True)
+
+    # 确定文件名：优先使用试卷名称
     if name is None:
-        exam_id = exam.get("exam_id", datetime.now().strftime('%Y%m%d_%H%M%S'))
-        name = exam_id
+        # 使用试卷名称作为文件名
+        exam_name = exam.get("name") or exam.get("topic", "未命名试卷")
+        name = sanitize_filename(exam_name)
 
-    filepath = os.path.join(QUESTION_BANK_DIR, f"{name}.json")
+        # 检查是否已存在同名文件，如果存在则添加时间戳
+        filepath = os.path.join(save_dir, f"{name}.json")
+        if os.path.exists(filepath):
+            timestamp = datetime.now().strftime('_%Y%m%d_%H%M%S')
+            name = f"{name}{timestamp}"
+
+    filepath = os.path.join(save_dir, f"{name}.json")
 
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(exam, f, ensure_ascii=False, indent=2)
 
-    print(f"试卷已保存: {filepath}")
+    print(f"试卷已保存: {filepath} (状态: {status})")
     return filepath
 
 
@@ -208,34 +617,42 @@ def list_exams(status: str = None, page: int = 1, limit: int = 20) -> dict:
             "page": int
         }
     """
+    # 确保目录存在
     os.makedirs(QUESTION_BANK_DIR, exist_ok=True)
+    os.makedirs(DRAFT_DIR, exist_ok=True)
 
     exams = []
-    for filename in os.listdir(QUESTION_BANK_DIR):
-        if not filename.endswith('.json'):
-            continue
 
-        filepath = os.path.join(QUESTION_BANK_DIR, filename)
-        try:
-            exam = load_exam(filepath)
-            # 状态过滤
-            if status and exam.get("status") != status:
-                continue
-            # 只返回摘要信息
-            exams.append({
-                "exam_id": exam.get("exam_id", filename[:-5]),
-                "name": exam.get("name") or exam.get("topic", "未命名试卷"),
-                "topic": exam.get("topic", ""),
-                "status": exam.get("status", "approved"),
-                "total_count": exam.get("total_count", 0),
-                "total_score": exam.get("total_score", 0),
-                "created_at": exam.get("created_at", ""),
-                "created_by": exam.get("created_by", ""),
-                "filename": filename
-            })
-        except Exception as e:
-            print(f"加载试卷失败 {filename}: {e}")
+    # 从题库目录和草稿目录加载试卷
+    for directory in [QUESTION_BANK_DIR, DRAFT_DIR]:
+        if not os.path.exists(directory):
             continue
+        for filename in os.listdir(directory):
+            if not filename.endswith('.json'):
+                continue
+
+            filepath = os.path.join(directory, filename)
+            try:
+                exam = load_exam(filepath)
+                # 状态过滤
+                if status and exam.get("status") != status:
+                    continue
+                # 只返回摘要信息
+                exams.append({
+                    "exam_id": exam.get("exam_id", filename[:-5]),
+                    "name": exam.get("name") or exam.get("topic", "未命名试卷"),
+                    "topic": exam.get("topic", ""),
+                    "status": exam.get("status", "approved"),
+                    "total_count": exam.get("total_count", 0),
+                    "total_score": exam.get("total_score", 0),
+                    "created_at": exam.get("created_at", ""),
+                    "created_by": exam.get("created_by", ""),
+                    "filename": filename,
+                    "filepath": filepath
+                })
+            except Exception as e:
+                print(f"加载试卷失败 {filename}: {e}")
+                continue
 
     # 按创建时间倒序
     exams.sort(key=lambda x: x.get("created_at", ""), reverse=True)
@@ -252,6 +669,35 @@ def list_exams(status: str = None, page: int = 1, limit: int = 20) -> dict:
     }
 
 
+def _find_exam_filepath(exam_id: str) -> Optional[str]:
+    """
+    查找试卷文件路径（在题库和草稿目录中查找）
+
+    Args:
+        exam_id: 试卷ID
+
+    Returns:
+        文件路径，如果不存在返回None
+    """
+    # 确保目录存在
+    os.makedirs(QUESTION_BANK_DIR, exist_ok=True)
+    os.makedirs(DRAFT_DIR, exist_ok=True)
+
+    # 先检查题库目录
+    for directory in [DRAFT_DIR, QUESTION_BANK_DIR]:
+        for filename in os.listdir(directory):
+            if not filename.endswith('.json'):
+                continue
+            filepath = os.path.join(directory, filename)
+            try:
+                exam = load_exam(filepath)
+                if exam.get("exam_id") == exam_id:
+                    return filepath
+            except:
+                continue
+    return None
+
+
 def get_exam_by_id(exam_id: str) -> Optional[dict]:
     """
     根据 ID 获取试卷
@@ -262,60 +708,58 @@ def get_exam_by_id(exam_id: str) -> Optional[dict]:
     Returns:
         试卷JSON，如果不存在返回None
     """
-    filepath = os.path.join(QUESTION_BANK_DIR, f"{exam_id}.json")
-    if not os.path.exists(filepath):
-        # 尝试遍历查找
-        for filename in os.listdir(QUESTION_BANK_DIR):
-            if not filename.endswith('.json'):
-                continue
-            fp = os.path.join(QUESTION_BANK_DIR, filename)
-            try:
-                exam = load_exam(fp)
-                if exam.get("exam_id") == exam_id:
-                    return exam
-            except:
-                continue
-        return None
-
-    return load_exam(filepath)
+    filepath = _find_exam_filepath(exam_id)
+    if filepath:
+        return load_exam(filepath)
+    return None
 
 
 def update_exam(exam_id: str, exam_data: dict) -> Optional[dict]:
     """
-    更新试卷
+    更新试卷（合并更新，保留未传字段）
 
     Args:
         exam_id: 试卷ID
-        exam_data: 新的试卷数据
+        exam_data: 新的试卷数据（部分字段）
 
     Returns:
         更新后的试卷，如果不存在返回None
     """
-    exam = get_exam_by_id(exam_id)
-    if not exam:
+    # 查找试卷文件路径
+    filepath = _find_exam_filepath(exam_id)
+    if not filepath:
         return None
 
+    # 加载现有试卷数据
+    existing_exam = load_exam(filepath)
+
+    # 合并数据：现有数据 + 新数据（新数据覆盖同名字段）
+    merged = {**existing_exam, **exam_data}
+
     # 保留不可修改的字段
-    exam_data["exam_id"] = exam_id
-    exam_data["created_at"] = exam.get("created_at")
-    exam_data["created_by"] = exam.get("created_by")
+    merged["exam_id"] = exam_id
+    merged["created_at"] = existing_exam.get("created_at")
+    merged["created_by"] = existing_exam.get("created_by")
+
+    # 保留状态（除非明确传入新状态）
+    if "status" not in exam_data:
+        merged["status"] = existing_exam.get("status", EXAM_STATUS_DRAFT)
 
     # 更新时间戳
-    exam_data["updated_at"] = datetime.now().isoformat()
+    merged["updated_at"] = datetime.now().isoformat()
 
     # 重新计算统计
-    exam_data["total_count"] = (
-        len(exam_data.get("choice_questions", [])) +
-        len(exam_data.get("blank_questions", [])) +
-        len(exam_data.get("short_answer_questions", []))
+    merged["total_count"] = (
+        len(merged.get("choice_questions", [])) +
+        len(merged.get("blank_questions", [])) +
+        len(merged.get("short_answer_questions", []))
     )
 
-    # 保存
-    filepath = os.path.join(QUESTION_BANK_DIR, f"{exam_id}.json")
+    # 保存到原位置
     with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(exam_data, f, ensure_ascii=False, indent=2)
+        json.dump(merged, f, ensure_ascii=False, indent=2)
 
-    return exam_data
+    return merged
 
 
 def delete_exam(exam_id: str) -> bool:
@@ -328,23 +772,10 @@ def delete_exam(exam_id: str) -> bool:
     Returns:
         是否删除成功
     """
-    filepath = os.path.join(QUESTION_BANK_DIR, f"{exam_id}.json")
-    if os.path.exists(filepath):
+    filepath = _find_exam_filepath(exam_id)
+    if filepath and os.path.exists(filepath):
         os.remove(filepath)
         return True
-
-    # 尝试遍历查找
-    for filename in os.listdir(QUESTION_BANK_DIR):
-        if not filename.endswith('.json'):
-            continue
-        fp = os.path.join(QUESTION_BANK_DIR, filename)
-        try:
-            exam = load_exam(fp)
-            if exam.get("exam_id") == exam_id:
-                os.remove(fp)
-                return True
-        except:
-            continue
 
     return False
 
@@ -376,8 +807,33 @@ def review_exam(exam_id: str, action: str, questions: List[dict] = None,
         if feedback:
             exam["review_feedback"] = feedback
 
+        # 将试卷从草稿目录移动到题库目录
+        old_filepath = _find_exam_filepath(exam_id)
+        if old_filepath:
+            # 生成新的文件名（使用试卷名称）
+            exam_name = exam.get("name") or exam.get("topic", "未命名试卷")
+            new_name = sanitize_filename(exam_name)
+
+            # 检查是否已存在同名文件
+            new_filepath = os.path.join(QUESTION_BANK_DIR, f"{new_name}.json")
+            if os.path.exists(new_filepath) and new_filepath != old_filepath:
+                # 添加时间戳避免冲突
+                timestamp = datetime.now().strftime('_%Y%m%d_%H%M%S')
+                new_name = f"{new_name}{timestamp}"
+                new_filepath = os.path.join(QUESTION_BANK_DIR, f"{new_name}.json")
+
+            # 确保题库目录存在
+            os.makedirs(QUESTION_BANK_DIR, exist_ok=True)
+
+            # 移动文件
+            import shutil
+            if old_filepath != new_filepath:
+                shutil.move(old_filepath, new_filepath)
+                print(f"试卷已从草稿目录移动到题库: {new_filepath}")
+
+        # 更新试卷数据
         update_exam(exam_id, exam)
-        return {"success": True, "status": EXAM_STATUS_APPROVED}
+        return {"success": True, "status": EXAM_STATUS_APPROVED, "message": "试卷审核通过，已保存到题库"}
 
     elif action == "reject":
         # 整体驳回
@@ -561,13 +1017,14 @@ def search_questions(keyword: str, question_type: str = None,
     }
 
 
-def grade_question(question: dict, student_answer: str) -> dict:
+def grade_question(question: dict, student_answer: str, user_token: str = None) -> dict:
     """
     批阅单道题
 
     Args:
         question: 题目信息(含正确答案和分值)
         student_answer: 学生答案
+        user_token: 用户认证token（由网关注入）
 
     Returns:
         批阅结果
@@ -595,11 +1052,25 @@ def grade_question(question: dict, student_answer: str) -> dict:
         "question_content": question.get("content", ""),
         "correct_answer": correct_answer,
         "student_answer": student_answer,
-        "max_score": max_score
+        "max_score": max_score,
+        "user_token": user_token or ""
     }
 
-    result = call_dify_workflow(DIFY_GRADE_API_KEY, inputs)
-    outputs = parse_json_response(result)
+    print(f"[DEBUG] 批阅题目: 类型={question_type}, ID={question.get('id', 0)}")
+
+    try:
+        result = call_dify_workflow(DIFY_GRADE_API_KEY, inputs)
+        outputs = parse_json_response(result)
+    except Exception as e:
+        print(f"[ERROR] 批阅题目失败: {e}")
+        # 返回默认结果，避免整个批阅流程失败
+        return {
+            "score": 0,
+            "max_score": max_score,
+            "feedback": f"批阅服务暂时不可用: {str(e)}",
+            "correct": False,
+            "error": True
+        }
 
     # 解析返回结果
     grade_result = outputs.get("result", {})
@@ -625,6 +1096,156 @@ def grade_question(question: dict, student_answer: str) -> dict:
         grade_result = {"score": 0, "feedback": str(grade_result)}
 
     return grade_result
+
+
+def grade_from_mysql(
+    exam_id: str,
+    student_id: str,
+    student_name: str,
+    answers: List[Dict],
+    user_token: str = None
+) -> Dict:
+    """
+    基于前端传入的题目批卷（不从本地文件读取）
+
+    Args:
+        exam_id: 试卷ID（前端生成）
+        student_id: 学生ID
+        student_name: 学生姓名
+        answers: 答案列表，每项包含：
+            {
+                "question_id": "q_uuid_001",
+                "question_type": "choice/blank/short_answer",
+                "question_content": "题目内容",
+                "correct_answer": "A" 或 JSON 字符串（简答题）,
+                "max_score": 2,
+                "student_answer": "学生答案"
+            }
+        user_token: 用户认证token（由网关注入）
+
+    Returns:
+        批阅报告（与 grade_exam() 返回格式一致）
+    """
+    report = {
+        "report_id": str(uuid.uuid4()),
+        "exam_id": exam_id,
+        "student_id": student_id,
+        "student_name": student_name or "匿名",
+        "graded_at": datetime.now().isoformat(),
+        "total_score": 0,
+        "max_score": 0,
+        "results": []
+    }
+
+    if not answers:
+        report["error"] = "没有答案数据"
+        return report
+
+    # 收集所有需要批阅的题目
+    tasks = []
+
+    for ans in answers:
+        question_type = ans.get("question_type", "choice")
+        question_id = ans.get("question_id", "")
+        question_content = ans.get("question_content", "")
+        correct_answer = ans.get("correct_answer", "")
+        max_score = ans.get("max_score", 2)
+        student_answer = ans.get("student_answer", "")
+
+        # 构造题目对象（用于 grade_question）
+        question = {
+            "id": question_id,
+            "content": question_content,
+            "score": max_score
+        }
+
+        # 根据题型设置答案格式
+        if question_type == "choice":
+            question["options"] = []  # 选择题选项
+            question["answer"] = correct_answer
+        elif question_type == "short_answer":
+            # 简答题答案是 JSON 字符串
+            try:
+                question["reference_answer"] = json.loads(correct_answer) if isinstance(correct_answer, str) else correct_answer
+            except (json.JSONDecodeError, TypeError):
+                question["reference_answer"] = {
+                    "points": [{"point": correct_answer, "score": max_score}],
+                    "total_score": max_score
+                }
+        else:  # blank
+            question["answer"] = correct_answer
+
+        tasks.append({
+            "type": question_type,
+            "question": question,
+            "student_answer": student_answer,
+            "qid": question_id,
+            "max_score": max_score
+        })
+
+    # 并发批阅（最多 5 个并发）
+    print(f"[INFO] 开始并发批阅 {len(tasks)} 道题目（来自前端）...")
+    results = [None] * len(tasks)  # 保持顺序
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_index = {
+            executor.submit(grade_question, task["question"], task["student_answer"], user_token): i
+            for i, task in enumerate(tasks)
+        }
+
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            try:
+                results[index] = future.result()
+            except Exception as e:
+                print(f"[ERROR] 题目批阅失败: {e}")
+                # 失败时返回默认结果
+                results[index] = {"score": 0, "feedback": f"批阅失败: {str(e)}", "error": True}
+
+    # 处理结果
+    for i, task in enumerate(tasks):
+        result = results[i]
+        qid = task["qid"]
+        q_type = task["type"]
+        max_score = task["max_score"]
+        student_answer = task["student_answer"]
+        question = task["question"]
+
+        q_score = result.get("score", 0)
+        report["total_score"] += q_score
+        report["max_score"] += max_score
+
+        result_item = {
+            "question_id": qid,
+            "question_type": q_type,
+            "question_content": question.get("content", ""),
+            "student_answer": student_answer,
+            "score": q_score,
+            "max_score": max_score,
+            "feedback": result.get("feedback", ""),
+            "correct": result.get("correct", False)
+        }
+
+        # 简答题添加更多字段
+        if q_type == "short_answer":
+            result_item["correct_answer"] = question.get("reference_answer", {})
+            result_item["highlights"] = result.get("highlights", [])
+            result_item["shortcomings"] = result.get("shortcomings", [])
+            result_item["score_details"] = result.get("score_details", [])
+        elif q_type == "choice":
+            result_item["correct_answer"] = question.get("answer", "")
+        else:
+            result_item["correct_answer"] = question.get("answer", "")
+            result_item["highlights"] = result.get("highlights", [])
+            result_item["shortcomings"] = result.get("shortcomings", [])
+
+        report["results"].append(result_item)
+
+    # 计算得分率
+    report["score_rate"] = round(report["total_score"] / report["max_score"] * 100, 1) if report["max_score"] > 0 else 0
+
+    print(f"[INFO] 批阅完成: 得分 {report['total_score']}/{report['max_score']} ({report['score_rate']}%)")
+    return report
 
 
 def grade_exam(exam_filepath: str, student_answers: dict, student_name: str = None) -> dict:
@@ -659,88 +1280,129 @@ def grade_exam(exam_filepath: str, student_answers: dict, student_name: str = No
         "questions": []
     }
 
-    # 批阅选择题
+    # 收集所有需要批阅的题目
+    tasks = []
+
+    # 选择题
     for q in exam.get("choice_questions", []):
         qid = q.get("id", 0)
         key = f"choice_{qid}"
         student_answer = student_answers.get(key, "")
-
-        result = grade_question(q, student_answer)
-
-        q_score = result.get("score", 0)
-        q_max = q.get("score", 2)  # 从试卷获取分值
-
-        report["total_score"] += q_score
-        report["max_score"] += q_max
-        report["questions"].append({
+        tasks.append({
             "type": "choice",
-            "id": qid,
-            "content": q.get("content", ""),
+            "question": q,
             "student_answer": student_answer,
-            "correct_answer": q.get("answer", ""),
-            "score": q_score,
-            "max_score": q_max,
-            "feedback": result.get("feedback", ""),
-            "correct": result.get("correct", False)
+            "qid": qid
         })
 
-    # 批阅填空题
+    # 填空题
     for q in exam.get("blank_questions", []):
         qid = q.get("id", 0)
         key = f"blank_{qid}"
         student_answer = student_answers.get(key, "")
-
-        result = grade_question(q, student_answer)
-
-        q_score = result.get("score", 0)
-        q_max = q.get("score", 3)  # 从试卷获取分值
-
-        report["total_score"] += q_score
-        report["max_score"] += q_max
-        report["questions"].append({
+        tasks.append({
             "type": "blank",
-            "id": qid,
-            "content": q.get("content", ""),
+            "question": q,
             "student_answer": student_answer,
-            "correct_answer": q.get("answer", ""),
-            "score": q_score,
-            "max_score": q_max,
-            "feedback": result.get("feedback", ""),
-            "highlights": result.get("highlights", []),
-            "shortcomings": result.get("shortcomings", [])
+            "qid": qid
         })
 
-    # 批阅简答题
+    # 简答题
     for q in exam.get("short_answer_questions", []):
         qid = q.get("id", 0)
         key = f"short_answer_{qid}"
         student_answer = student_answers.get(key, "")
-
-        result = grade_question(q, student_answer)
-
-        q_score = result.get("score", 0)
-        q_max = q.get("reference_answer", {}).get("total_score", 10)
-
-        report["total_score"] += q_score
-        report["max_score"] += q_max
-        report["questions"].append({
+        tasks.append({
             "type": "short_answer",
-            "id": qid,
-            "content": q.get("content", ""),
+            "question": q,
             "student_answer": student_answer,
-            "reference_answer": q.get("reference_answer", {}),
-            "score": q_score,
-            "max_score": q_max,
-            "feedback": result.get("feedback", ""),
-            "highlights": result.get("highlights", []),
-            "shortcomings": result.get("shortcomings", []),
-            "suggestions": result.get("suggestions", []),
-            "score_details": result.get("score_details", [])
+            "qid": qid
         })
+
+    # 并发批阅（最多 5 个并发）
+    print(f"[INFO] 开始并发批阅 {len(tasks)} 道题目...")
+    results = [None] * len(tasks)  # 保持顺序
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_index = {
+            executor.submit(grade_question, task["question"], task["student_answer"]): i
+            for i, task in enumerate(tasks)
+        }
+
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            try:
+                results[index] = future.result()
+            except Exception as e:
+                print(f"[ERROR] 题目批阅失败: {e}")
+                # 失败时返回默认结果
+                results[index] = {"score": 0, "feedback": f"批阅失败: {str(e)}", "error": True}
+
+    # 处理结果
+    for i, task in enumerate(tasks):
+        result = results[i]
+        q = task["question"]
+        qid = task["qid"]
+        q_type = task["type"]
+        student_answer = task["student_answer"]
+
+        if q_type == "choice":
+            q_score = result.get("score", 0)
+            q_max = q.get("score", 2)
+            report["total_score"] += q_score
+            report["max_score"] += q_max
+            report["questions"].append({
+                "type": "choice",
+                "id": qid,
+                "content": q.get("content", ""),
+                "student_answer": student_answer,
+                "correct_answer": q.get("answer", ""),
+                "score": q_score,
+                "max_score": q_max,
+                "feedback": result.get("feedback", ""),
+                "correct": result.get("correct", False)
+            })
+        elif q_type == "blank":
+            q_score = result.get("score", 0)
+            q_max = q.get("score", 3)
+            report["total_score"] += q_score
+            report["max_score"] += q_max
+            report["questions"].append({
+                "type": "blank",
+                "id": qid,
+                "content": q.get("content", ""),
+                "student_answer": student_answer,
+                "correct_answer": q.get("answer", ""),
+                "score": q_score,
+                "max_score": q_max,
+                "feedback": result.get("feedback", ""),
+                "highlights": result.get("highlights", []),
+                "shortcomings": result.get("shortcomings", [])
+            })
+        elif q_type == "short_answer":
+            q_score = result.get("score", 0)
+            q_max = q.get("reference_answer", {}).get("total_score", 10)
+            report["total_score"] += q_score
+            report["max_score"] += q_max
+            report["questions"].append({
+                "type": "short_answer",
+                "id": qid,
+                "content": q.get("content", ""),
+                "student_answer": student_answer,
+                "reference_answer": q.get("reference_answer", {}),
+                "score": q_score,
+                "max_score": q_max,
+                "feedback": result.get("feedback", ""),
+                "highlights": result.get("highlights", []),
+                "shortcomings": result.get("shortcomings", []),
+                "suggestions": result.get("suggestions", []),
+                "score_details": result.get("score_details", [])
+            })
 
     # 计算得分率
     report["score_rate"] = round(report["total_score"] / report["max_score"] * 100, 1) if report["max_score"] > 0 else 0
 
+    print(f"[INFO] 批阅完成: 得分 {report['total_score']}/{report['max_score']} ({report['score_rate']}%)")
     return report
 
 

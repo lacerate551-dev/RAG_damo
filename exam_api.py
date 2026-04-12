@@ -21,46 +21,33 @@ from exam_manager import (
     list_exams, get_exam_by_id, update_exam,
     review_exam, submit_for_review, search_questions,
     grade_exam, save_grade_report, get_report_by_id, list_reports,
+    generate_exam_by_file, grade_from_mysql,
     EXAM_STATUS_DRAFT, EXAM_STATUS_PENDING, EXAM_STATUS_APPROVED, EXAM_STATUS_REJECTED
+)
+
+# 导入网关认证模块
+from auth_gateway import (
+    require_gateway_auth, check_collection_permission, get_current_user
 )
 
 # 创建蓝图
 exam_bp = Blueprint('exam', __name__)
 
-# JWT 配置（与 auth.py 保持一致）
-JWT_SECRET = os.environ.get('JWT_SECRET', 'dev-secret-change-in-production')
+# JWT 配置（保留用于其他功能，但不再覆盖 get_current_user）
+# 密钥长度至少32字节以满足SHA256要求
+JWT_SECRET = os.environ.get('JWT_SECRET', 'dev-secret-change-in-production-32b!')
 
 
 # ==================== 认证装饰器 ====================
-
-def get_current_user():
-    """从请求头获取当前用户"""
-    auth_header = request.headers.get('Authorization', '')
-    if not auth_header.startswith('Bearer '):
-        return None
-
-    token = auth_header[7:]  # 去掉 "Bearer " 前缀
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
-        return {
-            'user_id': payload.get('user_id'),
-            'username': payload.get('username'),
-            'role': payload.get('role'),
-            'department': payload.get('department')
-        }
-    except jwt.ExpiredSignatureError:
-        return None
-    except jwt.InvalidTokenError:
-        return None
-
+# 注意: get_current_user 已从 auth_gateway 导入，无需重复定义
 
 def require_auth(f):
-    """要求登录"""
+    """要求登录（网关认证）"""
     @wraps(f)
     def decorated(*args, **kwargs):
         user = get_current_user()
         if not user:
-            return jsonify({'error': '缺少认证令牌，请先登录'}), 401
+            return jsonify({'error': '缺少认证信息，请通过网关访问'}), 401
         # 将用户信息附加到请求上下文
         request.current_user = user
         return f(*args, **kwargs)
@@ -73,7 +60,7 @@ def require_admin(f):
     def decorated(*args, **kwargs):
         user = get_current_user()
         if not user:
-            return jsonify({'error': '缺少认证令牌，请先登录'}), 401
+            return jsonify({'error': '缺少认证信息，请通过网关访问'}), 401
         if user.get('role') != 'admin':
             return jsonify({'error': '需要管理员权限'}), 403
         request.current_user = user
@@ -82,6 +69,89 @@ def require_admin(f):
 
 
 # ==================== 出题相关 API ====================
+
+@exam_bp.route('/generate-by-file', methods=['POST'])
+@require_gateway_auth
+def api_generate_exam_by_file():
+    """
+    按文件生成题目
+
+    请求体:
+    {
+        "file_path": "public/产品手册.pdf",
+        "collection": "public_kb",
+        "choice_count": 5,
+        "blank_count": 2,
+        "short_answer_count": 2,
+        "difficulty": 3,
+        "choice_score": 2,
+        "blank_score": 3
+    }
+
+    返回:
+    {
+        "source_file": {"path": "...", "collection": "..."},
+        "choice_questions": [...],
+        "blank_questions": [...],
+        "short_answer_questions": [...],
+        "total_count": 9,
+        "total_score": 22
+    }
+    """
+    try:
+        data = request.json
+
+        file_path = data.get('file_path')
+        collection = data.get('collection')
+
+        if not file_path or not collection:
+            return jsonify({"error": "缺少 file_path 或 collection 参数"}), 400
+
+        # 获取当前用户
+        user = get_current_user()
+        print(f"[DEBUG] get_current_user() = {user}")  # 调试日志
+        print(f"[DEBUG] request.current_user = {getattr(request, 'current_user', 'NOT SET')}")  # 调试日志
+        print(f"[DEBUG] X-User-ID header = {request.headers.get('X-User-ID')}")  # 调试日志
+        if not user:
+            return jsonify({"error": "未认证", "debug": "current_user is None"}), 401
+
+        # 检查向量库访问权限
+        if not check_collection_permission(
+            role=user['role'],
+            department=user.get('department', ''),
+            collection_name=collection,
+            operation="read"
+        ):
+            return jsonify({
+                "error": "权限不足",
+                "message": f"您没有权限访问向量库 '{collection}'",
+                "your_role": user['role'],
+                "your_department": user.get('department', ''),
+                "target_collection": collection
+            }), 403
+
+        # 按文件生成题目（传入用户信息用于工作流认证）
+        result = generate_exam_by_file(
+            file_path=file_path,
+            collection=collection,
+            user_id=user.get('user_id'),
+            user_role=user.get('role'),
+            user_department=user.get('department'),
+            choice_count=data.get('choice_count', 3),
+            blank_count=data.get('blank_count', 2),
+            short_answer_count=data.get('short_answer_count', 2),
+            difficulty=data.get('difficulty', 3),
+            choice_score=data.get('choice_score', 2),
+            blank_score=data.get('blank_score', 3),
+            created_by=data.get('created_by'),
+            name=data.get('name')
+        )
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @exam_bp.route('/generate', methods=['POST'])
 @require_auth
@@ -305,6 +375,83 @@ def api_review_exam(exam_id):
 
 
 # ==================== 批卷相关 API ====================
+
+@exam_bp.route('/grade-from-mysql', methods=['POST'])
+@require_auth
+def api_grade_from_mysql():
+    """
+    基于前端传入的题目批卷
+
+    请求体:
+    {
+        "exam_id": "试卷ID",
+        "student_id": "学生ID",
+        "student_name": "张三",
+        "answers": [
+            {
+                "question_id": "q_uuid_001",
+                "question_type": "choice",
+                "question_content": "题目内容",
+                "correct_answer": "A",
+                "max_score": 2,
+                "student_answer": "B"
+            },
+            {
+                "question_id": "q_uuid_002",
+                "question_type": "blank",
+                "question_content": "填空题内容______",
+                "correct_answer": "正确答案",
+                "max_score": 3,
+                "student_answer": "学生答案"
+            },
+            {
+                "question_id": "q_uuid_003",
+                "question_type": "short_answer",
+                "question_content": "简答题内容",
+                "correct_answer": "{\"points\":[{\"point\":\"要点1\",\"score\":3}]}",
+                "max_score": 10,
+                "student_answer": "学生作答内容..."
+            }
+        ]
+    }
+
+    返回:
+    {
+        "report_id": "uuid",
+        "exam_id": "试卷ID",
+        "student_id": "学生ID",
+        "student_name": "张三",
+        "total_score": 75,
+        "max_score": 100,
+        "score_rate": 75.0,
+        "results": [...]
+    }
+    """
+    try:
+        data = request.json
+
+        answers = data.get('answers', [])
+        if not answers:
+            return jsonify({"error": "缺少答案数据"}), 400
+
+        # 从请求头获取 Authorization token
+        auth_header = request.headers.get('Authorization', '')
+        user_token = auth_header.replace('Bearer ', '') if auth_header.startswith('Bearer ') else ''
+
+        # 调用批卷函数
+        result = grade_from_mysql(
+            exam_id=data.get('exam_id', ''),
+            student_id=data.get('student_id', ''),
+            student_name=data.get('student_name', '匿名'),
+            answers=answers,
+            user_token=user_token
+        )
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @exam_bp.route('/<exam_id>/grade', methods=['POST'])
 @require_auth

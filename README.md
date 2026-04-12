@@ -2,11 +2,18 @@
 
 基于本地向量模型 + Chroma向量数据库 + Neo4j知识图谱 + Qwen API 的智能知识库问答系统，支持双模式对话、Agentic RAG 和 Graph RAG。
 
-> **最新版本**: v4.2.0 (出题系统完善 + 审核流程优化)
+> **最新版本**: v5.0.0 (大规模系统重构：多向量库权限控制、文档生命周期及本地化出题批卷)
 
 ## 功能特性
 
-### 最新特性 (v4.2.0)
+### 最新特性 (v5.0.0)
+- **多向量库与细粒度权限控制**：全面重构向量库底层，基于公共知识库(`public_kb`)和各部门隔离的子知识库(`dept_xxx`)实现物理阻断，通过网关注入(`auth_gateway.py`)进行Role/Department鉴权。
+- **文档生命周期与版本差异引擎**：引入文档全生命周期跟踪(`document_lifecycle.py`)和MD5哈希监控差异引擎(`document_diff.py`)，文档废止或更新时自动分析关联考题的连带影响(`question_maintenance_hook.py`)。
+- **本地化自治出题与批卷系统**：建立独立的本地出卷、题库存储系统(`exam_local_db.py`)与题库分析系统(`exam_analysis.py`)，支持脱离工作流进行溯源追踪与本地打分。
+- **问答质量闭环与纲要生成**：支持记录用户点赞/点踩动作与追问(`feedback_service.py`)形成本地FAQ闭环；使用大模型自动化提取文档大纲及关联推荐(`outline_generator.py`)。
+- **全新解析与分块器**：集成结构化PDF解析(ODL解析)与Excel深度解析扩展，引入智能语义切块算法(`semantic_chunker.py`)提升检索精准度。
+
+### v4.2.0 特性
 - **出题系统完善**：试卷生成、审核、批阅完整流程
 - **审核流程优化**：管理员可在"审核试卷"中审核草稿试卷
 - **前端界面优化**：修复页面滚动问题，优化交互体验
@@ -42,32 +49,36 @@
 
 ```
 RAG_damo/
-├── models/                    # 模型目录（需下载）
-│   ├── bge-base-zh-v1.5/     # 向量模型（必需）
-│   └── bge-reranker-base/    # 重排序模型（自动下载）
-├── documents/                 # 文档目录
-├── 题库/                      # 试卷存储目录
-├── 批阅报告/                   # 批阅报告目录
-├── chroma_db/                 # 向量数据库（自动生成）
-├── chat-ui/                   # 前端界面
-│   ├── index.html            # 主聊天界面
-│   ├── exam.html             # 出题系统界面
-│   ├── style.css
-│   ├── app.js
-│   └── exam.js
-├── docs/                      # 文档
-├── rag_demo.py               # RAG基础功能
-├── agentic_rag.py            # Agentic RAG 核心
-├── graph_rag.py              # Graph RAG 检索模块
-├── graph_manager.py          # Neo4j 图谱管理器
-├── entity_extractor.py       # 实体提取器
-├── graph_build.py            # 图谱构建脚本
-├── rag_api_server.py         # REST API 服务
-├── exam_manager.py           # 出题系统核心逻辑
-├── exam_api.py               # 出题系统 API
-├── session_manager.py        # 会话管理器
+├── models/                    # 模型目录（需手动下载/配置）
+├── documents/                 # 知识库文档源目录
+├── vector_store/              # Chroma与BM25多向量/索引存储
+│   ├── chroma/                # public_kb与dept_xxx隔离存储
+│   └── bm25/                  # 各库的独立BM25缓存
+├── data/                      # SQLite本地业务数据库
+│   ├── sessions.db            # 会话管理及审计日志
+│   ├── exam_local.db          # 本地试卷题库
+│   ├── exam_analysis.db       # 题目分析及文档生命周期
+│   └── feedback.db            # 反馈与FAQ
+├── chat-ui/                   # 前端界面 (HTML/CSS/JS)
+├── docs/                      # 架构及开发文档
+├── rag_api_server.py         # Flask 主 REST API 服务入口
+├── agentic_rag.py            # Agentic RAG 推理与Agent决策引擎
+├── auth_gateway.py           # API网关注入认证及多向量库路由鉴权
+├── knowledge_base_manager.py # 多向量库引擎管理器 (RRF多库融合)
+├── kb_router.py              # LLM智能知识库路由选择器
+├── session_manager.py        # 并发友好型多轮会话管理
+├── knowledge_sync.py         # 文档自动同步及哈希对比服务
+├── document_lifecycle.py     # 文档生命周期与废止管理
+├── document_diff.py          # 文档内容差异分析引擎
+├── pdf_parser_odl.py         # ODL智能化PDF文档解析引擎
+├── semantic_chunker.py       # 语义优化Chunker分块器
+├── outline_generator.py      # 文档纲要自动化生成与相似推荐
+├── feedback_service.py       # 用户问答质量反馈与FAQ服务
+├── exam_manager.py           # 结合大模型与本地库的出题系统统筹
+├── exam_api.py               # 考试管理API路由模块
+├── exam_local_db.py          # 纯本地SQLite出题批阅持久化层
 ├── config.example.py         # 配置示例
-├── requirements.txt          # Python依赖
+├── requirements.txt          # 生产与开发环境依赖
 └── README.md
 ```
 
@@ -410,6 +421,14 @@ Q: 发生一级安全事件后应该向谁报告？
 | `/exam/report/<id>` | GET | 获取批阅报告 |
 | `/exam/report/list` | GET | 批阅报告列表 |
 
+### 文档管理接口
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/documents/upload` | POST | 上传文件到知识库 |
+| `/documents/list` | GET | 获取文档列表 |
+| `/documents/<path>` | DELETE | 删除文档 |
+
 详细 API 文档请参考 [API对接文档](docs/API对接文档.md)
 
 ## 依赖库
@@ -457,9 +476,10 @@ USE_GRAPH_RAG = True
 
 | 版本 | 更新内容 |
 |------|----------|
-| **v4.2.0** | 出题系统完善：试卷审核流程优化、前端界面修复、试卷名称自定义 |
-| **v4.1.0** | 前端日志面板：实时显示Agent思考过程，日志持久化存储；来源去重优化 |
-| **v4.0.0** | Graph RAG：Neo4j知识图谱、实体提取、多跳推理；智能聊天网络搜索；出题系统集成 |
+| **v5.0.0** | 大规模引擎重构：引入多向量库的部门级鉴权与路由隔离、文档生命周期与差异监控；加入ODL解析与Semantic Chunker；完成独立出卷系统(MySQL/SQLite)、纲要生成与FAQ问答闭环反馈收集功能 |
+| v4.2.0 | 出题系统完善：试卷审核流程优化、前端界面修复、试卷名称自定义 |
+| v4.1.0 | 前端日志面板：实时显示Agent思考过程，日志持久化存储；来源去重优化 |
+| v4.0.0 | Graph RAG：Neo4j知识图谱、实体提取、多跳推理；智能聊天网络搜索；出题系统集成 |
 | v3.0.0 | 双模式RAG系统：普通聊天/知识库问答，会话管理，前端界面 |
 | v2.1.0 | Dify智能出题系统集成 |
 | v1.1.0 | RAG幻觉优化：混合检索+Rerank+置信度 |

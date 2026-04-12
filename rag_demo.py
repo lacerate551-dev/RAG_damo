@@ -30,6 +30,35 @@ import numpy as np
 from rank_bm25 import BM25Okapi
 import jieba
 
+# OpenDataLoader PDF 解析器（可选）
+try:
+    from pdf_parser_odl import parse_pdf_with_odl, ChunkMetadata
+    ODL_AVAILABLE = True
+except ImportError:
+    ODL_AVAILABLE = False
+
+# 语义分块器（可选）
+try:
+    from semantic_chunker import SemanticChunker, HybridChunker
+    SEMANTIC_CHUNKER_AVAILABLE = True
+except ImportError:
+    SEMANTIC_CHUNKER_AVAILABLE = False
+
+# Docling 文档解析器（可选）
+try:
+    from doc_parser_docling import DoclingParser, DOCLING_AVAILABLE, DocChunk
+    if not DOCLING_AVAILABLE:
+        DOCLING_AVAILABLE = False
+except ImportError:
+    DOCLING_AVAILABLE = False
+
+# Excel 增强解析器（可选）
+try:
+    from excel_parser_enhanced import ExcelParserEnhanced, ExcelChunk
+    EXCEL_ENHANCED_AVAILABLE = True
+except ImportError:
+    EXCEL_ENHANCED_AVAILABLE = False
+
 # 导入配置
 try:
     from config import API_KEY, BASE_URL, MODEL
@@ -52,9 +81,13 @@ EMBEDDING_MODEL_PATH = os.path.join(MODELS_DIR, "bge-base-zh-v1.5")
 RERANK_MODEL_PATH = os.path.join(MODELS_DIR, "bge-reranker-base")
 
 # 数据目录
-CHROMA_DB_PATH = os.path.join(PROJECT_ROOT, "chroma_db")
+VECTOR_STORE_PATH = os.path.join(PROJECT_ROOT, "vector_store")
+CHROMA_DB_PATH = os.path.join(VECTOR_STORE_PATH, "chroma")
 DOCUMENTS_PATH = os.path.join(PROJECT_ROOT, "documents")
-BM25_INDEX_PATH = os.path.join(PROJECT_ROOT, "bm25_index.pkl")
+BM25_INDEXES_PATH = os.path.join(VECTOR_STORE_PATH, "bm25")
+
+# 多向量库配置
+USE_MULTI_KB = True  # 是否使用多向量库模式
 
 # 混合检索配置
 USE_HYBRID_SEARCH = True  # 是否启用混合检索
@@ -65,6 +98,25 @@ BM25_WEIGHT = 0.5  # BM25检索权重
 USE_RERANK = True  # 是否启用重排序
 RERANK_CANDIDATES = 20  # 重排序前的候选数量（混合检索后）
 RERANK_TOP_K = 5  # 重排序后返回的数量
+
+# PDF 解析配置
+USE_ODL_PARSER = True  # 是否使用 OpenDataLoader PDF 解析器（更高质量）
+ODL_USE_STRUCT_TREE = True  # 是否使用 PDF 结构树（Tagged PDF）
+ODL_USE_HYBRID = False  # 是否使用混合模式（需要后端服务）
+
+# Docling 文档解析配置
+USE_DOCLING_PARSER = True  # 是否使用 Docling 解析 Word（更高质量）
+
+# Excel 解析配置
+USE_EXCEL_ENHANCED = True  # 是否使用增强版 Excel 解析器
+EXCEL_MAX_ROWS_PER_CHUNK = 50  # 每个分块的最大行数
+EXCEL_MIN_ROWS_PER_CHUNK = 2   # 每个分块的最小行数
+
+# 分块配置
+USE_SEMANTIC_CHUNK = True  # 是否使用语义分块（替代固定字符切分）
+SEMANTIC_BREAKPOINT_THRESHOLD = 0.5  # 语义分块阈值（值越大分块越少）
+SEMANTIC_MIN_CHUNK_SIZE = 50  # 最小分块字符数
+SEMANTIC_MAX_CHUNK_SIZE = 800  # 最大分块字符数
 
 
 # ========== 模型初始化辅助函数 ==========
@@ -215,18 +267,53 @@ if not model_ok:
 embedding_model = SentenceTransformer(EMBEDDING_MODEL_PATH)
 print(f"      模型加载完成: {EMBEDDING_MODEL_PATH}")
 
+# 初始化语义分块器
+semantic_chunker = None
+if USE_SEMANTIC_CHUNK and SEMANTIC_CHUNKER_AVAILABLE:
+    semantic_chunker = SemanticChunker(
+        embedding_model=embedding_model,
+        breakpoint_threshold=SEMANTIC_BREAKPOINT_THRESHOLD,
+        min_chunk_size=SEMANTIC_MIN_CHUNK_SIZE,
+        max_chunk_size=SEMANTIC_MAX_CHUNK_SIZE
+    )
+    print(f"      语义分块器已启用 (阈值: {SEMANTIC_BREAKPOINT_THRESHOLD})")
+elif USE_SEMANTIC_CHUNK and not SEMANTIC_CHUNKER_AVAILABLE:
+    print("      警告: 语义分块模块未找到，使用传统分块")
+
 print("\n[2/5] 初始化向量数据库...")
-chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-collection = chroma_client.get_or_create_collection(
-    name="knowledge_base",
-    metadata={"description": "RAG Demo 知识库"}
-)
-print(f"      数据库路径: {CHROMA_DB_PATH}")
+# 多向量库模式
+if USE_MULTI_KB:
+    from knowledge_base_manager import KnowledgeBaseManager
+    from kb_router import KnowledgeBaseRouter
+    from auth_gateway import get_accessible_collections
+
+    kb_manager = KnowledgeBaseManager(CHROMA_DB_PATH)
+    kb_router = KnowledgeBaseRouter(use_llm=False)
+    print(f"      数据库路径: {CHROMA_DB_PATH}")
+    print(f"      向量库数量: {len(kb_manager.list_collections())}")
+    print(f"      多向量库模式: 已启用")
+
+    # 兼容旧代码的 collection 引用（指向 public_kb）
+    chroma_client = None
+    collection = kb_manager.get_collection('public_kb')
+else:
+    chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    collection = chroma_client.get_or_create_collection(
+        name="knowledge_base",
+        metadata={"description": "RAG Demo 知识库"}
+    )
+    kb_manager = None
+    kb_router = None
+    print(f"      数据库路径: {CHROMA_DB_PATH}")
+print(f"      当前模式: {'多向量库' if USE_MULTI_KB else '单向量库'}")
 
 print("\n[3/5] 初始化BM25索引...")
 bm25_index = BM25Index()
 if USE_HYBRID_SEARCH:
-    bm25_index.load(BM25_INDEX_PATH)
+    if USE_MULTI_KB:
+        print("      多向量库模式: BM25索引按需从各向量库加载")
+    else:
+        bm25_index.load(BM25_INDEX_PATH)
 else:
     print("      混合检索已禁用，跳过BM25索引加载")
 
@@ -331,7 +418,12 @@ def add_file_to_index(filepath):
                 has_table = page_info.get('has_table', False)
                 section = page_info.get('section', '')
 
-                chunks = split_text(page_text)
+                # ODL 分块不再切分，传统 PDF 使用智能分块
+                is_odl_chunk = page_info.get('is_odl_chunk', False)
+                if is_odl_chunk:
+                    chunks = [page_text]
+                else:
+                    chunks = smart_split_text(page_text)
 
                 for i, chunk in enumerate(chunks):
                     vector = embedding_model.encode(chunk).tolist()
@@ -363,7 +455,8 @@ def add_file_to_index(filepath):
                 is_table = block.get('is_table', False)
                 section = block.get('section', '')
 
-                chunks = [text] if is_table else split_text(text)
+                # 表格不分块，普通文本使用智能分块
+                chunks = [text] if is_table else smart_split_text(text)
 
                 for i, chunk in enumerate(chunks):
                     vector = embedding_model.encode(chunk).tolist()
@@ -422,7 +515,7 @@ def add_file_to_index(filepath):
     elif ext == '.txt':
         content = extract_text_from_txt(filepath)
         if content.strip():
-            chunks = split_text(content)
+            chunks = smart_split_text(content)  # 使用智能分块
             for i, chunk in enumerate(chunks):
                 vector = embedding_model.encode(chunk).tolist()
                 chunk_id = f"{rel_path}_{i}"
@@ -502,7 +595,67 @@ def sync_documents():
 
 # ========== 文档处理函数 ==========
 def extract_text_from_pdf(filepath):
-    """从PDF提取文本，返回带页码和结构信息的内容列表"""
+    """
+    从PDF提取文本，返回带页码和结构信息的内容列表
+
+    支持两种解析模式：
+    1. OpenDataLoader 模式（USE_ODL_PARSER=True）：高质量解析，保留文档结构
+    2. pdfplumber 模式（默认）：基础解析，按页提取
+    """
+    # 使用 OpenDataLoader 解析器（优先）
+    if USE_ODL_PARSER and ODL_AVAILABLE:
+        return extract_text_from_pdf_odl(filepath)
+
+    # 回退到 pdfplumber 解析
+    return extract_text_from_pdf_plumber(filepath)
+
+
+def extract_text_from_pdf_odl(filepath):
+    """
+    使用 OpenDataLoader PDF 解析器提取文本
+
+    返回格式与 pdfplumber 兼容，但包含更丰富的结构信息：
+    - 按章节分块而非按页
+    - 保留标题层级
+    - 包含 bounding box 坐标
+    """
+    pages_content = []
+    try:
+        result = parse_pdf_with_odl(
+            filepath,
+            use_struct_tree=ODL_USE_STRUCT_TREE,
+            use_hybrid=ODL_USE_HYBRID
+        )
+
+        # 将分块结果转换为兼容格式
+        for chunk in result['chunks']:
+            pages_content.append({
+                'text': chunk.content,
+                'page': chunk.page_start,
+                'page_end': chunk.page_end,
+                'has_table': chunk.chunk_type == 'table',
+                'section': chunk.title,
+                'section_path': chunk.section_path,
+                'level': chunk.level,
+                'bbox': chunk.bbox,
+                'source_file': chunk.source_file,
+                'is_odl_chunk': True  # 标记为 ODL 分块
+            })
+
+        # 如果没有分块，回退到 pdfplumber
+        if not pages_content:
+            print(f"      OpenDataLoader 未提取到内容，回退到 pdfplumber: {filepath}")
+            return extract_text_from_pdf_plumber(filepath)
+
+    except Exception as e:
+        print(f"      OpenDataLoader 解析错误，回退到 pdfplumber: {e}")
+        return extract_text_from_pdf_plumber(filepath)
+
+    return pages_content
+
+
+def extract_text_from_pdf_plumber(filepath):
+    """从PDF提取文本，返回带页码和结构信息的内容列表（pdfplumber 实现）"""
     pages_content = []
     try:
         with pdfplumber.open(filepath) as pdf:
@@ -536,14 +689,65 @@ def extract_text_from_pdf(filepath):
 
 
 def extract_text_from_docx(filepath):
-    """从Word文档提取文本，返回带结构信息的内容块列表"""
+    """
+    从Word文档提取文本，返回带结构信息的内容块列表
+
+    支持两种解析模式：
+    1. Docling 模式（USE_DOCLING_PARSER=True）：高质量解析，保留结构
+    2. docx2txt + python-docx 模式（默认）：基础解析
+    """
+    # 使用 Docling 解析器（优先）
+    if USE_DOCLING_PARSER and DOCLING_AVAILABLE:
+        return extract_text_from_docx_docling(filepath)
+
+    # 回退到传统解析
+    return extract_text_from_docx_traditional(filepath)
+
+
+def extract_text_from_docx_docling(filepath):
+    """使用 Docling 解析 Word 文档"""
+    content_blocks = []
+    try:
+        from doc_parser_docling import DoclingParser
+
+        parser = DoclingParser()
+        result = parser.parse(filepath)
+
+        # 转换分块为兼容格式
+        for chunk in result['chunks']:
+            content_blocks.append({
+                'text': chunk.content,
+                'is_heading': chunk.level > 0,
+                'section': chunk.title,
+                'section_path': chunk.section_path,
+                'level': chunk.level,
+                'is_table': chunk.chunk_type == 'table',
+                'is_docling_chunk': True  # 标记为 Docling 分块
+            })
+
+        if not content_blocks:
+            print(f"      Docling 未提取到内容，回退到传统解析: {filepath}")
+            return extract_text_from_docx_traditional(filepath)
+
+    except Exception as e:
+        print(f"      Docling 解析错误，回退到传统解析: {e}")
+        return extract_text_from_docx_traditional(filepath)
+
+    return content_blocks
+
+
+def extract_text_from_docx_traditional(filepath):
+    """
+    Word 传统解析（简化版，作为 Docling 的回退）
+
+    保留基础文本提取和简单表格处理
+    """
     content_blocks = []
 
-    # 首先尝试用docx2txt提取（兼容性更好）
+    # 首先尝试用 docx2txt 提取（兼容性更好）
     try:
         full_text = docx2txt.process(filepath)
         if full_text and full_text.strip():
-            # 按段落分割
             for para in full_text.split('\n\n'):
                 text = para.strip()
                 if text:
@@ -555,27 +759,21 @@ def extract_text_from_docx(filepath):
                     })
             return content_blocks
     except Exception as e:
-        print(f"      docx2txt解析失败，尝试python-docx: {e}")
+        print(f"      docx2txt 解析失败，尝试 python-docx: {e}")
 
-    # 备用：尝试python-docx
+    # 备用：使用 python-docx
     try:
         doc = Document(filepath)
-
         current_section = ""
+
         for para in doc.paragraphs:
             text = para.text.strip()
             if not text:
                 continue
 
-            # 检测是否为标题（通过样式或格式）
-            is_heading = False
-            if para.style.name.startswith('Heading') or para.style.name.startswith('标题'):
-                is_heading = True
-                current_section = text
-            # 其他标题特征：短、以特定格式开头
-            elif len(text) < 50 and (text.startswith(('第', '一、', '二、', '三、', '四、', '五、')) or
-                                      text.endswith(('章', '节', '规定', '制度', '办法', '表'))):
-                is_heading = True
+            # 简单标题检测
+            is_heading = para.style.name.startswith(('Heading', '标题'))
+            if is_heading:
                 current_section = text
 
             content_blocks.append({
@@ -585,22 +783,23 @@ def extract_text_from_docx(filepath):
                 'is_table': False
             })
 
-        # 提取表格内容
-        for table_idx, table in enumerate(doc.tables):
-            table_text = []
+        # 简单表格提取
+        for table in doc.tables:
+            table_rows = []
             for row in table.rows:
                 row_text = " | ".join(cell.text.strip() for cell in row.cells)
                 if row_text.strip(" |"):
-                    table_text.append(row_text)
-            if table_text:
+                    table_rows.append(row_text)
+            if table_rows:
                 content_blocks.append({
-                    'text': "【表格内容】\n" + "\n".join(table_text),
+                    'text': "【表格】\n" + "\n".join(table_rows),
                     'is_heading': False,
                     'section': current_section,
                     'is_table': True
                 })
+
     except Exception as e:
-        print(f"      Word解析错误 {filepath}: {e}")
+        print(f"      Word 解析错误 {filepath}: {e}")
     return content_blocks
 
 
@@ -608,8 +807,61 @@ def extract_text_from_xlsx(filepath):
     """
     从Excel提取文本，智能分块存储
 
-    改进：将Excel中的数据块（由标题行+数据行组成）作为整体存储
-    而非逐行存储，提高检索效果
+    支持两种解析模式：
+    1. 增强模式（USE_EXCEL_ENHANCED=True）：表头检测、合并单元格、智能分块
+    2. 传统模式（默认）：简单的第一列/第二列规则分块
+    """
+    # 使用增强解析器（优先）
+    if USE_EXCEL_ENHANCED and EXCEL_ENHANCED_AVAILABLE:
+        return extract_text_from_xlsx_enhanced(filepath)
+
+    # 回退到传统解析
+    return extract_text_from_xlsx_traditional(filepath)
+
+
+def extract_text_from_xlsx_enhanced(filepath):
+    """使用增强解析器处理 Excel"""
+    content_blocks = []
+    try:
+        from excel_parser_enhanced import ExcelParserEnhanced
+
+        parser = ExcelParserEnhanced(
+            max_rows_per_chunk=EXCEL_MAX_ROWS_PER_CHUNK,
+            min_rows_per_chunk=EXCEL_MIN_ROWS_PER_CHUNK
+        )
+        result = parser.parse(filepath)
+
+        # 转换分块为兼容格式
+        for chunk in result['chunks']:
+            content_blocks.append({
+                'text': chunk.content,
+                'sheet': chunk.sheet,
+                'row': int(chunk.row_range.split('-')[0]) if chunk.row_range else 0,
+                'row_range': chunk.row_range,
+                'col_range': chunk.col_range,
+                'is_header': chunk.chunk_type == 'header',
+                'block_title': chunk.title,
+                'is_block': chunk.chunk_type == 'data',
+                'headers': chunk.headers,
+                'is_enhanced_chunk': True  # 标记为增强分块
+            })
+
+        if not content_blocks:
+            print(f"      增强解析未提取到内容，回退到传统解析: {filepath}")
+            return extract_text_from_xlsx_traditional(filepath)
+
+    except Exception as e:
+        print(f"      增强解析错误，回退到传统解析: {e}")
+        return extract_text_from_xlsx_traditional(filepath)
+
+    return content_blocks
+
+
+def extract_text_from_xlsx_traditional(filepath):
+    """
+    Excel 传统解析（简化版，作为增强解析的回退）
+
+    仅保留基础行读取，不做复杂的块检测
     """
     content_blocks = []
     try:
@@ -617,125 +869,20 @@ def extract_text_from_xlsx(filepath):
         for sheet_name in wb.sheetnames:
             sheet = wb[sheet_name]
 
-            # 读取所有行
-            all_rows = []
             for row_idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
                 cells = [str(cell) if cell is not None else "" for cell in row]
-                first_col = cells[0].strip() if cells else ""
-                second_col = cells[1].strip() if len(cells) > 1 else ""
                 row_text = " | ".join(cells)
 
                 if row_text.strip(" |"):
-                    all_rows.append({
-                        'row': row_idx,
-                        'text': row_text,
-                        'cells': cells,
-                        'first_col': first_col,
-                        'second_col': second_col
-                    })
-
-            if not all_rows:
-                continue
-
-            # 识别数据块：基于实际Excel结构
-            # 规则：如果第一列有值且第二列为空，则是新的分类块开始
-            blocks = []
-            current_block = None
-            header_row = None
-
-            for row_info in all_rows:
-                first_col = row_info['first_col']
-                second_col = row_info['second_col']
-                row_text = row_info['text']
-
-                # 判断是否为新块的开始
-                # 新块特征：第一列有实质内容，且(第二列为空 OR 是前两行)
-                is_new_block_start = (
-                    first_col and
-                    len(first_col) > 1 and
-                    (not second_col or row_info['row'] <= 2)
-                )
-
-                # 如果检测到新块开始，保存当前块并开始新块
-                if is_new_block_start:
-                    if current_block and current_block['rows']:
-                        blocks.append(current_block)
-                    current_block = {
-                        'title': first_col,
-                        'start_row': row_info['row'],
-                        'rows': [row_info]
-                    }
-                elif current_block:
-                    # 添加到当前块
-                    current_block['rows'].append(row_info)
-                    current_block['end_row'] = row_info['row']
-                else:
-                    # 还没有块，创建一个默认块
-                    current_block = {
-                        'title': sheet_name,
-                        'start_row': row_info['row'],
-                        'rows': [row_info]
-                    }
-
-            # 保存最后一个块
-            if current_block and current_block['rows']:
-                blocks.append(current_block)
-
-            # 如果没有识别出块，按简单方式处理（每行一个块）
-            if not blocks:
-                for row_info in all_rows:
                     content_blocks.append({
-                        'text': row_info['text'],
+                        'text': row_text,
                         'sheet': sheet_name,
-                        'row': row_info['row'],
-                        'row_range': str(row_info['row']),
-                        'is_header': row_info['row'] == 1,
+                        'row': row_idx,
+                        'row_range': str(row_idx),
+                        'is_header': row_idx == 1,
                         'block_title': '',
                         'is_block': False
                     })
-            else:
-                # 将每个块转换为存储单元
-                for block in blocks:
-                    title = block['title']
-                    start_row = block['start_row']
-                    rows = block['rows']
-                    end_row = block.get('end_row', start_row)
-
-                    if len(rows) == 1:
-                        # 单行块
-                        content_blocks.append({
-                            'text': rows[0]['text'],
-                            'sheet': sheet_name,
-                            'row': start_row,
-                            'row_range': str(start_row),
-                            'is_header': start_row <= 2,
-                            'block_title': title,
-                            'is_block': False
-                        })
-                    else:
-                        # 多行块，组合存储
-                        # 格式：【分类名称】\n编码1 | 说明1\n编码2 | 说明2...
-                        rows_text = []
-                        for r in rows:
-                            # 跳过块标题行本身（已在标题中显示）
-                            if r['first_col'] == title and not r['second_col']:
-                                continue
-                            rows_text.append(r['text'])
-
-                        if rows_text:
-                            combined_text = f"【{title}】\n" + "\n".join(rows_text[:100])
-                            if len(rows_text) > 100:
-                                combined_text += f"\n... (共{len(rows_text)}条)"
-
-                            content_blocks.append({
-                                'text': combined_text,
-                                'sheet': sheet_name,
-                                'row': start_row,
-                                'row_range': f"{start_row}-{end_row}",
-                                'is_header': start_row <= 2,
-                                'block_title': title,
-                                'is_block': True
-                            })
 
     except Exception as e:
         print(f"      Excel解析错误 {filepath}: {e}")
@@ -765,12 +912,10 @@ def load_documents():
     documents = []
     supported_extensions = {'.txt', '.pdf', '.docx', '.doc', '.xlsx'}
 
-    # 目录名 -> 安全级别映射
+    # 目录名 -> 安全级别映射 (精简版)
     security_levels = {
-        'public': 'public',           # 公开 - 所有人可见
-        'internal': 'internal',       # 内部 - 登录用户可见
-        'confidential': 'confidential',  # 机密 - 管理层及以上
-        'secret': 'secret'            # 绝密 - 仅管理员
+        'public': 'public',              # 全公司公开
+        'confidential': 'confidential'   # 部门内保密
     }
 
     if not os.path.exists(DOCUMENTS_PATH):
@@ -790,7 +935,7 @@ def load_documents():
             rel_path = os.path.relpath(filepath, DOCUMENTS_PATH)
 
             # 根据目录路径确定安全级别
-            security_level = 'public'  # 默认公开
+            security_level = 'internal'  # 默认部门内公开
             rel_path_lower = rel_path.lower().replace('\\', '/')
             for dir_name, level in security_levels.items():
                 if f'/{dir_name}/' in f'/{rel_path_lower}/':
@@ -847,8 +992,29 @@ def load_documents():
     return documents
 
 
+def smart_split_text(text, force_semantic=False):
+    """
+    智能分块函数 - 根据配置选择分块策略
+
+    Args:
+        text: 待分块的文本
+        force_semantic: 强制使用语义分块
+
+    Returns:
+        分块列表
+    """
+    global semantic_chunker
+
+    # 优先使用语义分块
+    if (USE_SEMANTIC_CHUNK or force_semantic) and semantic_chunker is not None:
+        return semantic_chunker.split_text(text)
+
+    # 降级到传统分块
+    return split_text(text, chunk_size=300, overlap=50)
+
+
 def split_text(text, chunk_size=300, overlap=50):
-    """将文本切分成重叠片段"""
+    """将文本切分成重叠片段（传统方式）"""
     chunks = []
     start = 0
 
@@ -879,6 +1045,17 @@ def split_text(text, chunk_size=300, overlap=50):
 def build_knowledge_base(force=False):
     """构建知识库（向量索引 + BM25索引）"""
     global chroma_client, collection
+
+    # 多向量库模式：调用重建脚本
+    if USE_MULTI_KB:
+        print("\n" + "=" * 50)
+        print("多向量库模式")
+        print("=" * 50)
+        print("\n请使用 rebuild_multi_kb.py 脚本构建多向量库:")
+        print("  python rebuild_multi_kb.py")
+        print("\n或使用 API 服务:")
+        print("  python rag_api_server.py")
+        return
 
     print("\n" + "=" * 50)
     print("构建知识库")
@@ -960,7 +1137,7 @@ def build_knowledge_base(force=False):
     all_metas = []
 
     for doc in documents:
-        # PDF特殊处理，按页切分
+        # PDF特殊处理，支持 ODL 智能分块和传统按页切分
         if doc['type'] == 'pdf':
             doc_chunks = 0
             for page_info in doc['pages']:
@@ -969,21 +1146,51 @@ def build_knowledge_base(force=False):
                 has_table = page_info.get('has_table', False)
                 section = page_info.get('section', '')
 
-                chunks = split_text(page_text)
+                # 检查是否为 ODL 分块（智能分块，不切分）
+                is_odl_chunk = page_info.get('is_odl_chunk', False)
+
+                if is_odl_chunk:
+                    # ODL 分块：直接使用，不再切分
+                    chunks = [page_text]
+                    section_path = page_info.get('section_path', section)
+                    level = page_info.get('level', 0)
+                    page_end = page_info.get('page_end', page_num)
+                    bbox = page_info.get('bbox')
+                else:
+                    # 传统分块：按字符切分
+                    chunks = split_text(page_text)
+                    section_path = section
+                    level = 0
+                    page_end = page_num
+                    bbox = None
+
                 doc_chunks += len(chunks)
 
                 for i, chunk in enumerate(chunks):
                     vector = embedding_model.encode(chunk).tolist()
-                    chunk_id = f"{doc['filename']}_p{page_num}_{i}"
+
+                    # ODL 分块使用章节路径作为 ID
+                    if is_odl_chunk:
+                        chunk_id = f"{doc['filename']}_s{page_num}_{level}_{i}"
+                    else:
+                        chunk_id = f"{doc['filename']}_p{page_num}_{i}"
 
                     meta = {
                         'source': doc['filename'],
                         'page': page_num,
+                        'page_end': page_end,
                         'chunk_index': i,
                         'has_table': has_table,
                         'section': section,
+                        'section_path': section_path,
+                        'level': level,
+                        'is_odl_chunk': is_odl_chunk,
                         'security_level': doc.get('security_level', 'public')
                     }
+
+                    # 添加 bounding box 信息（如果有）
+                    if bbox:
+                        meta['bbox'] = bbox
 
                     collection.add(
                         ids=[chunk_id],
@@ -1215,7 +1422,7 @@ def rerank_results(query, results, top_k=5):
     return reranked_results
 
 
-def search_knowledge(query, top_k=5, allowed_levels=None):
+def search_knowledge(query, top_k=5, allowed_levels=None, role=None, department=None, collections=None):
     """
     混合检索 (P4优化: 向量检索 + BM25 + RRF融合 + Rerank)
 
@@ -1228,13 +1435,19 @@ def search_knowledge(query, top_k=5, allowed_levels=None):
     Args:
         query: 查询文本
         top_k: 返回结果数
-        allowed_levels: 允许访问的安全级别列表，如 ["public", "internal"]
-                       None 表示不过滤（向后兼容）
+        allowed_levels: 允许访问的安全级别列表（单向量库模式）
+        role: 用户角色（多向量库模式）
+        department: 用户部门（多向量库模式）
+        collections: 指定向量库列表（多向量库模式，可选）
     """
     results_list = []
     weights = []
 
-    # 构建权限过滤条件
+    # 多向量库模式
+    if USE_MULTI_KB and kb_manager:
+        return _search_multi_kb(query, top_k, role, department, collections)
+
+    # 单向量库模式（原有逻辑）
     where_filter = None
     if allowed_levels:
         where_filter = {"security_level": {"$in": allowed_levels}}
@@ -1302,6 +1515,230 @@ def search_knowledge(query, top_k=5, allowed_levels=None):
         }
 
     return fused_results
+
+
+def _search_multi_kb(query, top_k=5, role=None, department=None, target_collections=None):
+    """
+    多向量库检索
+
+    Args:
+        query: 查询文本
+        top_k: 返回结果数
+        role: 用户角色
+        department: 用户部门
+        target_collections: 指定向量库列表（可选，不传则自动路由）
+    """
+    # 确定目标向量库
+    if target_collections is None:
+        if role and department:
+            # 使用路由器自动选择
+            accessible = get_accessible_collections(role, department, 'read')
+            target_collections = kb_router.route(query, role, department, accessible)
+        else:
+            # 默认只查 public_kb
+            target_collections = ['public_kb']
+
+    if not target_collections:
+        return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+
+    # 生成查询向量
+    query_vector = embedding_model.encode(query).tolist()
+    recall_k = RERANK_CANDIDATES if (USE_RERANK or USE_HYBRID_SEARCH) else top_k
+
+    # 并行检索多个向量库
+    all_results = []
+    for coll_name in target_collections:
+        try:
+            coll = kb_manager.get_collection(coll_name)
+            if coll is None:
+                continue
+
+            # 向量检索
+            results = coll.query(
+                query_embeddings=[query_vector],
+                n_results=recall_k
+            )
+
+            # 添加来源标记
+            if results['metadatas'] and results['metadatas'][0]:
+                for meta in results['metadatas'][0]:
+                    meta['_collection'] = coll_name
+
+            all_results.append(results)
+
+            # BM25 检索（如果启用）
+            if USE_HYBRID_SEARCH:
+                try:
+                    bm25 = kb_manager.get_bm25_index(coll_name)
+                    if bm25.bm25:
+                        bm25_results = bm25.search(query, top_k=recall_k)
+                        if bm25_results['metadatas'] and bm25_results['metadatas'][0]:
+                            for meta in bm25_results['metadatas'][0]:
+                                meta['_collection'] = coll_name
+                        all_results.append(bm25_results)
+                except Exception as e:
+                    pass  # BM25 索引可能不存在
+
+        except Exception as e:
+            print(f"检索向量库 {coll_name} 失败: {e}")
+            continue
+
+    if not all_results:
+        return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+
+    # 合并结果
+    if len(all_results) == 1:
+        fused_results = all_results[0]
+    else:
+        # 使用 RRF 融合
+        weights = [VECTOR_WEIGHT if i % 2 == 0 else BM25_WEIGHT for i in range(len(all_results))]
+        fused_results = reciprocal_rank_fusion(all_results, weights)
+
+    # Rerank 精排
+    if USE_RERANK and reranker:
+        fused_results = rerank_results(query, fused_results, top_k)
+    else:
+        fused_results = {
+            'ids': [fused_results['ids'][0][:top_k]],
+            'documents': [fused_results['documents'][0][:top_k]],
+            'metadatas': [fused_results['metadatas'][0][:top_k]],
+            'distances': [fused_results['distances'][0][:top_k]]
+        }
+
+    return fused_results
+
+
+def check_restricted_documents(query, allowed_levels, top_k=3, role=None, department=None):
+    """
+    检测是否存在超出用户权限的相关文档
+
+    当用户查询没有返回结果时，用于判断是因为知识库中确实没有相关信息，
+    还是因为相关信息存在于用户无权访问的文档中。
+
+    Args:
+        query: 查询文本
+        allowed_levels: 用户当前允许访问的安全级别列表（单向量库模式）
+        top_k: 检索数量
+        role: 用户角色（多向量库模式）
+        department: 用户部门（多向量库模式）
+
+    Returns:
+        {
+            "has_restricted": bool,
+            "restricted_levels": list,
+            "restricted_sources": list,
+            "top_restricted_score": float
+        }
+    """
+    # 多向量库模式
+    if USE_MULTI_KB and kb_manager and role and department:
+        return _check_restricted_multi_kb(query, role, department, top_k)
+
+    # 单向量库模式
+    if not allowed_levels:
+        return {"has_restricted": False, "restricted_levels": [], "restricted_sources": [], "top_restricted_score": 0.0}
+
+    all_levels = {"public", "internal", "confidential", "secret"}
+    allowed_set = set(allowed_levels)
+    restricted_levels = all_levels - allowed_set
+
+    if not restricted_levels:
+        return {"has_restricted": False, "restricted_levels": [], "restricted_sources": [], "top_restricted_score": 0.0}
+
+    restricted_filter = {"security_level": {"$in": list(restricted_levels)}}
+
+    query_vector = embedding_model.encode(query).tolist()
+    query_kwargs = {
+        "query_embeddings": [query_vector],
+        "n_results": top_k,
+        "where": restricted_filter
+    }
+
+    try:
+        restricted_results = collection.query(**query_kwargs)
+
+        docs = restricted_results.get('documents', [[]])[0]
+        metas = restricted_results.get('metadatas', [[]])[0]
+        distances = restricted_results.get('distances', [[]])[0]
+
+        if not docs:
+            return {"has_restricted": False, "restricted_levels": [], "restricted_sources": [], "top_restricted_score": 0.0}
+
+        found_levels = set()
+        found_sources = set()
+        top_score = 0.0
+
+        for doc, meta, dist in zip(docs, metas, distances):
+            level = meta.get('security_level', 'public')
+            source = meta.get('source', '未知')
+            found_levels.add(level)
+            found_sources.add(source)
+            if dist > top_score:
+                top_score = dist
+
+        level_names = {
+            "public": "公开",
+            "internal": "内部",
+            "confidential": "机密",
+            "secret": "绝密"
+        }
+
+        return {
+            "has_restricted": True,
+            "restricted_levels": [level_names.get(l, l) for l in found_levels],
+            "restricted_sources": list(found_sources)[:3],
+            "top_restricted_score": top_score
+        }
+
+    except Exception as e:
+        print(f"检测受限文档时出错: {e}")
+        return {"has_restricted": False, "restricted_levels": [], "restricted_sources": [], "top_restricted_score": 0.0}
+
+
+def _check_restricted_multi_kb(query, role, department, top_k=3):
+    """多向量库模式下的受限文档检测"""
+    from auth_gateway import get_accessible_collections
+
+    # 获取所有向量库和可访问向量库
+    all_collections = [c.name for c in kb_manager.list_collections()]
+    accessible = set(get_accessible_collections(role, department, 'read'))
+    restricted = set(all_collections) - accessible
+
+    if not restricted:
+        return {"has_restricted": False, "restricted_levels": [], "restricted_sources": [], "top_restricted_score": 0.0}
+
+    query_vector = embedding_model.encode(query).tolist()
+    found_sources = set()
+    top_score = 0.0
+
+    for coll_name in restricted:
+        try:
+            coll = kb_manager.get_collection(coll_name)
+            if coll is None:
+                continue
+
+            results = coll.query(
+                query_embeddings=[query_vector],
+                n_results=top_k
+            )
+
+            if results['metadatas'] and results['metadatas'][0]:
+                for meta in results['metadatas'][0]:
+                    source = meta.get('source', '未知')
+                    found_sources.add(source)
+                if results['distances'] and results['distances'][0]:
+                    for dist in results['distances'][0]:
+                        if dist > top_score:
+                            top_score = dist
+        except Exception:
+            continue
+
+    return {
+        "has_restricted": len(found_sources) > 0,
+        "restricted_levels": [coll.replace('dept_', '') for coll in restricted if coll in found_sources or True][:3],
+        "restricted_sources": list(found_sources)[:3],
+        "top_restricted_score": top_score
+    }
 
 
 def aggregate_excel_rows(results, max_rows=10):
@@ -1451,13 +1888,19 @@ def generate_answer(query, context):
 
 def chat(query=None):
     """交互式问答或单次问答"""
+    # 多向量库模式下的用户身份
+    current_role = 'admin'
+    current_department = ''
+
     if query:
         # 单次问答模式
-        return process_query(query)
+        return process_query(query, role=current_role, department=current_department)
 
     # 交互模式
     print("\n" + "=" * 50)
     print("知识库问答")
+    if USE_MULTI_KB:
+        print("(多向量库模式)")
     print("=" * 50)
     print("命令 (以 / 开头):")
     print("  /quit    - 退出程序")
@@ -1467,8 +1910,13 @@ def chat(query=None):
     print("  /del <文件名> - 删除单个文件")
     print("  /list    - 列出已索引的文件")
     print("  /help    - 显示帮助信息")
+    if USE_MULTI_KB:
+        print("  /role <role> - 设置角色 (admin/manager/user)")
+        print("  /dept <dept> - 设置部门 (finance/hr/tech/...)")
     print("其他输入将作为问题进行问答")
     print("=" * 50)
+    if USE_MULTI_KB:
+        print(f"当前身份: {current_role}/{current_department or '全部'}")
 
     while True:
         print("\n" + "-" * 30)
@@ -1494,10 +1942,15 @@ def chat(query=None):
                 continue
 
             if cmd == '/list':
-                files = list_indexed_files()
-                print(f"\n已索引文件 ({len(files)} 个):")
-                for f, count in sorted(files.items()):
-                    print(f"  {f}: {count} 片段")
+                if USE_MULTI_KB:
+                    print(f"\n向量库列表:")
+                    for coll_info in kb_manager.list_collections():
+                        print(f"  {coll_info.name}: {coll_info.document_count} 条记录")
+                else:
+                    files = list_indexed_files()
+                    print(f"\n已索引文件 ({len(files)} 个):")
+                    for f, count in sorted(files.items()):
+                        print(f"  {f}: {count} 片段")
                 continue
 
             if cmd == '/help':
@@ -1509,6 +1962,9 @@ def chat(query=None):
                 print("  /del <文件名> - 删除单个文件")
                 print("  /list    - 列出已索引的文件")
                 print("  /help    - 显示帮助信息")
+                if USE_MULTI_KB:
+                    print("  /role <role> - 设置角色 (admin/manager/user)")
+                    print("  /dept <dept> - 设置部门 (finance/hr/tech/...)")
                 continue
 
             if cmd.startswith('/add '):
@@ -1525,20 +1981,49 @@ def chat(query=None):
                 delete_file_from_index(filename)
                 continue
 
+            # 多向量库模式下的角色和部门设置
+            if USE_MULTI_KB and cmd.startswith('/role '):
+                new_role = query[6:].strip().lower()
+                if new_role in ['admin', 'manager', 'user']:
+                    current_role = new_role
+                    print(f"角色已设置为: {current_role}")
+                    print(f"当前身份: {current_role}/{current_department or '全部'}")
+                else:
+                    print(f"无效角色: {new_role}，有效值: admin, manager, user")
+                continue
+
+            if USE_MULTI_KB and cmd.startswith('/dept '):
+                new_dept = query[6:].strip().lower()
+                current_department = new_dept
+                print(f"部门已设置为: {current_department}")
+                print(f"当前身份: {current_role}/{current_department or '全部'}")
+                continue
+
             # 未知命令
             print(f"未知命令: {query}")
             print("输入 /help 查看可用命令")
             continue
 
         # 不是命令，作为问题处理
-        process_query(query)
+        process_query(query, role=current_role, department=current_department)
 
 
-def process_query(query):
-    """处理单个查询"""
+def process_query(query, role=None, department=None):
+    """处理单个查询
+
+    Args:
+        query: 查询文本
+        role: 用户角色（多向量库模式）
+        department: 用户部门（多向量库模式）
+    """
     # 检索相关内容
     print("\n[检索中...]")
-    results = search_knowledge(query, top_k=5)  # 增加召回数量
+
+    # 多向量库模式
+    if USE_MULTI_KB and role and department:
+        results = search_knowledge(query, top_k=5, role=role, department=department)
+    else:
+        results = search_knowledge(query, top_k=5)
 
     if not results['documents'][0]:
         print("未找到相关内容")

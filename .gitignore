@@ -63,3 +63,7 @@ documents/
 
 # 非必要文档
 docs/superpowers/
+
+# 以下为v5.0.0新增忽略：多向量库存储及SQLite数据
+data/
+vector_store/

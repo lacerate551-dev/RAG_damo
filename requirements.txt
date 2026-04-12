@@ -11,6 +11,7 @@ pdfplumber>=0.10.0
 python-docx>=0.8.11
 openpyxl>=3.1.0
 docx2txt>=0.8
+opendataloader-pdf>=2.2.0  # 高质量 PDF 解析器（需要 Java 11+）
 
 # Web服务
 flask>=2.0.0
@@ -20,6 +21,9 @@ PyJWT>=2.8.0
 # 检索相关
 rank-bm25>=0.2.2
 jieba>=0.42.1
+
+# 文件监控
+watchdog>=3.0.0
 
 # 其他
 requests>=2.28.0

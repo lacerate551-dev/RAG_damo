@@ -24,7 +24,7 @@ from typing import Optional, List, Dict
 class AuditLogger:
     """审计日志记录器"""
 
-    def __init__(self, db_path: str = "./sessions.db"):
+    def __init__(self, db_path: str = "./data/sessions.db"):
         self.db_path = db_path
         self._init_db()
 
@@ -67,6 +67,45 @@ class AuditLogger:
 
         conn.commit()
         conn.close()
+
+    def log(self, user_id: str, action: str, resource: str = "",
+            details: Dict = None, username: str = "", role: str = "",
+            department: str = "", ip_address: str = "") -> int:
+        """
+        记录通用操作日志（非查询类操作）
+
+        Args:
+            user_id: 用户ID
+            action: 操作类型（upload_document/delete_document/deprecate_document等）
+            resource: 操作资源（如文件路径）
+            details: 操作详情字典
+            username: 用户名
+            role: 用户角色
+            department: 部门
+            ip_address: 请求IP
+
+        Returns:
+            日志记录ID
+        """
+        details_json = json.dumps(details or {}, ensure_ascii=False)[:2000]
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            INSERT INTO audit_logs
+            (user_id, username, action, query, result_summary, sources,
+             role, department, ip_address, duration_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            user_id, username, action, resource, "", details_json,
+            role, department, ip_address, 0
+        ))
+
+        log_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return log_id
 
     def log_query(self, user_id: str, query: str,
                   result_summary: str = "", sources: List[Dict] = None,

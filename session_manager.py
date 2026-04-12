@@ -35,7 +35,7 @@ import uuid
 class SessionManager:
     """会话管理器"""
 
-    def __init__(self, db_path: str = "./sessions.db", session_expire_hours: int = 24):
+    def __init__(self, db_path: str = "./data/sessions.db", session_expire_hours: int = 24):
         """
         初始化会话管理器
 
