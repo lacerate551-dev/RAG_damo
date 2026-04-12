@@ -329,6 +329,36 @@ class HybridChunker:
         return sections
 
 
+# ========== 传统分块函数 ==========
+def split_text(text, chunk_size=300, overlap=50):
+    """将文本切分成重叠片段（传统方式）"""
+    chunks = []
+    start = 0
+
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+
+        # 尝试在句子边界处切分
+        if end < len(text):
+            # 查找最后一个句号、问号或感叹号
+            last_period = max(
+                chunk.rfind('。'),
+                chunk.rfind('？'),
+                chunk.rfind('！'),
+                chunk.rfind('\n')
+            )
+            if last_period > chunk_size // 2:
+                chunk = chunk[:last_period + 1]
+                end = start + last_period + 1
+
+        if chunk.strip():
+            chunks.append(chunk.strip())
+        start = end - overlap
+
+    return chunks
+
+
 def create_semantic_chunker(
     model_path: str = "./models/bge-base-zh-v1.5",
     breakpoint_threshold: float = 0.5,
