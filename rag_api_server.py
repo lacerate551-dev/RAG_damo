@@ -39,7 +39,7 @@ from services.session import SessionManager
 from auth.gateway import require_gateway_auth, require_role, get_user_permissions, get_auth_manager
 from services.audit import AuditLogger
 from auth.security import validate_query, sanitize_user_input, filter_response, AgentConstraints
-from agentic_rag import AgenticRAG
+from core.agentic import AgenticRAG
 from rag_demo import (
     collection, API_KEY, BASE_URL, MODEL,
     embedding_model, reranker, EMBEDDING_MODEL_PATH, RERANK_MODEL_PATH,

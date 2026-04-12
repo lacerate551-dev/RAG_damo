@@ -9,7 +9,7 @@ Agentic RAG - 知识库智能问答系统
 5. Agent决策 - 动态决定检索、改写、分解等操作
 
 使用方式：
-    from agentic_rag import AgenticRAG
+    from core.agentic import AgenticRAG
 
     rag = AgenticRAG()
     result = rag.process("你的问题")
@@ -1358,7 +1358,7 @@ def simple_query(query: str, history: list = None) -> dict:
         }
 
     使用示例:
-        from agentic_rag import simple_query
+        from core.agentic import simple_query
 
         result = simple_query("出差补助标准是什么？")
         print(result["answer"])
