@@ -699,7 +699,8 @@ class KnowledgeBaseManager:
     def _add_pdf_to_collection(self, collection, filepath, filename, embedding_model, extra_metadata):
         """添加 PDF 文件"""
         try:
-            from rag_demo import extract_text_from_pdf, split_text
+            from parsers import extract_text_from_pdf
+            from core.chunker import split_text
         except ImportError:
             logger.error("无法导入 PDF 处理函数")
             return 0
@@ -745,7 +746,8 @@ class KnowledgeBaseManager:
     def _add_docx_to_collection(self, collection, filepath, filename, embedding_model, extra_metadata):
         """添加 DOCX 文件"""
         try:
-            from rag_demo import extract_text_from_docx, split_text
+            from parsers import extract_text_from_docx
+            from core.chunker import split_text
         except ImportError:
             logger.error("无法导入 DOCX 处理函数")
             return 0
@@ -793,7 +795,7 @@ class KnowledgeBaseManager:
     def _add_xlsx_to_collection(self, collection, filepath, filename, embedding_model, extra_metadata):
         """添加 XLSX 文件"""
         try:
-            from rag_demo import extract_text_from_xlsx
+            from parsers import extract_text_from_xlsx
         except ImportError:
             logger.error("无法导入 XLSX 处理函数")
             return 0
@@ -844,7 +846,8 @@ class KnowledgeBaseManager:
     def _add_txt_to_collection(self, collection, filepath, filename, embedding_model, extra_metadata):
         """添加 TXT 文件"""
         try:
-            from rag_demo import extract_text_from_txt, split_text
+            from parsers import extract_text_from_txt
+            from core.chunker import split_text
         except ImportError:
             logger.error("无法导入 TXT 处理函数")
             return 0
