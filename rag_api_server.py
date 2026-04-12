@@ -61,6 +61,10 @@ except ImportError as e:
 app = Flask(__name__)
 CORS(app)
 
+# 注册认证/系统状态蓝图
+from api.auth_routes import auth_bp
+app.register_blueprint(auth_bp)
+
 # 注册出题系统蓝图
 if HAS_EXAM_API:
     app.register_blueprint(exam_bp, url_prefix='/exam')
@@ -68,6 +72,7 @@ if HAS_EXAM_API:
 
 # 会话管理器
 session_manager = SessionManager(db_path="./data/sessions.db", session_expire_hours=24)
+app.config['SESSION_MANAGER'] = session_manager  # 供 Blueprint 访问
 
 # 认证管理器（兼容旧代码，实际使用网关认证）
 auth_manager = get_auth_manager()
@@ -593,48 +598,7 @@ def clear_history(session_id):
     return jsonify({"success": True, "message": "历史已清空"})
 
 
-@app.route('/stats', methods=['GET'])
-@require_gateway_auth
-@require_role('admin')
-def get_stats():
-    """获取系统统计信息（仅管理员）"""
-    return jsonify(session_manager.get_stats())
-
-
-@app.route('/health', methods=['GET'])
-def health():
-    """健康检查"""
-    return jsonify({
-        "status": "ok",
-        "knowledge_base": "多向量库模式 (按集合提供服务)",
-        "bm25_index": "动态按需加载",
-        "mode": "Agentic RAG"
-    })
-
-
-# ==================== 认证 API ====================
-# 注意：登录和注册由后端网关处理，这里只提供用户信息查询
-
-@app.route('/auth/me', methods=['GET'])
-@require_gateway_auth
-def get_current_user():
-    """
-    获取当前用户信息
-
-    用户信息由网关注入到请求 Header 中：
-    - X-User-ID: 用户唯一标识
-    - X-User-Name: 用户名
-    - X-User-Role: 用户角色
-    - X-User-Department: 部门
-    """
-    user = request.current_user
-    return jsonify({
-        "user_id": user["user_id"],
-        "username": user["username"],
-        "role": user["role"],
-        "department": user["department"],
-        "permissions": get_user_permissions(user["role"])
-    })
+# ==================== 认证/健康/统计 API 已迁移到 api/auth_routes.py ====================
 
 
 # ==================== 多向量库管理 API ====================
