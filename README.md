@@ -1,35 +1,35 @@
-# RAG Demo - 本地知识库问答系统
+# RAG Agent - 模块化知识库问答系统
 
 基于本地向量模型 + Chroma向量数据库 + Neo4j知识图谱 + Qwen API 的智能知识库问答系统，支持双模式对话、Agentic RAG 和 Graph RAG。
 
-> **最新版本**: v5.0.0 (大规模系统重构：多向量库权限控制、文档生命周期及本地化出题批卷)
+> **最新版本**: v6.0.0 (模块化重构：代码架构全面优化，模块职责清晰分离)
 
 ## 功能特性
 
-### 最新特性 (v5.0.0)
-- **多向量库与细粒度权限控制**：全面重构向量库底层，基于公共知识库(`public_kb`)和各部门隔离的子知识库(`dept_xxx`)实现物理阻断，通过网关注入(`auth_gateway.py`)进行Role/Department鉴权。
-- **文档生命周期与版本差异引擎**：引入文档全生命周期跟踪(`document_lifecycle.py`)和MD5哈希监控差异引擎(`document_diff.py`)，文档废止或更新时自动分析关联考题的连带影响(`question_maintenance_hook.py`)。
-- **本地化自治出题与批卷系统**：建立独立的本地出卷、题库存储系统(`exam_local_db.py`)与题库分析系统(`exam_analysis.py`)，支持脱离工作流进行溯源追踪与本地打分。
-- **问答质量闭环与纲要生成**：支持记录用户点赞/点踩动作与追问(`feedback_service.py`)形成本地FAQ闭环；使用大模型自动化提取文档大纲及关联推荐(`outline_generator.py`)。
-- **全新解析与分块器**：集成结构化PDF解析(ODL解析)与Excel深度解析扩展，引入智能语义切块算法(`semantic_chunker.py`)提升检索精准度。
+### 最新特性 (v6.0.0)
+- **模块化架构重构**：代码从单文件拆分为清晰的模块结构，提升可维护性
+  - `core/` 核心引擎：查询分类、质量评估、置信度门控、推理反思、循环防护
+  - `api/` 路由模块：11 个独立路由文件，职责单一
+  - `parsers/` 文档解析：支持 PDF/Word/Excel/TXT/图片提取
+  - `knowledge/` 知识库管理：多向量库、同步、生命周期
+  - `services/` 业务服务：会话、反馈、审计、纲要
+  - `auth/` 认证安全：网关认证、输入输出安全
+  - `exam_pkg/` 考试系统：出题、批卷、分析
+- **图片提取功能**：新增 `image_extractor.py`，支持从文档中提取图片
+- **前端界面优化**：chat-ui 样式更新，交互体验提升
+- **新增统一入口**：`main.py` 作为推荐启动入口
 
-### v4.2.0 特性
-- **出题系统完善**：试卷生成、审核、批阅完整流程
-- **审核流程优化**：管理员可在"审核试卷"中审核草稿试卷
-- **前端界面优化**：修复页面滚动问题，优化交互体验
-- **试卷名称自定义**：生成试卷时可指定名称
+### v5.0.0 特性
+- **多向量库与细粒度权限控制**：全面重构向量库底层，基于公共知识库(`public_kb`)和各部门隔离的子知识库(`dept_xxx`)实现物理阻断，通过网关注入进行 Role/Department 鉴权
+- **文档生命周期与版本差异引擎**：引入文档全生命周期跟踪和 MD5 哈希监控差异引擎，文档废止或更新时自动分析关联考题的连带影响
+- **本地化自治出题与批卷系统**：建立独立的本地出卷、题库存储系统与题库分析系统，支持脱离工作流进行溯源追踪与本地打分
+- **问答质量闭环与纲要生成**：支持记录用户点赞/点踩动作与追问形成本地 FAQ 闭环；使用大模型自动化提取文档大纲及关联推荐
+- **全新解析与分块器**：集成结构化 PDF 解析(ODL解析)与 Excel 深度解析扩展，引入智能语义切块算法提升检索精准度
 
-### v4.1.0 特性
-- **前端日志面板**：实时显示Agent思考过程（决策、检索、改写、回答等）
-- **日志持久化**：localStorage存储，刷新页面后日志保留
-- **来源去重**：同一来源合并显示，页码信息整合
-
-### v4.0.0 特性
-- **Graph RAG**：Neo4j 图数据库存储实体关系，多跳推理查询
-- **图谱检索**：向量检索 + 图谱检索融合
-- **智能聊天网络搜索**：Chat 模式支持实时天气、新闻查询
-- **双模式切换**：智能聊天(支持网络搜索) / 知识库问答(多源检索)
-- **出题系统**：Dify 智能出题 + 批阅 + 前端管理界面
+### v4.x 特性
+- **v4.2.0**: 出题系统完善，试卷生成/审核/批阅完整流程
+- **v4.1.0**: 前端日志面板，实时显示 Agent 思考过程
+- **v4.0.0**: Graph RAG，Neo4j 图数据库存储实体关系，多跳推理查询
 
 ### Agentic RAG 核心能力
 - **知识库检索**：向量检索 + BM25 + Rerank
@@ -39,48 +39,94 @@
 - **多源融合**：智能处理知识库、网络、图谱内容
 
 ### 基础功能
-- 支持多种文档格式：PDF、Word(.docx)、Excel(.xlsx)、TXT
+- 支持多种文档格式：PDF、Word(.docx)、Excel(.xlsx)、TXT、图片提取
 - 本地向量模型：BGE-base-zh-v1.5
 - 本地向量数据库：Chroma
 - 精确元数据记录：页码、章节、表格、行列号等
 - 增量更新：无需每次完全重建
 
-## 项目结构
+## 项目结构（模块化）
 
 ```
-RAG_damo/
-├── models/                    # 模型目录（需手动下载/配置）
-├── documents/                 # 知识库文档源目录
-├── knowledge/                 # 知识库管理模块
-│   └── vector_store/          # Chroma与BM25多向量/索引存储
-│       ├── chroma/            # public_kb与dept_xxx隔离存储
-│       └── bm25/              # 各库的独立BM25缓存
-├── data/                      # SQLite本地业务数据库
-│   ├── sessions.db            # 会话管理及审计日志
-│   ├── exam_local.db          # 本地试卷题库
-│   ├── exam_analysis.db       # 题目分析及文档生命周期
-│   └── feedback.db            # 反馈与FAQ
-├── chat-ui/                   # 前端界面 (HTML/CSS/JS)
-├── docs/                      # 架构及开发文档
-├── rag_api_server.py         # Flask 主 REST API 服务入口
-├── agentic_rag.py            # Agentic RAG 推理与Agent决策引擎
-├── auth_gateway.py           # API网关注入认证及多向量库路由鉴权
-├── knowledge_base_manager.py # 多向量库引擎管理器 (RRF多库融合)
-├── kb_router.py              # LLM智能知识库路由选择器
-├── session_manager.py        # 并发友好型多轮会话管理
-├── knowledge_sync.py         # 文档自动同步及哈希对比服务
-├── document_lifecycle.py     # 文档生命周期与废止管理
-├── document_diff.py          # 文档内容差异分析引擎
-├── pdf_parser_odl.py         # ODL智能化PDF文档解析引擎
-├── semantic_chunker.py       # 语义优化Chunker分块器
-├── outline_generator.py      # 文档纲要自动化生成与相似推荐
-├── feedback_service.py       # 用户问答质量反馈与FAQ服务
-├── exam_manager.py           # 结合大模型与本地库的出题系统统筹
-├── exam_api.py               # 考试管理API路由模块
-├── exam_local_db.py          # 纯本地SQLite出题批阅持久化层
-├── config.example.py         # 配置示例
-├── requirements.txt          # 生产与开发环境依赖
-└── README.md
+rag-agent/
+├── main.py                  # ✨ 统一启动入口（推荐）
+├── config.py                # API 配置（需自行创建）
+├── config.example.py        # API 配置模板
+├── requirements.txt         # 依赖列表
+│
+├── core/                    # RAG 核心引擎
+│   ├── agentic.py           #   Agentic RAG 智能问答引擎
+│   ├── engine.py            #   检索引擎核心
+│   ├── bm25_index.py        #   BM25 关键词检索
+│   ├── chunker.py           #   语义分块器
+│   ├── query_classifier.py  #   查询分类器
+│   ├── quality_assessor.py  #   质量评估器
+│   ├── confidence_gate.py   #   置信度门控
+│   ├── reasoning_reflector.py #   推理反思器
+│   └── loop_guard.py        #   循环防护器
+│
+├── parsers/                 # 文档解析器
+│   ├── pdf_odl.py           #   OpenDataLoader PDF 解析
+│   ├── pdf_plumber.py       #   PDF Plumber 解析
+│   ├── docx_docling.py      #   Docling 文档解析
+│   ├── docx_parser.py       #   Word 文档解析
+│   ├── excel_parser.py      #   增强版 Excel 解析
+│   ├── txt_parser.py        #   TXT 文本解析
+│   └── image_extractor.py   #   图片提取器
+│
+├── knowledge/               # 知识库管理
+│   ├── manager.py           #   多向量库管理器
+│   ├── router.py            #   知识库路由器
+│   ├── sync.py              #   同步服务
+│   ├── lifecycle.py         #   文档生命周期
+│   ├── diff.py              #   文档差异分析
+│   └── vector_store/        #   向量存储目录
+│
+├── exam_pkg/                # 考试系统
+│   ├── manager.py           #   出题与批卷管理
+│   ├── api.py               #   Flask Blueprint
+│   ├── analysis.py          #   考试分析
+│   ├── local_db.py          #   本地题库
+│   └── question_hook.py     #   题目维护钩子
+│
+├── services/                # 业务服务
+│   ├── session.py           #   会话管理
+│   ├── audit.py             #   审计日志
+│   ├── feedback.py          #   反馈质量闭环
+│   ├── outline.py           #   纲要生成与推荐
+│   └── user_info.py         #   用户信息服务
+│
+├── auth/                    # 认证与安全
+│   ├── gateway.py           #   网关认证
+│   └── security.py          #   输入/输出安全
+│
+├── api/                     # API 路由层
+│   ├── __init__.py          #   Flask 应用工厂
+│   ├── chat_routes.py       #   聊天路由
+│   ├── document_routes.py   #   文档管理路由
+│   ├── kb_routes.py         #   知识库路由
+│   ├── sync_routes.py       #   同步路由
+│   ├── session_routes.py    #   会话路由
+│   ├── feedback_routes.py   #   反馈路由
+│   ├── outline_routes.py    #   纲要路由
+│   ├── question_routes.py   #   题目路由
+│   ├── audit_routes.py      #   审计路由
+│   ├── graph_routes.py      #   图谱路由
+│   ├── image_routes.py      #   图片路由
+│   └── auth_routes.py       #   认证路由
+│
+├── graph/                   # 知识图谱
+├── scripts/                 # 工具脚本
+├── models/                  # 本地模型目录
+├── documents/               # 知识库文档目录
+├── data/                    # SQLite 数据库
+├── chat-ui/                 # 前端界面
+├── tests/                   # 测试
+├── docs/                    # 文档
+├── venv/                    # 虚拟环境
+│
+├── rag_api_server.py        # ⚠️ 旧入口（兼容层）
+└── rag_demo.py              # ⚠️ 旧入口（兼容层）
 ```
 
 ## 快速开始
@@ -185,7 +231,7 @@ docker run -d \
 ### 8. 构建知识库
 
 ```bash
-# 构建向量索引 + BM25索引
+# 激活虚拟环境后运行
 python rag_demo.py --rebuild
 
 # 构建知识图谱（需要 Neo4j）
@@ -195,7 +241,12 @@ python graph_build.py
 ### 9. 启动服务
 
 ```bash
-python rag_api_server.py
+# ✨ 推荐方式 - 新入口
+python main.py                  # 启动 API 服务（端口 5001）
+python main.py --port 8080      # 指定端口
+
+# 旧入口（仍可用）
+python rag_api_server.py        # 启动 API 服务
 ```
 
 服务启动后：
@@ -232,13 +283,13 @@ curl -X POST http://localhost:5001/graph/build
 
 ```bash
 # 知识库问答
-python agentic_rag.py "请假流程是什么"
+python -c "from core.agentic import AgenticRAG; rag = AgenticRAG(); print(rag.query('请假流程是什么'))"
 
 # 交互模式
-python agentic_rag.py
+python rag_demo.py
 
-# 测试 Graph RAG
-python graph_test.py
+# 单次问答
+python rag_demo.py "请假流程是什么"
 ```
 
 交互模式命令：
@@ -270,14 +321,6 @@ python graph_test.py
 2. **审核试卷**：管理员审核草稿试卷（审核通过后才能用于考试）
 3. **批阅试卷**：选择已通过的试卷，学生作答后系统自动批阅
 4. **批阅报告**：查看历史批阅记录和成绩
-
-### 试卷状态
-
-| 状态 | 说明 |
-|------|------|
-| `draft` | 草稿，管理员可审核 |
-| `approved` | 已通过，可用于学生答题 |
-| `rejected` | 已驳回，不可使用 |
 
 ### API 调用示例
 
@@ -315,27 +358,25 @@ curl -X POST http://localhost:5001/exam/<exam_id>/grade \
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                       rag_api_server.py                                  │
+│                           API 路由层 (api/)                              │
 │   ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────┐    │
-│   │   /chat     │    │    /rag     │    │    /graph/search        │    │
-│   │ 智能聊天     │    │  知识库问答  │    │     图谱检索            │    │
+│   │ chat_routes │    │ kb_routes   │    │   graph_routes          │    │
+│   │   /chat     │    │   /kb       │    │   /graph/*              │    │
 │   └──────┬──────┘    └──────┬──────┘    └───────────┬─────────────┘    │
-│          │                  │                       │                   │
 └──────────┼──────────────────┼───────────────────────┼───────────────────┘
            │                  │                       │
            ▼                  ▼                       ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        Agentic RAG                                       │
+│                        核心引擎层 (core/)                                 │
 │   ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────┐    │
-│   │ Agent决策   │    │ 知识库检索   │    │     Graph RAG           │    │
-│   │ 检索/改写/  │    │ 向量+BM25+  │    │   实体提取 + 图谱查询    │    │
-│   │ 分解/回答   │    │ Rerank      │    │                         │    │
+│   │ agentic.py  │    │ engine.py   │    │   Graph RAG             │    │
+│   │ Agent决策   │    │ 检索引擎     │    │   实体提取 + 图谱查询    │    │
 │   └─────────────┘    └─────────────┘    └─────────────────────────┘    │
 │                                                                          │
-│   ┌─────────────────────────────────────────────────────────────────┐   │
-│   │                      网络搜索 (Serper API)                       │   │
-│   │              实时信息：天气、新闻、股价等                         │   │
-│   └─────────────────────────────────────────────────────────────────┘   │
+│   ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────────────────┐  │
+│   │ query_    │ │ quality_  │ │confidence_│ │ reasoning_reflector   │  │
+│   │ classifier│ │ assessor  │ │   gate    │ │   推理反思器           │  │
+│   └───────────┘ └───────────┘ └───────────┘ └───────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -346,46 +387,11 @@ curl -X POST http://localhost:5001/exam/<exam_id>/grade \
 │   │  向量数据库  │    │  关键词检索  │    │     知识图谱           │    │
 │   └─────────────┘    └─────────────┘    └─────────────────────────┘    │
 │                                                                          │
-│   ┌─────────────┐    ┌─────────────┐                                    │
-│   │ 文档解析     │    │ BGE向量模型  │                                    │
-│   │ PDF/Word/   │    │  (本地运行)  │                                    │
-│   │ Excel/TXT   │    └─────────────┘                                    │
-│   └─────────────┘                                                        │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │                    文档解析器 (parsers/)                          │   │
+│   │          PDF / Word / Excel / TXT / 图片提取                     │   │
+│   └─────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────┘
-```
-
-## Graph RAG 功能详解
-
-### 实体类型
-
-从企业制度文档中自动提取的实体类型：
-
-| 实体类型 | 示例 |
-|----------|------|
-| 部门 | 人力资源部、财务部、信息技术部 |
-| 制度 | 差旅管理办法、信息安全管理制度 |
-| 人员 | 员工、经理、审批人 |
-| 流程 | 报销流程、审批流程 |
-| 条件 | 享受条件、适用范围 |
-
-### 关系类型
-
-| 关系 | 示例 |
-|------|------|
-| 负责 | 人力资源部 → 负责 → 差旅管理办法 |
-| 适用 | 差旅管理办法 → 适用 → 员工 |
-| 包含 | 报销流程 → 包含 → 审批步骤 |
-| 审批 | 部门负责人 → 审批 → 报销申请 |
-
-### 多跳查询示例
-
-```
-Q: 发生一级安全事件后应该向谁报告？
-→ 图谱推理链：
-  一级安全事件 --属于--> 安全事件
-  安全事件 --报告--> 应急响应小组
-  应急响应小组 --由--> 安全部门负责
-→ A: 应向应急响应小组报告，由安全部门负责处理
 ```
 
 ## API 接口文档
@@ -430,7 +436,7 @@ Q: 发生一级安全事件后应该向谁报告？
 | `/documents/list` | GET | 获取文档列表 |
 | `/documents/<path>` | DELETE | 删除文档 |
 
-详细 API 文档请参考 [API对接文档](docs/API对接文档.md)
+详细 API 文档请参考 [API接口文档](docs/API接口文档.md)
 
 ## 依赖库
 
@@ -477,27 +483,24 @@ USE_GRAPH_RAG = True
 
 | 版本 | 更新内容 |
 |------|----------|
-| **v5.0.0** | 大规模引擎重构：引入多向量库的部门级鉴权与路由隔离、文档生命周期与差异监控；加入ODL解析与Semantic Chunker；完成独立出卷系统(MySQL/SQLite)、纲要生成与FAQ问答闭环反馈收集功能 |
-| v4.2.0 | 出题系统完善：试卷审核流程优化、前端界面修复、试卷名称自定义 |
-| v4.1.0 | 前端日志面板：实时显示Agent思考过程，日志持久化存储；来源去重优化 |
-| v4.0.0 | Graph RAG：Neo4j知识图谱、实体提取、多跳推理；智能聊天网络搜索；出题系统集成 |
-| v3.0.0 | 双模式RAG系统：普通聊天/知识库问答，会话管理，前端界面 |
-| v2.1.0 | Dify智能出题系统集成 |
-| v1.1.0 | RAG幻觉优化：混合检索+Rerank+置信度 |
-| v1.0.0 | 初始版本：RAG本地知识库问答系统 |
+| **v6.0.0** | 模块化架构重构：代码拆分为 core/api/parsers/knowledge/services/auth/exam_pkg 模块；新增图片提取功能；前端优化；统一入口 main.py |
+| v5.0.0 | 多向量库权限控制、文档生命周期、本地出卷系统、ODL解析、Semantic Chunker |
+| v4.2.0 | 出题系统完善：试卷审核流程优化、前端界面修复 |
+| v4.1.0 | 前端日志面板：实时显示 Agent 思考过程，日志持久化 |
+| v4.0.0 | Graph RAG：Neo4j 知识图谱、实体提取、多跳推理 |
+| v3.0.0 | 双模式 RAG 系统：普通聊天/知识库问答，会话管理 |
+| v2.1.0 | Dify 智能出题系统集成 |
+| v1.1.0 | RAG 幻觉优化：混合检索 + Rerank + 置信度 |
+| v1.0.0 | 初始版本：RAG 本地知识库问答系统 |
 
 ## 文档
 
-- [API对接文档](docs/API对接文档.md) - 完整 API 接口说明、认证、出题系统
-- [开发文档](docs/开发文档.md) - 系统架构、技术栈、Dify 集成、部署指南
-- [Graph RAG 使用指南](docs/Graph_RAG使用指南.md) - 知识图谱功能详解
-- [Agentic RAG 完整指南](docs/Agentic_RAG完整指南.md) - Agent 决策机制与使用方法
-- [Dify 快速入门指南](docs/Dify快速入门指南.md) - Dify 工作流集成教程
-- [出题批卷系统集成方案](docs/出题批卷系统集成方案.md) - 出题系统设计文档
-- [文档权限控制实现说明](docs/文档权限控制实现说明.md) - 权限系统技术说明
+- [API接口文档](docs/API接口文档.md) - 完整 API 接口说明、认证、出题系统
+- [开发文档](docs/开发文档.md) - 系统架构、技术栈、部署指南
+- [模块说明](docs/模块说明.md) - 各模块职责与接口
+- [数据库设计文档](docs/数据库设计文档.md) - 数据库表结构设计
+- [多向量库实现权限划分](docs/多向量库实现权限划分.md) - 权限系统技术说明
 - [多源信息融合指南](docs/多源信息融合指南.md) - 知识库与网络搜索融合策略
-- [RAG幻觉问题优化方案](docs/RAG幻觉问题优化方案.md) - 幻觉问题分析与解决方案
-- [RAG系统生产环境风险分析](docs/RAG系统生产环境风险分析与优化方向.md) - 安全风险与优化方向
 
 ## License
 
