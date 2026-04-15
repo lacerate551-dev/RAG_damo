@@ -27,7 +27,7 @@ from exam_pkg.manager import (
 
 # 导入网关认证模块
 from auth.gateway import (
-    require_gateway_auth, check_collection_permission, get_current_user
+    require_gateway_auth, require_role, check_collection_permission, get_current_user
 )
 
 # 创建蓝图
@@ -36,58 +36,6 @@ exam_bp = Blueprint('exam', __name__)
 # JWT 配置（保留用于其他功能，但不再覆盖 get_current_user）
 # 密钥长度至少32字节以满足SHA256要求
 JWT_SECRET = os.environ.get('JWT_SECRET', 'dev-secret-change-in-production-32b!')
-
-
-# ==================== 认证装饰器 ====================
-# 注意: get_current_user 已从 auth_gateway 导入，无需重复定义
-
-def require_auth(f):
-    """要求登录（网关认证）- 从Header读取用户信息"""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        # 直接从 Header 读取用户信息
-        user_id = request.headers.get('X-User-ID')
-        if not user_id:
-            return jsonify({'error': '缺少认证信息，请通过网关访问'}), 401
-
-        # 构造用户信息
-        user = {
-            'user_id': user_id,
-            'username': request.headers.get('X-User-Name', ''),
-            'role': request.headers.get('X-User-Role', 'user'),
-            'department': request.headers.get('X-User-Department', '')
-        }
-
-        # 将用户信息附加到请求上下文
-        request.current_user = user
-        return f(*args, **kwargs)
-    return decorated
-
-
-def require_admin(f):
-    """要求管理员权限"""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        # 直接从 Header 读取用户信息
-        user_id = request.headers.get('X-User-ID')
-        if not user_id:
-            return jsonify({'error': '缺少认证信息，请通过网关访问'}), 401
-
-        role = request.headers.get('X-User-Role', 'user')
-        if role != 'admin':
-            return jsonify({'error': '需要管理员权限'}), 403
-
-        # 构造用户信息
-        user = {
-            'user_id': user_id,
-            'username': request.headers.get('X-User-Name', ''),
-            'role': role,
-            'department': request.headers.get('X-User-Department', '')
-        }
-
-        request.current_user = user
-        return f(*args, **kwargs)
-    return decorated
 
 
 # ==================== 出题相关 API ====================
@@ -176,7 +124,7 @@ def api_generate_exam_by_file():
 
 
 @exam_bp.route('/generate', methods=['POST'])
-@require_auth
+@require_gateway_auth
 def api_generate_exam():
     """
     生成试卷
@@ -233,7 +181,7 @@ def api_generate_exam():
 
 
 @exam_bp.route('/list', methods=['GET'])
-@require_auth
+@require_gateway_auth
 def api_list_exams():
     """
     获取试卷列表
@@ -263,7 +211,7 @@ def api_list_exams():
 
 
 @exam_bp.route('/<exam_id>', methods=['GET'])
-@require_auth
+@require_gateway_auth
 def api_get_exam(exam_id):
     """
     获取试卷详情
@@ -288,7 +236,7 @@ def api_get_exam(exam_id):
 
 
 @exam_bp.route('/<exam_id>', methods=['PUT'])
-@require_auth
+@require_gateway_auth
 def api_update_exam(exam_id):
     """
     更新试卷
@@ -314,7 +262,7 @@ def api_update_exam(exam_id):
 
 
 @exam_bp.route('/<exam_id>', methods=['DELETE'])
-@require_auth
+@require_gateway_auth
 def api_delete_exam(exam_id):
     """删除试卷"""
     try:
@@ -329,7 +277,7 @@ def api_delete_exam(exam_id):
 
 
 @exam_bp.route('/<exam_id>/submit', methods=['POST'])
-@require_auth
+@require_gateway_auth
 def api_submit_exam(exam_id):
     """
     提交试卷审核
@@ -352,7 +300,8 @@ def api_submit_exam(exam_id):
 
 
 @exam_bp.route('/<exam_id>/review', methods=['POST'])
-@require_admin
+@require_gateway_auth
+@require_role('admin')
 def api_review_exam(exam_id):
     """
     审核试卷
@@ -399,7 +348,7 @@ def api_review_exam(exam_id):
 # ==================== 批卷相关 API ====================
 
 @exam_bp.route('/grade-from-mysql', methods=['POST'])
-@require_auth
+@require_gateway_auth
 def api_grade_from_mysql():
     """
     基于前端传入的题目批卷
@@ -455,7 +404,7 @@ def api_grade_from_mysql():
 
 
 @exam_bp.route('/<exam_id>/grade', methods=['POST'])
-@require_auth
+@require_gateway_auth
 def api_grade_exam(exam_id):
     """
     批阅试卷
@@ -511,7 +460,7 @@ def api_grade_exam(exam_id):
 
 
 @exam_bp.route('/report/<report_id>', methods=['GET'])
-@require_auth
+@require_gateway_auth
 def api_get_report(report_id):
     """
     获取批阅报告
@@ -530,7 +479,7 @@ def api_get_report(report_id):
 
 
 @exam_bp.route('/report/list', methods=['GET'])
-@require_auth
+@require_gateway_auth
 def api_list_reports():
     """
     获取批阅报告列表
@@ -560,7 +509,7 @@ def api_list_reports():
 # ==================== 题库搜索 API ====================
 
 @exam_bp.route('/questions/search', methods=['GET'])
-@require_auth
+@require_gateway_auth
 def api_search_questions():
     """
     搜索题目

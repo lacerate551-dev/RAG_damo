@@ -33,6 +33,7 @@ class ChunkMetadata:
     source_file: str = ""         # 源文件名
     chunk_type: str = "section"   # 类型: section, table, image
     table_data: Optional[str] = None  # 表格原始数据（如果是表格）
+    images: Optional[List[Dict]] = None  # 关联的图片信息（新增）
 
 
 def parse_pdf_with_odl(
@@ -40,7 +41,9 @@ def parse_pdf_with_odl(
     output_dir: Optional[str] = None,
     use_struct_tree: bool = True,
     use_hybrid: bool = False,
-    hybrid_url: Optional[str] = None
+    hybrid_url: Optional[str] = None,
+    extract_images: bool = True,
+    images_output_dir: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     使用 OpenDataLoader PDF 解析文档
@@ -51,6 +54,8 @@ def parse_pdf_with_odl(
         use_struct_tree: 是否使用 PDF 结构树（Tagged PDF）
         use_hybrid: 是否使用混合模式（需要后端服务）
         hybrid_url: 混合模式服务器地址
+        extract_images: 是否提取图片
+        images_output_dir: 图片输出目录
 
     Returns:
         {
@@ -58,6 +63,7 @@ def parse_pdf_with_odl(
             "json_data": {...},  # JSON 结构化数据
             "chunks": [ChunkMetadata, ...],  # 智能分块结果
             "tables": ["表格1", ...],  # 提取的表格列表
+            "images": [ImageInfo, ...],  # 提取的图片列表
             "metadata": {...}  # 文档元数据
         }
     """
@@ -85,6 +91,7 @@ def parse_pdf_with_odl(
     # 混合模式配置
     if use_hybrid:
         convert_kwargs["hybrid"] = "docling-fast"
+        convert_kwargs["hybrid_fallback"] = True  # 启用 Java 回退，避免页面丢失
         if hybrid_url:
             convert_kwargs["hybrid_url"] = hybrid_url
 
@@ -118,16 +125,35 @@ def parse_pdf_with_odl(
             source_file=pdf_path.name
         )
 
+        # 提取图片
+        images = []
+        if extract_images:
+            from parsers.image_extractor import extract_images_from_pdf, get_images_base_path
+
+            img_output = images_output_dir or get_images_base_path()
+            try:
+                images = extract_images_from_pdf(str(pdf_path), img_output)
+
+                # 为分块关联图片信息
+                if images:
+                    from parsers.image_extractor import enrich_chunks_with_images
+                    chunks = enrich_chunks_with_images(chunks, images, pdf_path.name)
+
+            except Exception as e:
+                print(f"[警告] 图片提取失败: {e}")
+
         return {
             "markdown": markdown_content,
             "json_data": json_data,
             "chunks": chunks,
             "tables": tables,
+            "images": images,
             "metadata": {
                 "source_file": pdf_path.name,
                 "output_dir": str(output_dir),
                 "use_struct_tree": use_struct_tree,
-                "use_hybrid": use_hybrid
+                "use_hybrid": use_hybrid,
+                "image_count": len(images)
             }
         }
 

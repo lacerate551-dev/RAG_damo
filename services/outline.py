@@ -15,12 +15,13 @@
 
 import json
 import os
-import sqlite3
 import hashlib
 import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass, asdict, field
+
+from data.db import get_connection, init_databases
 
 # 配置日志
 logging.basicConfig(
@@ -126,96 +127,89 @@ class Recommendation:
 class OutlineDB:
     """纲要缓存数据库"""
 
-    def __init__(self, db_path: str = "./data/outline_cache.db"):
-        self.db_path = db_path
+    def __init__(self):
+        init_databases()
         self._init_db()
 
     def _init_db(self):
         """初始化数据库表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        # 纲要缓存表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS outline_cache (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id TEXT NOT NULL UNIQUE,
-                document_name TEXT,
-                total_pages INTEGER DEFAULT 0,
-                content_hash TEXT NOT NULL,
-                outline_json TEXT NOT NULL,
-                generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+            # 纲要缓存表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS outline_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    document_id TEXT NOT NULL UNIQUE,
+                    document_name TEXT,
+                    total_pages INTEGER DEFAULT 0,
+                    content_hash TEXT NOT NULL,
+                    outline_json TEXT NOT NULL,
+                    generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
-        # 文档向量缓存表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS document_vectors (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id TEXT NOT NULL UNIQUE,
-                document_name TEXT,
-                vector_hash TEXT,
-                vector_json TEXT NOT NULL,
-                tags_json TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+            # 文档向量缓存表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS document_vectors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    document_id TEXT NOT NULL UNIQUE,
+                    document_name TEXT,
+                    vector_hash TEXT,
+                    vector_json TEXT NOT NULL,
+                    tags_json TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
-        # 推荐缓存表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS recommendation_cache (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id TEXT NOT NULL,
-                recommendations_json TEXT NOT NULL,
-                generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+            # 推荐缓存表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS recommendation_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    document_id TEXT NOT NULL,
+                    recommendations_json TEXT NOT NULL,
+                    generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
-        # 创建索引
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_outline_doc ON outline_cache(document_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_vector_doc ON document_vectors(document_id)")
-
-        conn.commit()
-        conn.close()
+            # 创建索引
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_outline_doc ON outline_cache(document_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_vector_doc ON document_vectors(document_id)")
 
     # ==================== 纲要缓存 ====================
 
     def save_outline(self, outline: DocumentOutline) -> int:
         """保存纲要"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT OR REPLACE INTO outline_cache
-            (document_id, document_name, total_pages, content_hash, outline_json, generated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            outline.document_id,
-            outline.document_name,
-            outline.total_pages,
-            outline.content_hash,
-            json.dumps(outline.to_dict(), ensure_ascii=False),
-            outline.generated_at
-        ))
+            cursor.execute("""
+                INSERT OR REPLACE INTO outline_cache
+                (document_id, document_name, total_pages, content_hash, outline_json, generated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                outline.document_id,
+                outline.document_name,
+                outline.total_pages,
+                outline.content_hash,
+                json.dumps(outline.to_dict(), ensure_ascii=False),
+                outline.generated_at
+            ))
 
-        outline_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return outline_id
+            return cursor.lastrowid
 
     def get_outline(self, document_id: str) -> Optional[DocumentOutline]:
         """获取纲要"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT document_id, document_name, total_pages, content_hash,
-                   outline_json, generated_at
-            FROM outline_cache WHERE document_id = ?
-        """, (document_id,))
+            cursor.execute("""
+                SELECT document_id, document_name, total_pages, content_hash,
+                       outline_json, generated_at
+                FROM outline_cache WHERE document_id = ?
+            """, (document_id,))
 
-        row = cursor.fetchone()
-        conn.close()
+            row = cursor.fetchone()
 
         if not row:
             return None
@@ -225,28 +219,23 @@ class OutlineDB:
 
     def delete_outline(self, document_id: str) -> bool:
         """删除纲要缓存"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("DELETE FROM outline_cache WHERE document_id = ?", (document_id,))
-        deleted = cursor.rowcount > 0
-
-        conn.commit()
-        conn.close()
-        return deleted
+            cursor.execute("DELETE FROM outline_cache WHERE document_id = ?", (document_id,))
+            return cursor.rowcount > 0
 
     def list_outlines(self, limit: int = 50) -> List[Dict]:
         """获取纲要列表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT document_id, document_name, total_pages, generated_at
-            FROM outline_cache ORDER BY generated_at DESC LIMIT ?
-        """, (limit,))
+            cursor.execute("""
+                SELECT document_id, document_name, total_pages, generated_at
+                FROM outline_cache ORDER BY generated_at DESC LIMIT ?
+            """, (limit,))
 
-        rows = cursor.fetchall()
-        conn.close()
+            rows = cursor.fetchall()
 
         return [
             {
@@ -263,41 +252,37 @@ class OutlineDB:
     def save_document_vector(self, document_id: str, document_name: str,
                              vector: List[float], tags: List[str] = None) -> int:
         """保存文档向量"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        vector_hash = hashlib.md5(str(vector[:10]).encode()).hexdigest()[:8]
+            vector_hash = hashlib.md5(str(vector[:10]).encode()).hexdigest()[:8]
 
-        cursor.execute("""
-            INSERT OR REPLACE INTO document_vectors
-            (document_id, document_name, vector_hash, vector_json, tags_json, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            document_id,
-            document_name,
-            vector_hash,
-            json.dumps(vector),
-            json.dumps(tags or [], ensure_ascii=False),
-            datetime.now().isoformat()
-        ))
+            cursor.execute("""
+                INSERT OR REPLACE INTO document_vectors
+                (document_id, document_name, vector_hash, vector_json, tags_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                document_id,
+                document_name,
+                vector_hash,
+                json.dumps(vector),
+                json.dumps(tags or [], ensure_ascii=False),
+                datetime.now().isoformat()
+            ))
 
-        vector_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return vector_id
+            return cursor.lastrowid
 
     def get_document_vector(self, document_id: str) -> Optional[Dict]:
         """获取文档向量"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT document_id, document_name, vector_json, tags_json
-            FROM document_vectors WHERE document_id = ?
-        """, (document_id,))
+            cursor.execute("""
+                SELECT document_id, document_name, vector_json, tags_json
+                FROM document_vectors WHERE document_id = ?
+            """, (document_id,))
 
-        row = cursor.fetchone()
-        conn.close()
+            row = cursor.fetchone()
 
         if not row:
             return None
@@ -311,16 +296,15 @@ class OutlineDB:
 
     def get_all_document_vectors(self) -> List[Dict]:
         """获取所有文档向量"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT document_id, document_name, vector_json, tags_json
-            FROM document_vectors
-        """)
+            cursor.execute("""
+                SELECT document_id, document_name, vector_json, tags_json
+                FROM document_vectors
+            """)
 
-        rows = cursor.fetchall()
-        conn.close()
+            rows = cursor.fetchall()
 
         return [
             {
@@ -336,37 +320,33 @@ class OutlineDB:
 
     def save_recommendations(self, document_id: str, recommendations: List[Recommendation]) -> int:
         """保存推荐结果"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        # 先删除旧缓存
-        cursor.execute("DELETE FROM recommendation_cache WHERE document_id = ?", (document_id,))
+            # 先删除旧缓存
+            cursor.execute("DELETE FROM recommendation_cache WHERE document_id = ?", (document_id,))
 
-        cursor.execute("""
-            INSERT INTO recommendation_cache (document_id, recommendations_json, generated_at)
-            VALUES (?, ?, ?)
-        """, (
-            document_id,
-            json.dumps([r.to_dict() for r in recommendations], ensure_ascii=False),
-            datetime.now().isoformat()
-        ))
+            cursor.execute("""
+                INSERT INTO recommendation_cache (document_id, recommendations_json, generated_at)
+                VALUES (?, ?, ?)
+            """, (
+                document_id,
+                json.dumps([r.to_dict() for r in recommendations], ensure_ascii=False),
+                datetime.now().isoformat()
+            ))
 
-        rec_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return rec_id
+            return cursor.lastrowid
 
     def get_recommendations(self, document_id: str) -> Optional[List[Recommendation]]:
         """获取推荐结果"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT recommendations_json FROM recommendation_cache WHERE document_id = ?
-        """, (document_id,))
+            cursor.execute("""
+                SELECT recommendations_json FROM recommendation_cache WHERE document_id = ?
+            """, (document_id,))
 
-        row = cursor.fetchone()
-        conn.close()
+            row = cursor.fetchone()
 
         if not row:
             return None
@@ -897,15 +877,13 @@ class RecommendationService:
 
 # ==================== 便捷函数 ====================
 
-def create_services(db_path: str = "./data/outline_cache.db",
-                    documents_path: str = "./documents",
+def create_services(documents_path: str = "./documents",
                     chroma_collection=None,
                     embedding_model=None) -> Tuple[OutlineDB, OutlineGenerator, RecommendationService]:
     """
     创建服务实例
 
     Args:
-        db_path: 数据库路径
         documents_path: 文档目录
         chroma_collection: ChromaDB集合
         embedding_model: 嵌入模型
@@ -913,7 +891,7 @@ def create_services(db_path: str = "./data/outline_cache.db",
     Returns:
         (数据库实例, 纲要生成服务, 推荐服务)
     """
-    db = OutlineDB(db_path)
+    db = OutlineDB()
     outline_generator = OutlineGenerator(db, documents_path)
     recommendation_service = RecommendationService(
         db, documents_path, chroma_collection, embedding_model
@@ -937,7 +915,6 @@ if __name__ == "__main__":
 
     # 创建服务
     db, outline_svc, rec_svc = create_services(
-        db_path="./test_outline.db",
         documents_path="./documents"
     )
 
@@ -995,13 +972,6 @@ if __name__ == "__main__":
     print("\n[4] 测试纲要缓存...")
     outlines = db.list_outlines()
     print(f"  缓存数量: {len(outlines)}")
-
-    # 清理测试数据库
-    import os
-    for db_file in ["./test_outline.db", "./test_outline.db-wal", "./test_outline.db-shm"]:
-        if os.path.exists(db_file):
-            os.remove(db_file)
-            print(f"\n  [OK] 清理: {db_file}")
 
     print("\n" + "=" * 60)
     print("测试完成")

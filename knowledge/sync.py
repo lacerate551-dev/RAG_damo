@@ -27,7 +27,6 @@ import os
 import sys
 import json
 import hashlib
-import sqlite3
 import threading
 import time
 from datetime import datetime
@@ -35,6 +34,8 @@ from typing import Dict, List, Optional, Callable
 from dataclasses import dataclass, asdict
 from enum import Enum
 import logging
+
+from data.db import get_connection, init_databases
 
 # 设置日志
 logging.basicConfig(
@@ -121,383 +122,269 @@ class SyncResult:
 class SyncDatabase:
     """同步数据库管理"""
 
-    def __init__(self, db_path: str = "./data/sync_data.db"):
-        self.db_path = db_path
-        self._init_db()
-
-    def _init_db(self):
-        """初始化数据库表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        # 文档哈希表 - 记录每个文档的当前哈希
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS document_hashes (
-                document_id TEXT PRIMARY KEY,
-                document_name TEXT,
-                content_hash TEXT,
-                file_size INTEGER,
-                last_modified TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        # 变更日志表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS change_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id TEXT,
-                document_name TEXT,
-                change_type TEXT,
-                old_hash TEXT,
-                new_hash TEXT,
-                change_time TIMESTAMP,
-                processed INTEGER DEFAULT 0,
-                error_message TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        # 用户订阅表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                document_id TEXT,
-                document_name TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, document_id)
-            )
-        ''')
-
-        # 通知记录表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                document_id TEXT,
-                document_name TEXT,
-                change_type TEXT,
-                message TEXT,
-                read INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        # 同步状态表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS sync_status (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sync_type TEXT,
-                status TEXT,
-                start_time TIMESTAMP,
-                end_time TIMESTAMP,
-                documents_processed INTEGER,
-                documents_added INTEGER,
-                documents_modified INTEGER,
-                documents_deleted INTEGER,
-                error_message TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        # 创建索引
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_change_logs_time ON change_logs(change_time)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_change_logs_processed ON change_logs(processed)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(user_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read)')
-
-        conn.commit()
-        conn.close()
+    def __init__(self):
+        """初始化数据库"""
+        init_databases()
 
     def get_document_hash(self, document_id: str) -> Optional[Dict]:
         """获取文档的当前哈希"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT document_id, document_name, content_hash, file_size, last_modified
-            FROM document_hashes WHERE document_id = ?
-        ''', (document_id,))
-        row = cursor.fetchone()
-        conn.close()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT document_id, document_name, content_hash, file_size, last_modified
+                FROM document_hashes WHERE document_id = ?
+            ''', (document_id,))
+            row = cursor.fetchone()
 
-        if row:
-            return {
-                "document_id": row[0],
-                "document_name": row[1],
-                "content_hash": row[2],
-                "file_size": row[3],
-                "last_modified": row[4]
-            }
-        return None
+            if row:
+                return {
+                    "document_id": row[0],
+                    "document_name": row[1],
+                    "content_hash": row[2],
+                    "file_size": row[3],
+                    "last_modified": row[4]
+                }
+            return None
 
     def set_document_hash(self, document_id: str, document_name: str,
                           content_hash: str, file_size: int, last_modified: datetime):
         """设置文档哈希"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO document_hashes
-            (document_id, document_name, content_hash, file_size, last_modified, updated_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (document_id, document_name, content_hash, file_size, last_modified))
-        conn.commit()
-        conn.close()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO document_hashes
+                (document_id, document_name, content_hash, file_size, last_modified, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (document_id, document_name, content_hash, file_size, last_modified))
 
     def delete_document_hash(self, document_id: str):
         """删除文档哈希记录"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('DELETE FROM document_hashes WHERE document_id = ?', (document_id,))
-        conn.commit()
-        conn.close()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM document_hashes WHERE document_id = ?', (document_id,))
 
     def get_all_document_hashes(self) -> Dict[str, Dict]:
         """获取所有文档哈希"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT document_id, document_name, content_hash, file_size, last_modified
-            FROM document_hashes
-        ''')
-        rows = cursor.fetchall()
-        conn.close()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT document_id, document_name, content_hash, file_size, last_modified
+                FROM document_hashes
+            ''')
+            rows = cursor.fetchall()
 
-        return {
-            row[0]: {
-                "document_id": row[0],
-                "document_name": row[1],
-                "content_hash": row[2],
-                "file_size": row[3],
-                "last_modified": row[4]
+            return {
+                row[0]: {
+                    "document_id": row[0],
+                    "document_name": row[1],
+                    "content_hash": row[2],
+                    "file_size": row[3],
+                    "last_modified": row[4]
+                }
+                for row in rows
             }
-            for row in rows
-        }
 
     def log_change(self, change: DocumentChange) -> int:
         """记录变更"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO change_logs
-            (document_id, document_name, change_type, old_hash, new_hash, change_time, processed, error_message)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            change.document_id,
-            change.document_name,
-            change.change_type.value,
-            change.old_hash,
-            change.new_hash,
-            change.change_time,
-            change.processed,
-            change.error_message
-        ))
-        change_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return change_id
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO change_logs
+                (document_id, document_name, change_type, old_hash, new_hash, change_time, processed, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                change.document_id,
+                change.document_name,
+                change.change_type.value,
+                change.old_hash,
+                change.new_hash,
+                change.change_time,
+                change.processed,
+                change.error_message
+            ))
+            return cursor.lastrowid
 
     def get_change_logs(self, limit: int = 100, processed: Optional[bool] = None,
                         days: int = 30) -> List[Dict]:
         """获取变更日志"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        sql = '''
-            SELECT id, document_id, document_name, change_type, old_hash, new_hash,
-                   change_time, processed, error_message
-            FROM change_logs
-            WHERE change_time >= datetime('now', ?)
-        '''
-        params = [f'-{days} days']
+            sql = '''
+                SELECT id, document_id, document_name, change_type, old_hash, new_hash,
+                       change_time, processed, error_message
+                FROM change_logs
+                WHERE change_time >= datetime('now', ?)
+            '''
+            params = [f'-{days} days']
 
-        if processed is not None:
-            sql += ' AND processed = ?'
-            params.append(1 if processed else 0)
+            if processed is not None:
+                sql += ' AND processed = ?'
+                params.append(1 if processed else 0)
 
-        sql += ' ORDER BY change_time DESC LIMIT ?'
-        params.append(limit)
+            sql += ' ORDER BY change_time DESC LIMIT ?'
+            params.append(limit)
 
-        cursor.execute(sql, params)
-        rows = cursor.fetchall()
-        conn.close()
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
 
-        return [
-            {
-                "id": row[0],
-                "document_id": row[1],
-                "document_name": row[2],
-                "change_type": row[3],
-                "old_hash": row[4],
-                "new_hash": row[5],
-                "change_time": row[6],
-                "processed": bool(row[7]),
-                "error_message": row[8]
-            }
-            for row in rows
-        ]
+            return [
+                {
+                    "id": row[0],
+                    "document_id": row[1],
+                    "document_name": row[2],
+                    "change_type": row[3],
+                    "old_hash": row[4],
+                    "new_hash": row[5],
+                    "change_time": row[6],
+                    "processed": bool(row[7]),
+                    "error_message": row[8]
+                }
+                for row in rows
+            ]
 
     def mark_change_processed(self, change_id: int, error_message: str = None):
         """标记变更已处理"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE change_logs
-            SET processed = 1, error_message = ?
-            WHERE id = ?
-        ''', (error_message, change_id))
-        conn.commit()
-        conn.close()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE change_logs
+                SET processed = 1, error_message = ?
+                WHERE id = ?
+            ''', (error_message, change_id))
 
     def subscribe(self, user_id: str, document_id: str = None, document_name: str = None):
         """用户订阅文档"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        try:
-            cursor.execute('''
-                INSERT OR IGNORE INTO subscriptions (user_id, document_id, document_name)
-                VALUES (?, ?, ?)
-            ''', (user_id, document_id, document_name))
-            conn.commit()
-        except sqlite3.IntegrityError:
-            pass  # 已存在
-        finally:
-            conn.close()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO subscriptions (user_id, document_id, document_name)
+                    VALUES (?, ?, ?)
+                ''', (user_id, document_id, document_name))
+            except Exception:
+                pass  # 已存在
 
     def unsubscribe(self, user_id: str, document_id: str = None):
         """取消订阅"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        if document_id:
-            cursor.execute('''
-                DELETE FROM subscriptions WHERE user_id = ? AND document_id = ?
-            ''', (user_id, document_id))
-        else:
-            cursor.execute('DELETE FROM subscriptions WHERE user_id = ?', (user_id,))
-        conn.commit()
-        conn.close()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
+            if document_id:
+                cursor.execute('''
+                    DELETE FROM subscriptions WHERE user_id = ? AND document_id = ?
+                ''', (user_id, document_id))
+            else:
+                cursor.execute('DELETE FROM subscriptions WHERE user_id = ?', (user_id,))
 
     def get_subscribers(self, document_id: str) -> List[str]:
         """获取订阅某文档的用户"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT user_id FROM subscriptions
-            WHERE document_id = ? OR document_id IS NULL
-        ''', (document_id,))
-        rows = cursor.fetchall()
-        conn.close()
-        return [row[0] for row in rows]
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT user_id FROM subscriptions
+                WHERE document_id = ? OR document_id IS NULL
+            ''', (document_id,))
+            rows = cursor.fetchall()
+            return [row[0] for row in rows]
 
     def add_notification(self, user_id: str, document_id: str, document_name: str,
                          change_type: str, message: str):
         """添加通知"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO notifications (user_id, document_id, document_name, change_type, message)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, document_id, document_name, change_type, message))
-        conn.commit()
-        conn.close()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO notifications (user_id, document_id, document_name, change_type, message)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, document_id, document_name, change_type, message))
 
     def get_notifications(self, user_id: str, unread_only: bool = False) -> List[Dict]:
         """获取用户通知"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        sql = '''
-            SELECT id, document_id, document_name, change_type, message, read, created_at
-            FROM notifications WHERE user_id = ?
-        '''
-        params = [user_id]
+            sql = '''
+                SELECT id, document_id, document_name, change_type, message, read, created_at
+                FROM notifications WHERE user_id = ?
+            '''
+            params = [user_id]
 
-        if unread_only:
-            sql += ' AND read = 0'
+            if unread_only:
+                sql += ' AND read = 0'
 
-        sql += ' ORDER BY created_at DESC LIMIT 50'
+            sql += ' ORDER BY created_at DESC LIMIT 50'
 
-        cursor.execute(sql, params)
-        rows = cursor.fetchall()
-        conn.close()
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
 
-        return [
-            {
-                "id": row[0],
-                "document_id": row[1],
-                "document_name": row[2],
-                "change_type": row[3],
-                "message": row[4],
-                "read": bool(row[5]),
-                "created_at": row[6]
-            }
-            for row in rows
-        ]
+            return [
+                {
+                    "id": row[0],
+                    "document_id": row[1],
+                    "document_name": row[2],
+                    "change_type": row[3],
+                    "message": row[4],
+                    "read": bool(row[5]),
+                    "created_at": row[6]
+                }
+                for row in rows
+            ]
 
     def mark_notification_read(self, notification_id: int):
         """标记通知已读"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('UPDATE notifications SET read = 1 WHERE id = ?', (notification_id,))
-        conn.commit()
-        conn.close()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE notifications SET read = 1 WHERE id = ?', (notification_id,))
 
     def log_sync_status(self, result: SyncResult) -> int:
         """记录同步状态"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO sync_status
-            (sync_type, status, start_time, end_time, documents_processed,
-             documents_added, documents_modified, documents_deleted, error_message)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            "incremental",
-            result.status.value,
-            result.start_time,
-            result.end_time,
-            result.documents_processed,
-            result.documents_added,
-            result.documents_modified,
-            result.documents_deleted,
-            "; ".join(result.errors) if result.errors else None
-        ))
-        sync_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return sync_id
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO sync_status
+                (sync_type, status, start_time, end_time, documents_processed,
+                 documents_added, documents_modified, documents_deleted, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                "incremental",
+                result.status.value,
+                result.start_time,
+                result.end_time,
+                result.documents_processed,
+                result.documents_added,
+                result.documents_modified,
+                result.documents_deleted,
+                "; ".join(result.errors) if result.errors else None
+            ))
+            return cursor.lastrowid
 
     def get_sync_history(self, limit: int = 20) -> List[Dict]:
         """获取同步历史"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT id, sync_type, status, start_time, end_time,
-                   documents_processed, documents_added, documents_modified, documents_deleted, error_message
-            FROM sync_status
-            ORDER BY start_time DESC
-            LIMIT ?
-        ''', (limit,))
-        rows = cursor.fetchall()
-        conn.close()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, sync_type, status, start_time, end_time,
+                       documents_processed, documents_added, documents_modified, documents_deleted, error_message
+                FROM sync_status
+                ORDER BY start_time DESC
+                LIMIT ?
+            ''', (limit,))
+            rows = cursor.fetchall()
 
-        return [
-            {
-                "id": row[0],
-                "sync_type": row[1],
-                "status": row[2],
-                "start_time": row[3],
-                "end_time": row[4],
-                "documents_processed": row[5],
-                "documents_added": row[6],
-                "documents_modified": row[7],
-                "documents_deleted": row[8],
-                "error_message": row[9]
-            }
-            for row in rows
-        ]
+            return [
+                {
+                    "id": row[0],
+                    "sync_type": row[1],
+                    "status": row[2],
+                    "start_time": row[3],
+                    "end_time": row[4],
+                    "documents_processed": row[5],
+                    "documents_added": row[6],
+                    "documents_modified": row[7],
+                    "documents_deleted": row[8],
+                    "error_message": row[9]
+                }
+                for row in rows
+            ]
 
 
 class FileChangeHandler(FileSystemEventHandler if HAS_WATCHDOG else object):
@@ -607,48 +494,24 @@ class FileChangeHandler(FileSystemEventHandler if HAS_WATCHDOG else object):
 class KnowledgeSyncService:
     """知识库同步服务"""
 
-    def __init__(self, documents_path: str = None, db_path: str = "./data/sync_data.db"):
+    def __init__(self, documents_path: str = None):
         """
         初始化同步服务
 
         Args:
             documents_path: 文档目录路径，默认为 ./documents
-            db_path: 数据库路径
         """
         self.documents_path = documents_path or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "documents"
         )
-        self.db = SyncDatabase(db_path)
+        self.db = SyncDatabase()
 
         self._observer = None
         self._running = False
         self.on_change_callback: Optional[Callable] = None
         self.on_sync_callback: Optional[Callable] = None
 
-        # 导入 RAG 组件（延迟导入避免循环依赖）
-        self._rag_module = None
 
-    def _get_rag_module(self):
-        """延迟加载 RAG 模块"""
-        if self._rag_module is None:
-            try:
-                from rag_demo import (
-                    add_file_to_index,
-                    delete_file_from_index,
-                    rebuild_bm25_index,
-                    BM25_INDEX_PATH,
-                    bm25_index
-                )
-                self._rag_module = {
-                    'add_file_to_index': add_file_to_index,
-                    'delete_file_from_index': delete_file_from_index,
-                    'rebuild_bm25_index': rebuild_bm25_index,
-                    'BM25_INDEX_PATH': BM25_INDEX_PATH,
-                    'bm25_index': bm25_index
-                }
-            except ImportError as e:
-                logger.error(f"无法导入 RAG 模块: {e}")
-        return self._rag_module
 
     @staticmethod
     def calculate_file_hash(file_path: str) -> str:
@@ -956,9 +819,9 @@ class KnowledgeSyncService:
 
 
 # 便捷函数
-def create_sync_service(documents_path: str = None, db_path: str = "./data/sync_data.db") -> KnowledgeSyncService:
+def create_sync_service(documents_path: str = None) -> KnowledgeSyncService:
     """创建同步服务实例"""
-    return KnowledgeSyncService(documents_path, db_path)
+    return KnowledgeSyncService(documents_path)
 
 
 # 测试代码

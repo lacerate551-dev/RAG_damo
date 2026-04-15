@@ -18,13 +18,13 @@
 
 import json
 import os
-import sqlite3
 import hashlib
 import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass, asdict
 from enum import Enum
+from data.db import get_connection, init_databases
 
 # 配置日志
 logging.basicConfig(
@@ -132,7 +132,7 @@ class ExamAnalysisReport:
     report_id: str = ""
     exam_id: str = ""
     exam_name: str = ""
-    student_name: str = ""
+    student_id: str = ""  # 只保留 student_id，移除 student_name
     total_score: float = 0.0
     max_score: float = 0.0
     score_rate: float = 0.0
@@ -177,170 +177,48 @@ class ExamAnalysisReport:
 class ExamAnalysisDB:
     """题库分析数据库"""
 
-    def __init__(self, db_path: str = "./data/exam_analysis.db"):
-        self.db_path = db_path
-        self._init_db()
-
-    def _init_db(self):
-        """初始化数据库表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        # 题目-制度关联表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS question_document_links (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                question_id TEXT NOT NULL,
-                question_type TEXT NOT NULL,
-                exam_id TEXT NOT NULL,
-                document_id TEXT NOT NULL,
-                document_name TEXT,
-                chapter TEXT,
-                key_points TEXT,  -- JSON格式
-                relevance_score REAL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 制度版本表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS document_versions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id TEXT NOT NULL,
-                version TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                change_summary TEXT,
-                changed_sections TEXT,  -- JSON格式
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 知识点表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS knowledge_points (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                category TEXT,
-                description TEXT,
-                parent_id INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (parent_id) REFERENCES knowledge_points(id)
-            )
-        """)
-
-        # 题目-知识点关联表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS question_knowledge_links (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                question_id TEXT NOT NULL,
-                question_type TEXT NOT NULL,
-                exam_id TEXT NOT NULL,
-                knowledge_point_id INTEGER NOT NULL,
-                knowledge_point_name TEXT,
-                weight REAL DEFAULT 1.0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (knowledge_point_id) REFERENCES knowledge_points(id)
-            )
-        """)
-
-        # 题目状态表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS question_status (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                question_id TEXT NOT NULL UNIQUE,
-                question_type TEXT NOT NULL,
-                exam_id TEXT NOT NULL,
-                status TEXT DEFAULT 'approved',
-                affected_by TEXT,  -- 影响该题目的制度ID
-                affect_reason TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 整卷分析报告表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS exam_analysis_reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                report_id TEXT NOT NULL UNIQUE,
-                exam_id TEXT,
-                exam_name TEXT,
-                student_name TEXT,
-                total_score REAL,
-                max_score REAL,
-                score_rate REAL,
-                type_scores TEXT,  -- JSON格式
-                knowledge_analysis TEXT,  -- JSON格式
-                weak_points TEXT,  -- JSON格式
-                strong_points TEXT,  -- JSON格式
-                ai_comment TEXT,
-                study_suggestions TEXT,  -- JSON格式
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 新题建议表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS question_suggestions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id TEXT NOT NULL,
-                suggestion TEXT,  -- JSON格式的建议题目
-                status TEXT DEFAULT 'pending',  -- pending/approved/rejected
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 创建索引
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_qdl_question ON question_document_links(question_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_qdl_document ON question_document_links(document_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_qkl_question ON question_knowledge_links(question_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_qkl_knowledge ON question_knowledge_links(knowledge_point_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_qs_status ON question_status(status)")
-
-        conn.commit()
-        conn.close()
+    def __init__(self):
+        """初始化数据库连接（表结构由 data.db 统一管理）"""
+        init_databases()
 
     # ==================== 题目-制度关联 ====================
 
     def add_question_document_link(self, link: QuestionDocumentLink) -> int:
         """添加题目-制度关联"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT INTO question_document_links
-            (question_id, question_type, exam_id, document_id, document_name,
-             chapter, key_points, relevance_score, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            link.question_id, link.question_type, link.exam_id,
-            link.document_id, link.document_name, link.chapter,
-            json.dumps(link.key_points, ensure_ascii=False),
-            link.relevance_score, link.created_at
-        ))
+            cursor.execute("""
+                INSERT INTO question_document_links
+                (question_id, question_type, exam_id, document_id, document_name,
+                 chapter, key_points, relevance_score, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                link.question_id, link.question_type, link.exam_id,
+                link.document_id, link.document_name, link.chapter,
+                json.dumps(link.key_points, ensure_ascii=False),
+                link.relevance_score, link.created_at
+            ))
 
-        link_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return link_id
+            return cursor.lastrowid
 
     def get_question_documents(self, question_id: str, question_type: str = None) -> List[Dict]:
         """获取题目关联的制度文档"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        if question_type:
-            cursor.execute("""
-                SELECT * FROM question_document_links
-                WHERE question_id = ? AND question_type = ?
-            """, (question_id, question_type))
-        else:
-            cursor.execute("""
-                SELECT * FROM question_document_links WHERE question_id = ?
-            """, (question_id,))
+            if question_type:
+                cursor.execute("""
+                    SELECT * FROM question_document_links
+                    WHERE question_id = ? AND question_type = ?
+                """, (question_id, question_type))
+            else:
+                cursor.execute("""
+                    SELECT * FROM question_document_links WHERE question_id = ?
+                """, (question_id,))
 
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        conn.close()
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
 
         results = []
         for row in rows:
@@ -353,16 +231,15 @@ class ExamAnalysisDB:
 
     def get_document_questions(self, document_id: str) -> List[Dict]:
         """获取制度文档关联的题目"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT * FROM question_document_links WHERE document_id = ?
-        """, (document_id,))
+            cursor.execute("""
+                SELECT * FROM question_document_links WHERE document_id = ?
+            """, (document_id,))
 
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        conn.close()
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
 
         results = []
         for row in rows:
@@ -377,40 +254,36 @@ class ExamAnalysisDB:
 
     def add_document_version(self, version: DocumentVersion) -> int:
         """添加制度版本"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT INTO document_versions
-            (document_id, version, content_hash, change_summary, changed_sections, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            version.document_id, version.version, version.content_hash,
-            version.change_summary,
-            json.dumps(version.changed_sections, ensure_ascii=False),
-            version.created_at
-        ))
+            cursor.execute("""
+                INSERT INTO document_versions
+                (document_id, version, content_hash, change_summary, changed_sections, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                version.document_id, version.version, version.content_hash,
+                version.change_summary,
+                json.dumps(version.changed_sections, ensure_ascii=False),
+                version.created_at
+            ))
 
-        version_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return version_id
+            return cursor.lastrowid
 
     def get_document_versions(self, document_id: str, limit: int = 10) -> List[Dict]:
         """获取制度版本历史"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT * FROM document_versions
-            WHERE document_id = ?
-            ORDER BY created_at DESC
-            LIMIT ?
-        """, (document_id, limit))
+            cursor.execute("""
+                SELECT * FROM document_versions
+                WHERE document_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (document_id, limit))
 
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        conn.close()
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
 
         results = []
         for row in rows:
@@ -430,77 +303,68 @@ class ExamAnalysisDB:
 
     def add_knowledge_point(self, point: KnowledgePoint) -> int:
         """添加知识点"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        try:
-            cursor.execute("""
-                INSERT INTO knowledge_points (name, category, description, parent_id, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, (point.name, point.category, point.description, point.parent_id, point.created_at))
+            try:
+                cursor.execute("""
+                    INSERT INTO knowledge_points (name, category, description, parent_id, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (point.name, point.category, point.description, point.parent_id, point.created_at))
 
-            point_id = cursor.lastrowid
-            conn.commit()
-        except sqlite3.IntegrityError:
-            # 已存在，返回现有ID
-            cursor.execute("SELECT id FROM knowledge_points WHERE name = ?", (point.name,))
-            point_id = cursor.fetchone()[0]
-        finally:
-            conn.close()
-
-        return point_id
+                return cursor.lastrowid
+            except Exception:  # sqlite3.IntegrityError
+                # 已存在，返回现有ID
+                cursor.execute("SELECT id FROM knowledge_points WHERE name = ?", (point.name,))
+                result = cursor.fetchone()
+                return result[0] if result else None
 
     def get_knowledge_points(self, category: str = None) -> List[Dict]:
         """获取知识点列表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        if category:
-            cursor.execute("""
-                SELECT * FROM knowledge_points WHERE category = ? ORDER BY name
-            """, (category,))
-        else:
-            cursor.execute("SELECT * FROM knowledge_points ORDER BY name")
+            if category:
+                cursor.execute("""
+                    SELECT * FROM knowledge_points WHERE category = ? ORDER BY name
+                """, (category,))
+            else:
+                cursor.execute("SELECT * FROM knowledge_points ORDER BY name")
 
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        conn.close()
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
 
         return [dict(zip(columns, row)) for row in rows]
 
     def add_question_knowledge_link(self, link: QuestionKnowledgeLink) -> int:
         """添加题目-知识点关联"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT INTO question_knowledge_links
-            (question_id, question_type, exam_id, knowledge_point_id,
-             knowledge_point_name, weight, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            link.question_id, link.question_type, link.exam_id,
-            link.knowledge_point_id, link.knowledge_point_name,
-            link.weight, link.created_at
-        ))
+            cursor.execute("""
+                INSERT INTO question_knowledge_links
+                (question_id, question_type, exam_id, knowledge_point_id,
+                 knowledge_point_name, weight, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                link.question_id, link.question_type, link.exam_id,
+                link.knowledge_point_id, link.knowledge_point_name,
+                link.weight, link.created_at
+            ))
 
-        link_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return link_id
+            return cursor.lastrowid
 
     def get_question_knowledge_points(self, question_id: str) -> List[Dict]:
         """获取题目关联的知识点"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT * FROM question_knowledge_links WHERE question_id = ?
-        """, (question_id,))
+            cursor.execute("""
+                SELECT * FROM question_knowledge_links WHERE question_id = ?
+            """, (question_id,))
 
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        conn.close()
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
 
         return [dict(zip(columns, row)) for row in rows]
 
@@ -510,39 +374,35 @@ class ExamAnalysisDB:
                                exam_id: str, status: str, affected_by: str = None,
                                affect_reason: str = None):
         """更新题目状态"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT OR REPLACE INTO question_status
-            (question_id, question_type, exam_id, status, affected_by, affect_reason, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            question_id, question_type, exam_id, status,
-            affected_by, affect_reason, datetime.now().isoformat()
-        ))
-
-        conn.commit()
-        conn.close()
+            cursor.execute("""
+                INSERT OR REPLACE INTO question_status
+                (question_id, question_type, exam_id, status, affected_by, affect_reason, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                question_id, question_type, exam_id, status,
+                affected_by, affect_reason, datetime.now().isoformat()
+            ))
 
     def get_affected_questions(self, document_id: str = None) -> List[Dict]:
         """获取受影响的题目"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        if document_id:
-            cursor.execute("""
-                SELECT * FROM question_status
-                WHERE status = 'affected' AND affected_by = ?
-            """, (document_id,))
-        else:
-            cursor.execute("""
-                SELECT * FROM question_status WHERE status = 'affected'
-            """)
+            if document_id:
+                cursor.execute("""
+                    SELECT * FROM question_status
+                    WHERE status = 'affected' AND affected_by = ?
+                """, (document_id,))
+            else:
+                cursor.execute("""
+                    SELECT * FROM question_status WHERE status = 'affected'
+                """)
 
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        conn.close()
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
 
         return [dict(zip(columns, row)) for row in rows]
 
@@ -550,49 +410,45 @@ class ExamAnalysisDB:
 
     def save_analysis_report(self, report: ExamAnalysisReport) -> str:
         """保存分析报告"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT INTO exam_analysis_reports
-            (report_id, exam_id, exam_name, student_name, total_score, max_score,
-             score_rate, type_scores, knowledge_analysis, weak_points, strong_points,
-             ai_comment, study_suggestions, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            report.report_id, report.exam_id, report.exam_name,
-            report.student_name, report.total_score, report.max_score,
-            report.score_rate,
-            json.dumps(report.type_scores, ensure_ascii=False),
-            json.dumps(report.knowledge_analysis, ensure_ascii=False),
-            json.dumps(report.weak_points, ensure_ascii=False),
-            json.dumps(report.strong_points, ensure_ascii=False),
-            report.ai_comment,
-            json.dumps(report.study_suggestions, ensure_ascii=False),
-            report.created_at
-        ))
+            cursor.execute("""
+                INSERT INTO exam_analysis_reports
+                (report_id, exam_id, exam_name, student_id, total_score, max_score,
+                 score_rate, type_scores, knowledge_analysis, weak_points, strong_points,
+                 ai_comment, study_suggestions, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                report.report_id, report.exam_id, report.exam_name,
+                report.student_id, report.total_score, report.max_score,
+                report.score_rate,
+                json.dumps(report.type_scores, ensure_ascii=False),
+                json.dumps(report.knowledge_analysis, ensure_ascii=False),
+                json.dumps(report.weak_points, ensure_ascii=False),
+                json.dumps(report.strong_points, ensure_ascii=False),
+                report.ai_comment,
+                json.dumps(report.study_suggestions, ensure_ascii=False),
+                report.created_at
+            ))
 
-        conn.commit()
-        conn.close()
         return report.report_id
 
     def get_analysis_report(self, report_id: str) -> Optional[Dict]:
         """获取分析报告"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT * FROM exam_analysis_reports WHERE report_id = ?
-        """, (report_id,))
+            cursor.execute("""
+                SELECT * FROM exam_analysis_reports WHERE report_id = ?
+            """, (report_id,))
 
-        row = cursor.fetchone()
-        if not row:
-            conn.close()
-            return None
+            row = cursor.fetchone()
+            if not row:
+                return None
 
-        columns = [desc[0] for desc in cursor.description]
-        result = dict(zip(columns, row))
-        conn.close()
+            columns = [desc[0] for desc in cursor.description]
+            result = dict(zip(columns, row))
 
         # 解析JSON字段
         for field in ['type_scores', 'knowledge_analysis', 'weak_points',
@@ -604,30 +460,29 @@ class ExamAnalysisDB:
 
     def list_analysis_reports(self, exam_id: str = None, limit: int = 20) -> List[Dict]:
         """获取分析报告列表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        if exam_id:
-            cursor.execute("""
-                SELECT report_id, exam_id, exam_name, student_name, total_score,
-                       max_score, score_rate, created_at
-                FROM exam_analysis_reports
-                WHERE exam_id = ?
-                ORDER BY created_at DESC
-                LIMIT ?
-            """, (exam_id, limit))
-        else:
-            cursor.execute("""
-                SELECT report_id, exam_id, exam_name, student_name, total_score,
-                       max_score, score_rate, created_at
-                FROM exam_analysis_reports
-                ORDER BY created_at DESC
-                LIMIT ?
-            """, (limit,))
+            if exam_id:
+                cursor.execute("""
+                    SELECT report_id, exam_id, exam_name, student_id, total_score,
+                           max_score, score_rate, created_at
+                    FROM exam_analysis_reports
+                    WHERE exam_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                """, (exam_id, limit))
+            else:
+                cursor.execute("""
+                    SELECT report_id, exam_id, exam_name, student_id, total_score,
+                           max_score, score_rate, created_at
+                    FROM exam_analysis_reports
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                """, (limit,))
 
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        conn.close()
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
 
         return [dict(zip(columns, row)) for row in rows]
 
@@ -635,45 +490,41 @@ class ExamAnalysisDB:
 
     def add_question_suggestion(self, document_id: str, suggestion: Dict) -> int:
         """添加新题建议"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT INTO question_suggestions (document_id, suggestion, status, created_at)
-            VALUES (?, ?, 'pending', ?)
-        """, (document_id, json.dumps(suggestion, ensure_ascii=False),
-              datetime.now().isoformat()))
+            cursor.execute("""
+                INSERT INTO question_suggestions (document_id, suggestion, status, created_at)
+                VALUES (?, ?, 'pending', ?)
+            """, (document_id, json.dumps(suggestion, ensure_ascii=False),
+                  datetime.now().isoformat()))
 
-        suggestion_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return suggestion_id
+            return cursor.lastrowid
 
     def get_question_suggestions(self, document_id: str = None,
                                   status: str = None) -> List[Dict]:
         """获取新题建议"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        conditions = []
-        params = []
+            conditions = []
+            params = []
 
-        if document_id:
-            conditions.append("document_id = ?")
-            params.append(document_id)
-        if status:
-            conditions.append("status = ?")
-            params.append(status)
+            if document_id:
+                conditions.append("document_id = ?")
+                params.append(document_id)
+            if status:
+                conditions.append("status = ?")
+                params.append(status)
 
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
+            where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        cursor.execute(f"""
-            SELECT * FROM question_suggestions WHERE {where_clause} ORDER BY created_at DESC
-        """, params)
+            cursor.execute(f"""
+                SELECT * FROM question_suggestions WHERE {where_clause} ORDER BY created_at DESC
+            """, params)
 
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        conn.close()
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
 
         results = []
         for row in rows:
@@ -686,15 +537,12 @@ class ExamAnalysisDB:
 
     def update_suggestion_status(self, suggestion_id: int, status: str):
         """更新建议状态"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("exam") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            UPDATE question_suggestions SET status = ? WHERE id = ?
-        """, (status, suggestion_id))
-
-        conn.commit()
-        conn.close()
+            cursor.execute("""
+                UPDATE question_suggestions SET status = ? WHERE id = ?
+            """, (status, suggestion_id))
 
 
 # ==================== 题库维护服务 ====================
@@ -994,7 +842,7 @@ class ExamAnalysisService:
             report_id=str(uuid.uuid4()),
             exam_id=grade_report.get('exam_id', ''),
             exam_name=grade_report.get('exam_name', ''),
-            student_name=grade_report.get('student_name', ''),
+            student_id=grade_report.get('student_id', ''),
             total_score=grade_report.get('total_score', 0),
             max_score=grade_report.get('max_score', 100),
             score_rate=grade_report.get('score_rate', 0)
@@ -1241,20 +1089,18 @@ class ExamAnalysisService:
 
 # ==================== 便捷函数 ====================
 
-def create_services(db_path: str = "./data/exam_analysis.db",
-                    rag_module=None, llm_client=None) -> Tuple[ExamAnalysisDB, QuestionMaintenanceService, ExamAnalysisService]:
+def create_services(rag_module=None, llm_client=None) -> Tuple[ExamAnalysisDB, QuestionMaintenanceService, ExamAnalysisService]:
     """
     创建服务实例
 
     Args:
-        db_path: 数据库路径
         rag_module: RAG模块
         llm_client: LLM客户端
 
     Returns:
         (数据库实例, 题库维护服务, 整卷分析服务)
     """
-    db = ExamAnalysisDB(db_path)
+    db = ExamAnalysisDB()
     maintenance_service = QuestionMaintenanceService(db, rag_module)
     analysis_service = ExamAnalysisService(db, rag_module, llm_client)
 
@@ -1270,7 +1116,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # 创建服务
-    db, maintenance_svc, analysis_svc = create_services("./test_exam_analysis.db")
+    db, maintenance_svc, analysis_svc = create_services()
 
     # 测试知识点
     print("\n[1] 测试知识点管理...")
@@ -1325,7 +1171,7 @@ if __name__ == "__main__":
     grade_report = {
         "exam_id": "test-exam-001",
         "exam_name": "差旅管理办法测试",
-        "student_name": "测试学员",
+        "student_id": "test-student-001",
         "total_score": 75,
         "max_score": 100,
         "score_rate": 75.0,
@@ -1351,12 +1197,6 @@ if __name__ == "__main__":
     print(f"  AI评语: {analysis_report.ai_comment[:100]}...")
     print(f"  薄弱知识点: {[wp['name'] for wp in analysis_report.weak_points]}")
     print(f"  优势知识点: {[sp['name'] for sp in analysis_report.strong_points]}")
-
-    # 清理测试数据库
-    import os
-    if os.path.exists("./test_exam_analysis.db"):
-        os.remove("./test_exam_analysis.db")
-        print("\n[OK] 测试数据库已清理")
 
     print("\n" + "=" * 60)
     print("测试完成")

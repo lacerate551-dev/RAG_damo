@@ -10,12 +10,13 @@
 
 import json
 import os
-import sqlite3
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass, asdict, field
 from collections import Counter
+
+from data.db import get_connection, init_databases
 
 # 配置日志
 logging.basicConfig(
@@ -111,131 +112,53 @@ class QualityReport:
 class FeedbackDB:
     """反馈数据库"""
 
-    def __init__(self, db_path: str = "./data/feedback.db"):
-        self.db_path = db_path
-        self._init_db()
+    def __init__(self):
+        init_databases()
 
     def _init_db(self):
-        """初始化数据库表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        # 反馈记录表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS feedbacks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                query TEXT NOT NULL,
-                answer TEXT,
-                sources TEXT,
-                rating INTEGER NOT NULL,
-                reason TEXT,
-                user_id TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # FAQ表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS faqs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                question TEXT NOT NULL,
-                answer TEXT NOT NULL,
-                source_documents TEXT,
-                frequency INTEGER DEFAULT 1,
-                avg_rating REAL DEFAULT 0,
-                status TEXT DEFAULT 'draft',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 质量报告表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS quality_reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                report_type TEXT NOT NULL,
-                start_date DATE NOT NULL,
-                end_date DATE NOT NULL,
-                total_queries INTEGER DEFAULT 0,
-                total_feedback INTEGER DEFAULT 0,
-                positive_count INTEGER DEFAULT 0,
-                negative_count INTEGER DEFAULT 0,
-                avg_rating REAL DEFAULT 0,
-                satisfaction_rate REAL DEFAULT 0,
-                high_freq_queries TEXT,
-                low_rating_queries TEXT,
-                improvement_suggestions TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # FAQ建议表（高频问题自动推荐）
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS faq_suggestions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                query TEXT NOT NULL,
-                answer TEXT,
-                frequency INTEGER DEFAULT 1,
-                avg_rating REAL DEFAULT 0,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 创建索引
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_feedback_session ON feedbacks(session_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedbacks(rating)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedbacks(created_at)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_faq_status ON faqs(status)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_faq_suggestion_status ON faq_suggestions(status)")
-
-        conn.commit()
-        conn.close()
+        """初始化数据库表 - 已由 init_databases() 统一处理"""
+        pass
 
     # ==================== 反馈操作 ====================
 
     def add_feedback(self, feedback: Feedback) -> int:
         """添加反馈"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT INTO feedbacks
-            (session_id, query, answer, sources, rating, reason, user_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            feedback.session_id,
-            feedback.query,
-            feedback.answer,
-            json.dumps(feedback.sources, ensure_ascii=False),
-            feedback.rating,
-            feedback.reason,
-            feedback.user_id,
-            feedback.created_at
-        ))
+            cursor.execute("""
+                INSERT INTO feedbacks
+                (session_id, query, answer, sources, rating, reason, user_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                feedback.session_id,
+                feedback.query,
+                feedback.answer,
+                json.dumps(feedback.sources, ensure_ascii=False),
+                feedback.rating,
+                feedback.reason,
+                feedback.user_id,
+                feedback.created_at
+            ))
 
-        feedback_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+            feedback_id = cursor.lastrowid
 
         logger.info(f"添加反馈: session={feedback.session_id}, rating={feedback.rating}")
         return feedback_id
 
     def get_feedback(self, feedback_id: int) -> Optional[Dict]:
         """获取反馈详情"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("SELECT * FROM feedbacks WHERE id = ?", (feedback_id,))
-        row = cursor.fetchone()
-        conn.close()
+            cursor.execute("SELECT * FROM feedbacks WHERE id = ?", (feedback_id,))
+            row = cursor.fetchone()
 
         if not row:
             return None
 
-        columns = [desc[0] for desc in cursor.description]
-        result = dict(zip(columns, row))
+        # sqlite3.Row 支持直接转换为字典
+        result = dict(row)
         if result.get('sources'):
             result['sources'] = json.loads(result['sources'])
         return result
@@ -244,42 +167,41 @@ class FeedbackDB:
                       start_date: str = None, end_date: str = None,
                       limit: int = 100) -> List[Dict]:
         """获取反馈列表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        conditions = []
-        params = []
+            conditions = []
+            params = []
 
-        if rating is not None:
-            conditions.append("rating = ?")
-            params.append(rating)
-        if user_id:
-            conditions.append("user_id = ?")
-            params.append(user_id)
-        if start_date:
-            conditions.append("created_at >= ?")
-            params.append(start_date)
-        if end_date:
-            conditions.append("created_at <= ?")
-            params.append(end_date)
+            if rating is not None:
+                conditions.append("rating = ?")
+                params.append(rating)
+            if user_id:
+                conditions.append("user_id = ?")
+                params.append(user_id)
+            if start_date:
+                conditions.append("created_at >= ?")
+                params.append(start_date)
+            if end_date:
+                conditions.append("created_at <= ?")
+                params.append(end_date)
 
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
-        params.append(limit)
+            where_clause = " AND ".join(conditions) if conditions else "1=1"
+            params.append(limit)
 
-        cursor.execute(f"""
-            SELECT * FROM feedbacks
-            WHERE {where_clause}
-            ORDER BY created_at DESC
-            LIMIT ?
-        """, params)
+            cursor.execute(f"""
+                SELECT * FROM feedbacks
+                WHERE {where_clause}
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, params)
 
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        conn.close()
+            rows = cursor.fetchall()
 
         results = []
         for row in rows:
-            item = dict(zip(columns, row))
+            # sqlite3.Row 支持直接转换为字典
+            item = dict(row)
             if item.get('sources'):
                 item['sources'] = json.loads(item['sources'])
             results.append(item)
@@ -288,43 +210,41 @@ class FeedbackDB:
 
     def get_feedback_stats(self, start_date: str = None, end_date: str = None) -> Dict:
         """获取反馈统计"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        conditions = []
-        params = []
+            conditions = []
+            params = []
 
-        if start_date:
-            conditions.append("created_at >= ?")
-            params.append(start_date)
-        if end_date:
-            conditions.append("created_at <= ?")
-            params.append(end_date)
+            if start_date:
+                conditions.append("created_at >= ?")
+                params.append(start_date)
+            if end_date:
+                conditions.append("created_at <= ?")
+                params.append(end_date)
 
-        where_clause = " AND ".join(conditions) if conditions else "1=1"
+            where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        # 总数
-        cursor.execute(f"SELECT COUNT(*) FROM feedbacks WHERE {where_clause}", params)
-        total = cursor.fetchone()[0]
+            # 总数
+            cursor.execute(f"SELECT COUNT(*) FROM feedbacks WHERE {where_clause}", params)
+            total = cursor.fetchone()[0]
 
-        # 正面/负面
-        if conditions:
-            cursor.execute(f"SELECT COUNT(*) FROM feedbacks WHERE {where_clause} AND rating = 1", params)
-        else:
-            cursor.execute("SELECT COUNT(*) FROM feedbacks WHERE rating = 1")
-        positive = cursor.fetchone()[0]
+            # 正面/负面
+            if conditions:
+                cursor.execute(f"SELECT COUNT(*) FROM feedbacks WHERE {where_clause} AND rating = 1", params)
+            else:
+                cursor.execute("SELECT COUNT(*) FROM feedbacks WHERE rating = 1")
+            positive = cursor.fetchone()[0]
 
-        if conditions:
-            cursor.execute(f"SELECT COUNT(*) FROM feedbacks WHERE {where_clause} AND rating = -1", params)
-        else:
-            cursor.execute("SELECT COUNT(*) FROM feedbacks WHERE rating = -1")
-        negative = cursor.fetchone()[0]
+            if conditions:
+                cursor.execute(f"SELECT COUNT(*) FROM feedbacks WHERE {where_clause} AND rating = -1", params)
+            else:
+                cursor.execute("SELECT COUNT(*) FROM feedbacks WHERE rating = -1")
+            negative = cursor.fetchone()[0]
 
-        # 平均评分
-        cursor.execute(f"SELECT AVG(rating) FROM feedbacks WHERE {where_clause}", params)
-        avg_rating = cursor.fetchone()[0] or 0
-
-        conn.close()
+            # 平均评分
+            cursor.execute(f"SELECT AVG(rating) FROM feedbacks WHERE {where_clause}", params)
+            avg_rating = cursor.fetchone()[0] or 0
 
         satisfaction_rate = (positive / total * 100) if total > 0 else 0
 
@@ -340,74 +260,70 @@ class FeedbackDB:
 
     def add_faq(self, faq: FAQ) -> int:
         """添加FAQ"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT INTO faqs
-            (question, answer, source_documents, frequency, avg_rating, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            faq.question,
-            faq.answer,
-            json.dumps(faq.source_documents, ensure_ascii=False),
-            faq.frequency,
-            faq.avg_rating,
-            faq.status,
-            faq.created_at,
-            faq.updated_at
-        ))
+            cursor.execute("""
+                INSERT INTO faqs
+                (question, answer, source_documents, frequency, avg_rating, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                faq.question,
+                faq.answer,
+                json.dumps(faq.source_documents, ensure_ascii=False),
+                faq.frequency,
+                faq.avg_rating,
+                faq.status,
+                faq.created_at,
+                faq.updated_at
+            ))
 
-        faq_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+            faq_id = cursor.lastrowid
 
         logger.info(f"添加FAQ: {faq.question[:50]}...")
         return faq_id
 
     def get_faq(self, faq_id: int) -> Optional[Dict]:
         """获取FAQ详情"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("SELECT * FROM faqs WHERE id = ?", (faq_id,))
-        row = cursor.fetchone()
-        conn.close()
+            cursor.execute("SELECT * FROM faqs WHERE id = ?", (faq_id,))
+            row = cursor.fetchone()
 
         if not row:
             return None
 
-        columns = [desc[0] for desc in cursor.description]
-        result = dict(zip(columns, row))
+        # sqlite3.Row 支持直接转换为字典
+        result = dict(row)
         if result.get('source_documents'):
             result['source_documents'] = json.loads(result['source_documents'])
         return result
 
     def get_faqs(self, status: str = None, limit: int = 50) -> List[Dict]:
         """获取FAQ列表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        if status:
-            cursor.execute("""
-                SELECT * FROM faqs WHERE status = ?
-                ORDER BY frequency DESC, avg_rating DESC
-                LIMIT ?
-            """, (status, limit))
-        else:
-            cursor.execute("""
-                SELECT * FROM faqs
-                ORDER BY frequency DESC, avg_rating DESC
-                LIMIT ?
-            """, (limit,))
+            if status:
+                cursor.execute("""
+                    SELECT * FROM faqs WHERE status = ?
+                    ORDER BY frequency DESC, avg_rating DESC
+                    LIMIT ?
+                """, (status, limit))
+            else:
+                cursor.execute("""
+                    SELECT * FROM faqs
+                    ORDER BY frequency DESC, avg_rating DESC
+                    LIMIT ?
+                """, (limit,))
 
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        conn.close()
+            rows = cursor.fetchall()
 
         results = []
         for row in rows:
-            item = dict(zip(columns, row))
+            # sqlite3.Row 支持直接转换为字典
+            item = dict(row)
             if item.get('source_documents'):
                 item['source_documents'] = json.loads(item['source_documents'])
             results.append(item)
@@ -416,49 +332,43 @@ class FeedbackDB:
 
     def update_faq(self, faq_id: int, updates: Dict) -> bool:
         """更新FAQ"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        # 构建更新语句
-        set_clause = []
-        params = []
+            # 构建更新语句
+            set_clause = []
+            params = []
 
-        for key, value in updates.items():
-            if key in ['question', 'answer', 'status', 'frequency', 'avg_rating']:
-                set_clause.append(f"{key} = ?")
-                params.append(value)
-            elif key == 'source_documents':
-                set_clause.append("source_documents = ?")
-                params.append(json.dumps(value, ensure_ascii=False))
+            for key, value in updates.items():
+                if key in ['question', 'answer', 'status', 'frequency', 'avg_rating']:
+                    set_clause.append(f"{key} = ?")
+                    params.append(value)
+                elif key == 'source_documents':
+                    set_clause.append("source_documents = ?")
+                    params.append(json.dumps(value, ensure_ascii=False))
 
-        if not set_clause:
-            conn.close()
-            return False
+            if not set_clause:
+                return False
 
-        set_clause.append("updated_at = ?")
-        params.append(datetime.now().isoformat())
-        params.append(faq_id)
+            set_clause.append("updated_at = ?")
+            params.append(datetime.now().isoformat())
+            params.append(faq_id)
 
-        cursor.execute(f"""
-            UPDATE faqs SET {', '.join(set_clause)} WHERE id = ?
-        """, params)
+            cursor.execute(f"""
+                UPDATE faqs SET {', '.join(set_clause)} WHERE id = ?
+            """, params)
 
-        affected = cursor.rowcount > 0
-        conn.commit()
-        conn.close()
+            affected = cursor.rowcount > 0
 
         return affected
 
     def delete_faq(self, faq_id: int) -> bool:
         """删除FAQ"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("DELETE FROM faqs WHERE id = ?", (faq_id,))
-        affected = cursor.rowcount > 0
-
-        conn.commit()
-        conn.close()
+            cursor.execute("DELETE FROM faqs WHERE id = ?", (faq_id,))
+            affected = cursor.rowcount > 0
 
         return affected
 
@@ -467,106 +377,93 @@ class FeedbackDB:
     def add_faq_suggestion(self, query: str, answer: str = "",
                            frequency: int = 1, avg_rating: float = 0) -> int:
         """添加FAQ建议"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        # 检查是否已存在相似问题
-        cursor.execute("""
-            SELECT id, frequency FROM faq_suggestions
-            WHERE query = ? AND status = 'pending'
-        """, (query,))
-
-        existing = cursor.fetchone()
-        if existing:
-            # 更新频率
+            # 检查是否已存在相似问题
             cursor.execute("""
-                UPDATE faq_suggestions
-                SET frequency = ?, avg_rating = ?
-                WHERE id = ?
-            """, (existing[1] + frequency, avg_rating, existing[0]))
-            conn.commit()
-            conn.close()
-            return existing[0]
+                SELECT id, frequency FROM faq_suggestions
+                WHERE query = ? AND status = 'pending'
+            """, (query,))
 
-        cursor.execute("""
-            INSERT INTO faq_suggestions (query, answer, frequency, avg_rating, status, created_at)
-            VALUES (?, ?, ?, ?, 'pending', ?)
-        """, (query, answer, frequency, avg_rating, datetime.now().isoformat()))
+            existing = cursor.fetchone()
+            if existing:
+                # 更新频率
+                cursor.execute("""
+                    UPDATE faq_suggestions
+                    SET frequency = ?, avg_rating = ?
+                    WHERE id = ?
+                """, (existing['frequency'] + frequency, avg_rating, existing['id']))
+                return existing['id']
 
-        suggestion_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+            cursor.execute("""
+                INSERT INTO faq_suggestions (query, answer, frequency, avg_rating, status, created_at)
+                VALUES (?, ?, ?, ?, 'pending', ?)
+            """, (query, answer, frequency, avg_rating, datetime.now().isoformat()))
+
+            suggestion_id = cursor.lastrowid
 
         return suggestion_id
 
     def get_faq_suggestions(self, status: str = "pending", limit: int = 50) -> List[Dict]:
         """获取FAQ建议列表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT * FROM faq_suggestions
-            WHERE status = ?
-            ORDER BY frequency DESC, avg_rating DESC
-            LIMIT ?
-        """, (status, limit))
+            cursor.execute("""
+                SELECT * FROM faq_suggestions
+                WHERE status = ?
+                ORDER BY frequency DESC, avg_rating DESC
+                LIMIT ?
+            """, (status, limit))
 
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        conn.close()
+            rows = cursor.fetchall()
 
-        return [dict(zip(columns, row)) for row in rows]
+        return [dict(row) for row in rows]
 
     def approve_faq_suggestion(self, suggestion_id: int) -> int:
         """批准FAQ建议，转为正式FAQ"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        # 获取建议内容
-        cursor.execute("SELECT * FROM faq_suggestions WHERE id = ?", (suggestion_id,))
-        suggestion = cursor.fetchone()
+            # 获取建议内容
+            cursor.execute("SELECT * FROM faq_suggestions WHERE id = ?", (suggestion_id,))
+            suggestion = cursor.fetchone()
 
-        if not suggestion:
-            conn.close()
-            return -1
+            if not suggestion:
+                return -1
 
-        columns = [desc[0] for desc in cursor.description]
-        suggestion_dict = dict(zip(columns, suggestion))
+            # sqlite3.Row 支持直接通过列名访问
+            suggestion_dict = dict(suggestion)
 
-        # 创建FAQ
-        cursor.execute("""
-            INSERT INTO faqs (question, answer, frequency, avg_rating, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'approved', ?, ?)
-        """, (
-            suggestion_dict['query'],
-            suggestion_dict['answer'],
-            suggestion_dict['frequency'],
-            suggestion_dict['avg_rating'],
-            datetime.now().isoformat(),
-            datetime.now().isoformat()
-        ))
+            # 创建FAQ
+            cursor.execute("""
+                INSERT INTO faqs (question, answer, frequency, avg_rating, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'approved', ?, ?)
+            """, (
+                suggestion_dict['query'],
+                suggestion_dict['answer'],
+                suggestion_dict['frequency'],
+                suggestion_dict['avg_rating'],
+                datetime.now().isoformat(),
+                datetime.now().isoformat()
+            ))
 
-        faq_id = cursor.lastrowid
+            faq_id = cursor.lastrowid
 
-        # 更新建议状态
-        cursor.execute("UPDATE faq_suggestions SET status = 'approved' WHERE id = ?", (suggestion_id,))
-
-        conn.commit()
-        conn.close()
+            # 更新建议状态
+            cursor.execute("UPDATE faq_suggestions SET status = 'approved' WHERE id = ?", (suggestion_id,))
 
         logger.info(f"批准FAQ建议: {suggestion_dict['query'][:50]}...")
         return faq_id
 
     def reject_faq_suggestion(self, suggestion_id: int) -> bool:
         """拒绝FAQ建议"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("UPDATE faq_suggestions SET status = 'rejected' WHERE id = ?", (suggestion_id,))
-        affected = cursor.rowcount > 0
-
-        conn.commit()
-        conn.close()
+            cursor.execute("UPDATE faq_suggestions SET status = 'rejected' WHERE id = ?", (suggestion_id,))
+            affected = cursor.rowcount > 0
 
         return affected
 
@@ -574,51 +471,48 @@ class FeedbackDB:
 
     def save_report(self, report: QualityReport) -> int:
         """保存报告"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT INTO quality_reports
-            (report_type, start_date, end_date, total_queries, total_feedback,
-             positive_count, negative_count, avg_rating, satisfaction_rate,
-             high_freq_queries, low_rating_queries, improvement_suggestions, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            report.report_type,
-            report.start_date,
-            report.end_date,
-            report.total_queries,
-            report.total_feedback,
-            report.positive_count,
-            report.negative_count,
-            report.avg_rating,
-            report.satisfaction_rate,
-            json.dumps(report.high_freq_queries, ensure_ascii=False),
-            json.dumps(report.low_rating_queries, ensure_ascii=False),
-            json.dumps(report.improvement_suggestions, ensure_ascii=False),
-            report.created_at
-        ))
+            cursor.execute("""
+                INSERT INTO quality_reports
+                (report_type, start_date, end_date, total_queries, total_feedback,
+                 positive_count, negative_count, avg_rating, satisfaction_rate,
+                 high_freq_queries, low_rating_queries, improvement_suggestions, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                report.report_type,
+                report.start_date,
+                report.end_date,
+                report.total_queries,
+                report.total_feedback,
+                report.positive_count,
+                report.negative_count,
+                report.avg_rating,
+                report.satisfaction_rate,
+                json.dumps(report.high_freq_queries, ensure_ascii=False),
+                json.dumps(report.low_rating_queries, ensure_ascii=False),
+                json.dumps(report.improvement_suggestions, ensure_ascii=False),
+                report.created_at
+            ))
 
-        report_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+            report_id = cursor.lastrowid
 
         return report_id
 
     def get_report(self, report_id: int) -> Optional[Dict]:
         """获取报告详情"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("SELECT * FROM quality_reports WHERE id = ?", (report_id,))
-        row = cursor.fetchone()
-        conn.close()
+            cursor.execute("SELECT * FROM quality_reports WHERE id = ?", (report_id,))
+            row = cursor.fetchone()
 
         if not row:
             return None
 
-        columns = [desc[0] for desc in cursor.description]
-        result = dict(zip(columns, row))
+        # sqlite3.Row 支持直接转换为字典
+        result = dict(row)
 
         for field in ['high_freq_queries', 'low_rating_queries', 'improvement_suggestions']:
             if result.get(field):
@@ -628,24 +522,23 @@ class FeedbackDB:
 
     def get_latest_report(self, report_type: str = "weekly") -> Optional[Dict]:
         """获取最新报告"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT * FROM quality_reports
-            WHERE report_type = ?
-            ORDER BY created_at DESC
-            LIMIT 1
-        """, (report_type,))
+            cursor.execute("""
+                SELECT * FROM quality_reports
+                WHERE report_type = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (report_type,))
 
-        row = cursor.fetchone()
-        conn.close()
+            row = cursor.fetchone()
 
         if not row:
             return None
 
-        columns = [desc[0] for desc in cursor.description]
-        result = dict(zip(columns, row))
+        # sqlite3.Row 支持直接转换为字典
+        result = dict(row)
 
         for field in ['high_freq_queries', 'low_rating_queries', 'improvement_suggestions']:
             if result.get(field):
@@ -937,19 +830,17 @@ class FeedbackService:
 
 # ==================== 便捷函数 ====================
 
-def create_feedback_service(db_path: str = "./data/feedback.db",
-                             faq_threshold: int = 5) -> Tuple[FeedbackDB, FeedbackService]:
+def create_feedback_service(faq_threshold: int = 5) -> Tuple[FeedbackDB, FeedbackService]:
     """
     创建反馈服务实例
 
     Args:
-        db_path: 数据库路径
         faq_threshold: FAQ高频阈值
 
     Returns:
         (数据库实例, 反馈服务实例)
     """
-    db = FeedbackDB(db_path)
+    db = FeedbackDB()
     service = FeedbackService(db, faq_threshold)
     return db, service
 
@@ -968,7 +859,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # 创建服务
-    db, service = create_feedback_service(db_path="./test_feedback.db")
+    db, service = create_feedback_service()
 
     # 测试反馈
     print("\n[1] 测试反馈提交...")
@@ -1034,13 +925,6 @@ if __name__ == "__main__":
         # 获取FAQ列表
         faqs = db.get_faqs(status="approved")
         print(f"  已批准FAQ: {len(faqs)} 个")
-
-    # 清理测试数据库
-    import os
-    for f in ["./test_feedback.db", "./test_feedback.db-wal", "./test_feedback.db-shm"]:
-        if os.path.exists(f):
-            os.remove(f)
-            print(f"\n  [OK] 清理: {f}")
 
     print("\n" + "=" * 60)
     print("测试完成")

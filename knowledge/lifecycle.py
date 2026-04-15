@@ -23,12 +23,13 @@
 """
 
 import os
-import sqlite3
 import logging
 from enum import Enum
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+
+from data.db import get_connection, init_databases
 
 # 设置日志
 logging.basicConfig(
@@ -106,63 +107,12 @@ class DocumentLifecycleManager:
     支持软删除、版本追踪、影响分析。
     """
 
-    def __init__(self, db_path: str = "./data/exam_analysis.db"):
+    def __init__(self):
         """
         初始化
-
-        Args:
-            db_path: 数据库路径（与exam_analysis共用）
         """
-        self.db_path = db_path
-        self._init_tables()
-
-    def _init_tables(self):
-        """初始化数据库表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        # 文档版本表（扩展）
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS document_versions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id TEXT NOT NULL,
-                collection TEXT NOT NULL,
-                version TEXT NOT NULL DEFAULT 'v1',
-                status TEXT NOT NULL DEFAULT 'active',
-                effective_date DATE,
-                expiry_date DATE,
-                deprecated_date DATETIME,
-                deprecated_reason TEXT,
-                deprecated_by TEXT,
-                change_summary TEXT,
-                supersedes TEXT,
-                chunk_count INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                created_by TEXT,
-                UNIQUE(document_id, collection, version)
-            )
-        ''')
-
-        # 版本变更日志表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS version_change_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id TEXT NOT NULL,
-                collection TEXT NOT NULL,
-                old_version TEXT,
-                new_version TEXT,
-                old_status TEXT,
-                new_status TEXT,
-                change_type TEXT NOT NULL,
-                reason TEXT,
-                changed_by TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        conn.commit()
-        conn.close()
-        logger.info(f"文档生命周期管理器初始化完成: {self.db_path}")
+        init_databases()
+        logger.info("文档生命周期管理器初始化完成")
 
     # ==================== 废止操作 ====================
 
@@ -390,21 +340,20 @@ class DocumentLifecycleManager:
         Returns:
             版本历史列表
         """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            SELECT document_id, collection, version, status, effective_date,
-                   deprecated_date, deprecated_reason, change_summary, supersedes,
-                   created_at, created_by, chunk_count
-            FROM document_versions
-            WHERE document_id = ? AND collection = ?
-            ORDER BY created_at DESC
-            LIMIT ?
-        ''', (document_id, collection, limit))
+            cursor.execute('''
+                SELECT document_id, collection, version, status, effective_date,
+                       deprecated_date, deprecated_reason, change_summary, supersedes,
+                       created_at, created_by, chunk_count
+                FROM document_versions
+                WHERE document_id = ? AND collection = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            ''', (document_id, collection, limit))
 
-        rows = cursor.fetchall()
-        conn.close()
+            rows = cursor.fetchall()
 
         return [
             DocumentVersionInfo(
@@ -439,21 +388,20 @@ class DocumentLifecycleManager:
         Returns:
             生效版本信息，不存在返回None
         """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            SELECT document_id, collection, version, status, effective_date,
-                   deprecated_date, deprecated_reason, change_summary, supersedes,
-                   created_at, created_by, chunk_count
-            FROM document_versions
-            WHERE document_id = ? AND collection = ? AND status = 'active'
-            ORDER BY created_at DESC
-            LIMIT 1
-        ''', (document_id, collection))
+            cursor.execute('''
+                SELECT document_id, collection, version, status, effective_date,
+                       deprecated_date, deprecated_reason, change_summary, supersedes,
+                       created_at, created_by, chunk_count
+                FROM document_versions
+                WHERE document_id = ? AND collection = ? AND status = 'active'
+                ORDER BY created_at DESC
+                LIMIT 1
+            ''', (document_id, collection))
 
-        row = cursor.fetchone()
-        conn.close()
+            row = cursor.fetchone()
 
         if not row:
             return None
@@ -488,32 +436,31 @@ class DocumentLifecycleManager:
         Returns:
             已废止文档列表
         """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        if collection:
-            cursor.execute('''
-                SELECT document_id, collection, version, status, effective_date,
-                       deprecated_date, deprecated_reason, change_summary, supersedes,
-                       created_at, created_by, chunk_count
-                FROM document_versions
-                WHERE collection = ? AND status = 'deprecated'
-                ORDER BY deprecated_date DESC
-                LIMIT ?
-            ''', (collection, limit))
-        else:
-            cursor.execute('''
-                SELECT document_id, collection, version, status, effective_date,
-                       deprecated_date, deprecated_reason, change_summary, supersedes,
-                       created_at, created_by, chunk_count
-                FROM document_versions
-                WHERE status = 'deprecated'
-                ORDER BY deprecated_date DESC
-                LIMIT ?
-            ''', (limit,))
+            if collection:
+                cursor.execute('''
+                    SELECT document_id, collection, version, status, effective_date,
+                           deprecated_date, deprecated_reason, change_summary, supersedes,
+                           created_at, created_by, chunk_count
+                    FROM document_versions
+                    WHERE collection = ? AND status = 'deprecated'
+                    ORDER BY deprecated_date DESC
+                    LIMIT ?
+                ''', (collection, limit))
+            else:
+                cursor.execute('''
+                    SELECT document_id, collection, version, status, effective_date,
+                           deprecated_date, deprecated_reason, change_summary, supersedes,
+                           created_at, created_by, chunk_count
+                    FROM document_versions
+                    WHERE status = 'deprecated'
+                    ORDER BY deprecated_date DESC
+                    LIMIT ?
+                ''', (limit,))
 
-        rows = cursor.fetchall()
-        conn.close()
+            rows = cursor.fetchall()
 
         return [
             DocumentVersionInfo(
@@ -547,32 +494,29 @@ class DocumentLifecycleManager:
         """更新版本状态"""
         from datetime import datetime
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
         now = datetime.now().isoformat()
 
-        if new_status == "deprecated":
-            cursor.execute('''
-                UPDATE document_versions
-                SET status = ?, deprecated_date = ?, deprecated_reason = ?, deprecated_by = ?
-                WHERE document_id = ? AND collection = ? AND status = 'active'
-            ''', (new_status, now, reason, changed_by, document_id, collection))
-        elif new_status == "superseded":
-            cursor.execute('''
-                UPDATE document_versions
-                SET status = ?, expiry_date = ?
-                WHERE document_id = ? AND collection = ? AND status = 'active'
-            ''', (new_status, now[:10], document_id, collection))
-        elif new_status == "active":
-            cursor.execute('''
-                UPDATE document_versions
-                SET status = ?, deprecated_date = NULL, deprecated_reason = NULL
-                WHERE document_id = ? AND collection = ?
-            ''', (new_status, document_id, collection))
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        conn.commit()
-        conn.close()
+            if new_status == "deprecated":
+                cursor.execute('''
+                    UPDATE document_versions
+                    SET status = ?, deprecated_date = ?, deprecated_reason = ?, deprecated_by = ?
+                    WHERE document_id = ? AND collection = ? AND status = 'active'
+                ''', (new_status, now, reason, changed_by, document_id, collection))
+            elif new_status == "superseded":
+                cursor.execute('''
+                    UPDATE document_versions
+                    SET status = ?, expiry_date = ?
+                    WHERE document_id = ? AND collection = ? AND status = 'active'
+                ''', (new_status, now[:10], document_id, collection))
+            elif new_status == "active":
+                cursor.execute('''
+                    UPDATE document_versions
+                    SET status = ?, deprecated_date = NULL, deprecated_reason = NULL
+                    WHERE document_id = ? AND collection = ?
+                ''', (new_status, document_id, collection))
 
     def _create_version_record(
         self,
@@ -587,20 +531,17 @@ class DocumentLifecycleManager:
         """创建版本记录"""
         from datetime import datetime
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
         now = datetime.now()
 
-        cursor.execute('''
-            INSERT OR REPLACE INTO document_versions
-            (document_id, collection, version, status, effective_date, change_summary, supersedes, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (document_id, collection, version, status, now.strftime("%Y-%m-%d"),
-              change_summary, supersedes, created_by))
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        conn.commit()
-        conn.close()
+            cursor.execute('''
+                INSERT OR REPLACE INTO document_versions
+                (document_id, collection, version, status, effective_date, change_summary, supersedes, created_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (document_id, collection, version, status, now.strftime("%Y-%m-%d"),
+                  change_summary, supersedes, created_by))
 
     def _log_version_change(
         self,
@@ -615,18 +556,15 @@ class DocumentLifecycleManager:
         changed_by: str = ""
     ):
         """记录版本变更日志"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("knowledge") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            INSERT INTO version_change_logs
-            (document_id, collection, old_version, new_version, old_status, new_status, change_type, reason, changed_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (document_id, collection, old_version, new_version, old_status, new_status,
-              change_type, reason, changed_by))
-
-        conn.commit()
-        conn.close()
+            cursor.execute('''
+                INSERT INTO version_change_logs
+                (document_id, collection, old_version, new_version, old_status, new_status, change_type, reason, changed_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (document_id, collection, old_version, new_version, old_status, new_status,
+                  change_type, reason, changed_by))
 
     def _trigger_question_hook(
         self,

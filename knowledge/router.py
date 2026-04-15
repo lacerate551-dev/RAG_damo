@@ -35,7 +35,7 @@ except ImportError:
     from rag_demo import API_KEY, BASE_URL, MODEL
 
 # 导入权限管理
-from auth.gateway import get_accessible_collections
+from auth.gateway import get_accessible_collections, normalize_department_name
 
 # 设置日志
 logging.basicConfig(
@@ -368,9 +368,12 @@ class KnowledgeBaseRouter:
             else:
                 if public_kb in accessible_collections:
                     result.append(public_kb)
-                user_dept_kb = f"dept_{department}"
-                if user_dept_kb in accessible_collections and user_dept_kb not in result:
-                    result.append(user_dept_kb)
+                # 使用标准化的部门名称
+                normalized_dept = normalize_department_name(department)
+                if normalized_dept:
+                    user_dept_kb = f"dept_{normalized_dept}"
+                    if user_dept_kb in accessible_collections and user_dept_kb not in result:
+                        result.append(user_dept_kb)
 
         # 去重并保持顺序
         seen = set()

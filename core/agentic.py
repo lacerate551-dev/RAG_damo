@@ -26,15 +26,12 @@ import requests
 from openai import OpenAI
 
 # 导入现有RAG组件
-from rag_demo import (
-    search_knowledge,
-    generate_answer,
-    collection,
-    API_KEY,
-    BASE_URL,
-    MODEL,
-    check_restricted_documents
-)
+from core.engine import get_engine
+
+try:
+    from config import API_KEY, BASE_URL, MODEL
+except ImportError:
+    pass
 
 # 尝试导入搜索API配置
 try:
@@ -55,6 +52,14 @@ try:
     HAS_GRAPH_RAG = True
 except ImportError:
     HAS_GRAPH_RAG = False
+
+# 导入查询分类器
+try:
+    from core.query_classifier import QueryClassifier, QueryType
+    HAS_CLASSIFIER = True
+except ImportError:
+    HAS_CLASSIFIER = False
+    QueryType = None
 
 
 class AgenticRAG:
@@ -108,6 +113,37 @@ class AgenticRAG:
         self.SOURCE_WEB = "网络搜索"
         self.SOURCE_GRAPH = "知识图谱"
 
+        # 初始化查询分类器
+        self.query_classifier = QueryClassifier() if HAS_CLASSIFIER else None
+
+        # 初始化置信度门控
+        try:
+            from core.confidence_gate import create_gate
+            self.confidence_gate = create_gate()
+        except ImportError:
+            self.confidence_gate = None
+
+        # 初始化多维质量评估器
+        try:
+            from core.quality_assessor import create_assessor
+            self.quality_assessor = create_assessor()
+        except ImportError:
+            self.quality_assessor = None
+
+        # 初始化推理反思器
+        try:
+            from core.reasoning_reflector import create_reflector
+            self.reasoning_reflector = create_reflector()
+        except ImportError:
+            self.reasoning_reflector = None
+
+        # 初始化循环防护器
+        try:
+            from core.loop_guard import create_guard
+            self.loop_guard = create_guard(max_iterations=max_iterations)
+        except ImportError:
+            self.loop_guard = None
+
     def process(self, query: str, verbose: bool = True, history: list = None,
                 log_callback=None, allowed_levels: list = None,
                 role: str = None, department: str = None,
@@ -157,8 +193,51 @@ class AgenticRAG:
             print(f"[用户] {query}")
             print("=" * 60)
 
-        # 检查是否为元问题（关于知识库本身的问题）
-        if self._is_meta_question(query):
+        # ==================== 新增：查询分类 ====================
+        classified = None
+        if self.query_classifier:
+            classified = self.query_classifier.classify(query, history)
+            emit_log("classify", {
+                "query_type": classified.query_type.value,
+                "skip_llm": classified.skip_llm_decision,
+                "keywords": classified.keywords,
+                "confidence": classified.confidence
+            })
+
+            if verbose:
+                print(f"\n[分类] 类型: {classified.query_type.value}, 跳过LLM: {classified.skip_llm_decision}")
+                if classified.keywords:
+                    print(f"   关键词: {', '.join(classified.keywords[:5])}")
+
+        # ==================== 元问题直接处理 ====================
+        if classified and classified.query_type == QueryType.META:
+            if verbose:
+                print("\n[元问题] 检测到关于知识库本身的问题")
+            emit_log("decision", {"action": "meta_query", "reason": "分类器识别为元问题"})
+
+            answer = self._answer_meta_question(query, allowed_levels, role=role, department=department)
+            emit_log("answer", {"reason": "元问题直接回答"})
+
+            return {
+                "answer": answer,
+                "iterations": 0,
+                "reasoning": [{"type": "meta_question", "query": query, "classified": True}],
+                "contexts": [],
+                "sources": [],
+                "log_trace": log_trace,
+                "classified": classified.to_dict() if classified else None
+            }
+
+        # ==================== 实时信息走网络搜索 ====================
+        if classified and classified.query_type == QueryType.REALTIME:
+            if verbose:
+                print("\n[实时信息] 检测到需要实时信息，执行网络搜索")
+            emit_log("decision", {"action": "web_search", "reason": "分类器识别为实时信息"})
+
+            return self._web_search_flow(query, log_trace, emit_log, verbose, classified)
+
+        # ==================== 兼容旧版：无分类器时的元问题检测 ====================
+        if not classified and self._is_meta_question(query):
             if verbose:
                 print("\n[元问题] 检测到关于知识库本身的问题")
             emit_log("decision", {"action": "meta_query", "reason": "检测到元问题，直接回答"})
@@ -172,21 +251,211 @@ class AgenticRAG:
                 "reasoning": [{"type": "meta_question", "query": query}],
                 "contexts": [],
                 "sources": [],
-                "log_trace": log_trace
+                "log_trace": log_trace,
+                "classified": None
             }
+
+        # ==================== 知识库检索流程 ====================
+        # 获取检索配置
+        if classified:
+            search_config = classified.search_config
+            max_iterations = search_config.get("max_iterations", self.max_iterations)
+            top_k = search_config.get("top_k", 5)
+        else:
+            max_iterations = self.max_iterations
+            top_k = 5
 
         # 知识问答流程
         all_contexts = []
         reasoning_trace = []
-        current_query = query
+        current_query = classified.processed_query if classified else query
         iteration = 0
 
         if verbose:
             print("\n[开始检索...]")
 
-        while iteration < self.max_iterations:
+        # ==================== 简单查询：直接检索，跳过 LLM 决策 ====================
+        if classified and classified.skip_llm_decision:
+            if verbose:
+                print(f"[直接检索] {current_query}")
+
+            # 提取 source_filter（如果是文件特定查询）
+            source_filter = None
+            if classified and hasattr(classified, 'source_filter'):
+                source_filter = classified.source_filter
+
+            # 如果是图片查询且指定了文件名，直接从向量库获取图片
+            if (classified and classified.query_type == QueryType.FILE_SPECIFIC and
+                source_filter and ("图片" in query or "图像" in query or "image" in query.lower() or "figure" in query.lower())):
+                direct_images = self._get_images_for_source(source_filter, collections)
+                if direct_images:
+                    if verbose:
+                        print(f"   [图片查询] 从 {source_filter} 找到 {len(direct_images)} 张图片")
+
+                    return {
+                        "answer": f"在文件 **{source_filter}** 中找到 **{len(direct_images)}** 张图片。\n\n图片列表：\n" +
+                                  "\n".join([f"- 第{img.get('page', '?')}页: {img.get('id')}" for img in direct_images[:10]]),
+                        "iterations": 0,
+                        "reasoning": [{"type": "direct_image_query", "source": source_filter}],
+                        "contexts": [],
+                        "sources": [{"source": source_filter, "type": self.SOURCE_KB, "count": len(direct_images)}],
+                        "log_trace": log_trace,
+                        "classified": classified.to_dict() if classified else None,
+                        "images": direct_images,
+                        "tables": [],
+                        "sections": []
+                    }
+
+            search_start = time.time()
+            results = get_engine().search_knowledge(
+                current_query,
+                top_k=top_k,
+                allowed_levels=allowed_levels,
+                role=role,
+                department=department,
+                collections=collections,
+                source_filter=source_filter  # 添加 source_filter 参数
+            )
+            docs = results.get('documents', [[]])[0]
+            metas = results.get('metadatas', [[]])[0]
+
+            for doc, meta in zip(docs, metas):
+                all_contexts.append({
+                    'doc': doc,
+                    'meta': meta,
+                    'source_type': self.SOURCE_KB,
+                    'query': current_query
+                })
+
+            search_duration = (time.time() - search_start) * 1000
+            emit_log("retrieve", {
+                "source": "知识库",
+                "query": current_query,
+                "count": len(docs),
+                "duration_ms": round(search_duration, 0),
+                "skip_llm_decision": True
+            })
+
+            if verbose:
+                print(f"   找到 {len(docs)} 个片段")
+
+            # ==================== 置信度门控检查 ====================
+            gate_result = self._check_confidence_gate(current_query, docs, verbose)
+            if gate_result and gate_result.action.value != "pass":
+                # 触发补救流程
+                remediation_result = self._remediation_flow(
+                    query, current_query, all_contexts, gate_result,
+                    allowed_levels, role, department, collections,
+                    verbose, log_trace, emit_log
+                )
+                if remediation_result:
+                    return remediation_result
+
+            # ==================== 多维质量评估 ====================
+            quality_assessment = self._assess_quality(current_query, docs, metas, verbose)
+            # 质量评估结果可用于后续决策，暂时只记录
+
+            # 直接生成答案
+            answer = self._generate_fused_answer(query, all_contexts, allowed_levels)
+
+            # ==================== 推理反思 ====================
+            reflection = self._reflect_on_answer(query, answer, all_contexts, verbose)
+
+            sources = self._extract_sources(all_contexts)
+            # 只从相关来源提取图片（传入原始查询以提取特定文件名）
+            source_names = [s.get("source") for s in sources if s.get("source")]
+            rich_media = self._extract_rich_media(all_contexts, sources_filter=source_names, original_query=query)
+
+            return {
+                "answer": answer,
+                "iterations": 1,
+                "reasoning": [{"type": "direct_search", "query": current_query, "classified": classified.to_dict()}],
+                "contexts": all_contexts,
+                "sources": sources,
+                "log_trace": log_trace,
+                "classified": classified.to_dict() if classified else None,
+                # 富媒体信息
+                "images": rich_media["images"],
+                "tables": rich_media["tables"],
+                "sections": rich_media["sections"]
+            }
+
+        # ==================== 复杂查询：迭代决策流程 ====================
+        # 对于 FACT/COMPARISON/PROCESS 类型，强制首轮知识库检索
+        # 这确保即使 LLM 决策错误，也能有检索结果作为基础
+        need_initial_search = (
+            classified and
+            classified.query_type in (QueryType.FACT, QueryType.COMPARISON, QueryType.PROCESS) and
+            not all_contexts  # 还没有检索过
+        )
+
+        if need_initial_search:
+            if verbose:
+                print(f"[强制首轮检索] {current_query}")
+
+            # 提取 source_filter（如果是文件特定查询）
+            source_filter = None
+            if hasattr(classified, 'source_filter'):
+                source_filter = classified.source_filter
+
+            search_start = time.time()
+            results = get_engine().search_knowledge(
+                current_query,
+                top_k=top_k,
+                allowed_levels=allowed_levels,
+                role=role,
+                department=department,
+                collections=collections,
+                source_filter=source_filter
+            )
+            docs = results.get('documents', [[]])[0]
+            metas = results.get('metadatas', [[]])[0]
+
+            for doc, meta in zip(docs, metas):
+                all_contexts.append({
+                    'doc': doc,
+                    'meta': meta,
+                    'source_type': self.SOURCE_KB,
+                    'query': current_query
+                })
+
+            search_duration = (time.time() - search_start) * 1000
+            emit_log("retrieve", {
+                "source": "知识库",
+                "query": current_query,
+                "count": len(docs),
+                "duration_ms": round(search_duration, 0),
+                "phase": "initial_mandatory"
+            })
+
+            if verbose:
+                print(f"   找到 {len(docs)} 个片段")
+
+            # 记录到循环防护
+            if self.loop_guard and docs:
+                from core.confidence_gate import check_confidence
+                gate_result = check_confidence(current_query, docs)
+                self.loop_guard.record_iteration(
+                    query=current_query,
+                    confidence=gate_result.top_score if gate_result else 0.5,
+                    results_count=len(docs)
+                )
+
+        while iteration < max_iterations:
             iteration += 1
             iter_start = time.time()
+
+            # ==================== 循环防护检查 ====================
+            if self.loop_guard:
+                from core.loop_guard import GuardDecision
+                guard_result = self.loop_guard.should_continue()
+                if guard_result.decision != GuardDecision.CONTINUE:
+                    if verbose:
+                        print(f"\n[循环防护] 🛑 {guard_result.decision.value}")
+                        print(f"   原因: {guard_result.reason}")
+                        print(f"   建议: {guard_result.recommendation}")
+                    # 生成当前最佳答案
+                    break
 
             if verbose:
                 print(f"\n--- 第 {iteration} 轮迭代 ---")
@@ -226,14 +495,25 @@ class AgenticRAG:
                     "total_duration_ms": round((time.time() - start_time) * 1000, 0)
                 })
 
+                # ==================== 推理反思 ====================
+                reflection = self._reflect_on_answer(query, answer, all_contexts, verbose)
+
                 sources = self._extract_sources(all_contexts)
+                # 只从相关来源提取图片（传入原始查询以提取特定文件名）
+                source_names = [s.get("source") for s in sources if s.get("source")]
+                rich_media = self._extract_rich_media(all_contexts, sources_filter=source_names, original_query=query)
                 return {
                     "answer": answer,
                     "iterations": iteration,
                     "reasoning": reasoning_trace,
                     "contexts": all_contexts,
                     "sources": sources,
-                    "log_trace": log_trace
+                    "log_trace": log_trace,
+                    "classified": classified.to_dict() if classified else None,
+                    # 富媒体信息
+                    "images": rich_media["images"],
+                    "tables": rich_media["tables"],
+                    "sections": rich_media["sections"]
                 }
 
             elif decision["action"] == "kb_search":
@@ -242,8 +522,14 @@ class AgenticRAG:
                 if verbose:
                     print(f"[知识库检索] {current_query}")
 
-                results = search_knowledge(current_query, top_k=5, allowed_levels=allowed_levels,
-                                           role=role, department=department, collections=collections)
+                # 提取 source_filter（如果是文件特定查询）
+                source_filter = None
+                if classified and hasattr(classified, 'source_filter'):
+                    source_filter = classified.source_filter
+
+                results = get_engine().search_knowledge(current_query, top_k=top_k, allowed_levels=allowed_levels,
+                                           role=role, department=department, collections=collections,
+                                           source_filter=source_filter)
                 docs = results.get('documents', [[]])[0]
                 metas = results.get('metadatas', [[]])[0]
 
@@ -270,6 +556,31 @@ class AgenticRAG:
                 if verbose:
                     print(f"   找到 {len(docs)} 个片段")
 
+                # ==================== 置信度门控检查 ====================
+                gate_result = self._check_confidence_gate(current_query, docs, verbose)
+                if gate_result and gate_result.action.value != "pass":
+                    # 触发补救流程
+                    remediation_result = self._remediation_flow(
+                        query, current_query, all_contexts, gate_result,
+                        allowed_levels, role, department, collections,
+                        verbose, log_trace, emit_log
+                    )
+                    if remediation_result:
+                        return remediation_result
+
+                # ==================== 多维质量评估 ====================
+                quality_assessment = self._assess_quality(current_query, docs, metas, verbose)
+
+                # ==================== 记录迭代信息（循环防护）====================
+                if self.loop_guard and quality_assessment:
+                    from core.confidence_gate import check_confidence
+                    gate_result = check_confidence(current_query, docs)
+                    self.loop_guard.record_iteration(
+                        query=current_query,
+                        confidence=gate_result.top_score if gate_result else 0.5,
+                        results_count=len(docs)
+                    )
+
                 # 评估知识库检索结果是否足够
                 if docs and self._is_kb_result_sufficient(current_query, docs):
                     if verbose:
@@ -293,6 +604,7 @@ class AgenticRAG:
                     continue
 
                 # 检查知识库是否有足够结果
+                kb_count = sum(1 for c in all_contexts if c.get('source_type') == self.SOURCE_KB)
                 if kb_count > 0:
                     # 获取知识库文档内容
                     kb_docs = [c['doc'] for c in all_contexts if c.get('source_type') == self.SOURCE_KB]
@@ -381,7 +693,7 @@ class AgenticRAG:
                     print(f"[分解问题] {len(sub_queries)} 个子问题")
 
                 for sub_q in sub_queries:
-                    results = search_knowledge(sub_q, top_k=3, allowed_levels=allowed_levels,
+                    results = get_engine().search_knowledge(sub_q, top_k=3, allowed_levels=allowed_levels,
                                                 role=role, department=department, collections=collections)
                     docs = results.get('documents', [[]])[0]
                     metas = results.get('metadatas', [[]])[0]
@@ -397,6 +709,9 @@ class AgenticRAG:
         emit_log("max_iterations", {"iterations": iteration})
         answer = self._generate_fused_answer(query, all_contexts, allowed_levels)
         sources = self._extract_sources(all_contexts)
+        # 只从相关来源提取图片（传入原始查询以提取特定文件名）
+        source_names = [s.get("source") for s in sources if s.get("source")]
+        rich_media = self._extract_rich_media(all_contexts, sources_filter=source_names, original_query=query)
 
         emit_log("complete", {
             "total_duration_ms": round((time.time() - start_time) * 1000, 0)
@@ -408,7 +723,85 @@ class AgenticRAG:
             "reasoning": reasoning_trace,
             "contexts": all_contexts,
             "sources": sources,
-            "log_trace": log_trace
+            "log_trace": log_trace,
+            "classified": classified.to_dict() if classified else None,
+            # 富媒体信息
+            "images": rich_media["images"],
+            "tables": rich_media["tables"],
+            "sections": rich_media["sections"]
+        }
+
+    def _web_search_flow(self, query: str, log_trace: list, emit_log, verbose: bool,
+                         classified=None) -> dict:
+        """
+        网络搜索流程
+
+        Args:
+            query: 用户查询
+            log_trace: 日志追踪列表
+            emit_log: 日志发送函数
+            verbose: 是否打印详细过程
+            classified: 分类结果
+
+        Returns:
+            响应字典
+        """
+        import time
+
+        if not self.enable_web_search:
+            # 网络搜索未启用，返回提示
+            return {
+                "answer": "抱歉，网络搜索功能未启用，无法获取实时信息。",
+                "iterations": 0,
+                "reasoning": [{"type": "web_search_disabled"}],
+                "contexts": [],
+                "sources": [],
+                "log_trace": log_trace,
+                "classified": classified.to_dict() if classified else None
+            }
+
+        web_results = self._web_search(query)
+
+        contexts = []
+        for result in web_results:
+            contexts.append({
+                'doc': result['snippet'],
+                'meta': {
+                    'source': result['link'],
+                    'title': result['title'],
+                    'date': result.get('date', '')
+                },
+                'source_type': self.SOURCE_WEB,
+                'query': query
+            })
+
+        emit_log("retrieve", {
+            "source": "网络搜索",
+            "query": query,
+            "count": len(web_results)
+        })
+
+        if verbose:
+            print(f"   找到 {len(web_results)} 条网络结果")
+
+        answer = self._generate_fused_answer(query, contexts)
+        sources = self._extract_sources(contexts)
+        # 只从相关来源提取图片（传入原始查询以提取特定文件名）
+        source_names = [s.get("source") for s in sources if s.get("source")]
+        rich_media = self._extract_rich_media(contexts, sources_filter=source_names, original_query=query)
+
+        return {
+            "answer": answer,
+            "iterations": 1,
+            "reasoning": [{"type": "web_search", "query": query}],
+            "contexts": contexts,
+            "sources": sources,
+            "log_trace": log_trace,
+            "classified": classified.to_dict() if classified else None,
+            # 富媒体信息
+            "images": rich_media["images"],
+            "tables": rich_media["tables"],
+            "sections": rich_media["sections"]
         }
 
     def _extract_sources(self, contexts: list) -> list:
@@ -464,6 +857,173 @@ class AgenticRAG:
 
         return sources
 
+    def _get_images_for_source(self, source: str, collections: list = None) -> list:
+        """
+        直接从向量库获取指定文件的所有图片
+
+        当用户查询特定文件的图片时，直接查询向量库获取该文件的所有图片信息，
+        而不是依赖于检索结果的 contexts。
+
+        Args:
+            source: 文件名（如 "2604.09205v1.pdf"）
+            collections: 要查询的向量库列表（默认为 ['public_kb']）
+
+        Returns:
+            图片信息列表 [{"id": "...", "caption": "...", "url": "...", "page": 1, "source": "..."}]
+        """
+        try:
+            from knowledge.manager import get_kb_manager
+            kb_mgr = get_kb_manager()
+        except ImportError:
+            return []
+
+        images = []
+        seen_ids = set()
+
+        # 确定要查询的向量库
+        target_collections = collections or ['public_kb']
+
+        for kb_name in target_collections:
+            try:
+                coll = kb_mgr.get_collection(kb_name)
+                if not coll:
+                    continue
+
+                # 查询该文件的所有文档
+                result = coll.get(
+                    where={'source': source},
+                    include=['metadatas']
+                )
+
+                for meta in result.get('metadatas', []):
+                    images_json = meta.get('images_json')
+                    if images_json:
+                        try:
+                            imgs = json.loads(images_json)
+                            for img in imgs:
+                                img_id = img.get('id')
+                                if img_id and img_id not in seen_ids:
+                                    seen_ids.add(img_id)
+                                    images.append({
+                                        "id": img_id,
+                                        "caption": img.get("caption", ""),
+                                        "url": f"/images/{img_id}",
+                                        "page": img.get("page") or meta.get("page"),
+                                        "source": source,
+                                        "width": img.get("width"),
+                                        "height": img.get("height")
+                                    })
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+            except Exception as e:
+                print(f"[警告] 从 {kb_name} 获取图片失败: {e}")
+                continue
+
+        return images
+
+    def _extract_rich_media(self, contexts: list, sources_filter: list = None, max_images: int = 10,
+                            original_query: str = None) -> dict:
+        """
+        从检索结果提取富媒体信息
+
+        Args:
+            contexts: 检索上下文列表
+            sources_filter: 来源过滤列表（只返回这些来源的媒体）
+            max_images: 最大返回图片数
+            original_query: 原始用户查询（用于提取特定文件名）
+
+        Returns:
+            {"images": [...], "tables": [...], "sections": [...]}
+        """
+        import json
+        images = []
+        tables = []
+        sections = set()
+        seen_image_ids = set()  # 去重
+
+        # 从用户查询中提取特定文件名（如 "2604.09205v1.pdf中有几张图片"）
+        specific_source = None
+        if original_query:
+            import re
+            # 匹配文件名模式：xxx.pdf, xxx.docx, xxx.xlsx 等
+            file_pattern = r'([^\s，。？!！?？]+?\.(?:pdf|docx?|xlsx?|txt|md))'
+            match = re.search(file_pattern, original_query, re.IGNORECASE)
+            if match:
+                specific_source = match.group(1)
+
+        # 如果用户查询指定了特定文件，优先使用该文件名过滤
+        effective_filter = sources_filter
+        if specific_source:
+            effective_filter = [specific_source]
+
+        # 构建来源过滤集合（支持模糊匹配：source_filter 包含 source 即可）
+        # 例如: "2604.09205v1.pdf (第6页)" 应匹配 "2604.09205v1.pdf"
+        def source_matches(source, filter_list):
+            if not filter_list:
+                return True
+            for f in filter_list:
+                # 双向匹配：filter 包含 source 或 source 包含 filter 的文件名部分
+                # 提取文件名部分（去掉页码等信息）
+                f_clean = f.split('(')[0].strip()
+                if source in f or f_clean in source or source in f_clean:
+                    return True
+            return False
+
+        for ctx in contexts:
+            meta = ctx.get("meta", {})
+            source = meta.get("source", "")
+
+            # 如果有来源过滤，只处理匹配的来源
+            if effective_filter and not source_matches(source, effective_filter):
+                continue
+
+            # 提取图片（支持 images_json 和 images 两种格式）
+            images_data = None
+            if meta.get("images_json"):
+                try:
+                    images_data = json.loads(meta["images_json"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif meta.get("images"):
+                images_data = meta["images"]
+
+            if images_data:
+                for img in images_data:
+                    img_id = img.get("id")
+                    if img_id and img_id not in seen_image_ids:
+                        seen_image_ids.add(img_id)
+                        images.append({
+                            "id": img_id,
+                            "caption": img.get("caption", ""),
+                            "url": f"/images/{img_id}",
+                            "page": meta.get("page"),
+                            "source": meta.get("source"),
+                            "width": img.get("width"),
+                            "height": img.get("height")
+                        })
+
+            # 提取表格
+            if meta.get("is_table") or meta.get("chunk_type") == "table":
+                tables.append({
+                    "id": meta.get("id", ""),
+                    "markdown": ctx.get("doc", "")[:1000],  # 截取部分
+                    "page": meta.get("page"),
+                    "source": meta.get("source")
+                })
+
+            # 提取章节
+            if meta.get("section_path"):
+                sections.add(meta["section_path"])
+
+        # 限制图片数量
+        images = images[:max_images]
+
+        return {
+            "images": images,
+            "tables": tables,
+            "sections": list(sections)
+        }
+
     def _think(self, original_query: str, current_query: str,
                contexts: list, history: list) -> dict:
         """
@@ -489,7 +1049,10 @@ class AgenticRAG:
             "可以查看", "能查看", "有权限", "权限", "能访问", "可以访问",
             "知识库有哪些", "库里有", "文档有哪些", "有哪些文档",
             "系统支持", "系统能", "你能做什么", "你可以做什么",
-            "帮助", "使用说明", "怎么用", "如何使用"
+            "帮助", "使用说明", "怎么用", "如何使用",
+            # 新增：向量库名称相关
+            "public_kb", "dept_tech", "dept_hr", "dept_finance", "dept_operation",
+            "kb里", "向量库", "有哪些库", "库列表", "kb有哪些"
         ]
         is_meta_question = any(kw in current_query for kw in meta_keywords)
 
@@ -631,6 +1194,471 @@ class AgenticRAG:
         query_lower = query.lower()
         return any(kw in query_lower for kw in graph_keywords)
 
+    def _check_confidence_gate(self, query: str, docs: list, verbose: bool = True):
+        """
+        检查检索结果的置信度
+
+        Args:
+            query: 用户查询
+            docs: 检索到的文档列表
+            verbose: 是否打印详细日志
+
+        Returns:
+            GateResult 或 None（如果门控未启用）
+        """
+        if not self.confidence_gate or not docs:
+            return None
+
+        try:
+            gate_result = self.confidence_gate.evaluate(query, docs)
+
+            if verbose:
+                action_emoji = {
+                    "pass": "✅",
+                    "rewrite": "🔄",
+                    "web_search": "🌐",
+                    "fallback": "⚠️"
+                }.get(gate_result.action.value, "❓")
+
+                print(f"   [置信度门控] {action_emoji} {gate_result.action.value}")
+                print(f"      Top-1 分数: {gate_result.top_score:.3f}")
+                print(f"      决策原因: {gate_result.reason}")
+
+            return gate_result
+
+        except Exception as e:
+            if verbose:
+                print(f"   [置信度门控] ⚠️ 评估失败: {e}")
+            return None
+
+    def _assess_quality(self, query: str, docs: list, metas: list = None,
+                        verbose: bool = True):
+        """
+        多维质量评估
+
+        Args:
+            query: 用户查询
+            docs: 检索到的文档列表
+            metas: 文档元数据
+            verbose: 是否打印详细日志
+
+        Returns:
+            QualityAssessment 或 None（如果评估器未启用）
+        """
+        if not self.quality_assessor or not docs:
+            return None
+
+        try:
+            assessment = self.quality_assessor.assess(query, docs, metas)
+
+            if verbose:
+                status = "✅ 达标" if assessment.is_sufficient else "⚠️ 未达标"
+                print(f"   [质量评估] {status}")
+                print(f"      相关性: {assessment.relevance.score}/10")
+                print(f"      完整性: {assessment.completeness.score}/10")
+                print(f"      准确性: {assessment.accuracy.score}/10")
+                print(f"      覆盖率: {assessment.coverage.score}/10")
+                print(f"      总分: {assessment.total_score}/40 (阈值: 32)")
+
+                # 收集各维度的问题
+                all_issues = []
+                for dim in [assessment.relevance, assessment.completeness,
+                           assessment.accuracy, assessment.coverage]:
+                    all_issues.extend(dim.issues or [])
+                if all_issues:
+                    print(f"      问题: {', '.join(all_issues[:3])}")
+
+            return assessment
+
+        except Exception as e:
+            if verbose:
+                print(f"   [质量评估] ⚠️ 评估失败: {e}")
+            return None
+
+    def _reflect_on_answer(self, query: str, answer: str, contexts: list,
+                           verbose: bool = True):
+        """
+        推理反思：检查答案中的未验证声明
+
+        Args:
+            query: 用户查询
+            answer: 生成的答案
+            contexts: 检索上下文
+            verbose: 是否打印详细日志
+
+        Returns:
+            ReflectionResult 或 None
+        """
+        if not self.reasoning_reflector or not answer:
+            return None
+
+        try:
+            # 提取上下文文本
+            context_texts = [c.get('doc', '') for c in contexts if c.get('doc')]
+
+            reflection = self.reasoning_reflector.reflect(query, answer, context_texts)
+
+            if verbose:
+                status = "🔍 需验证" if reflection.has_unverified_claims else "✅ 已验证"
+                print(f"   [推理反思] {status}")
+                print(f"      声明总数: {len(reflection.claims)}")
+                print(f"      未验证声明: {len(reflection.unverified_claims)}")
+                print(f"      总结: {reflection.reflection_summary}")
+
+                if reflection.verification_queries:
+                    print(f"      建议查询: {reflection.verification_queries[0][:50]}...")
+
+            return reflection
+
+        except Exception as e:
+            if verbose:
+                print(f"   [推理反思] ⚠️ 反思失败: {e}")
+            return None
+
+    def _remediation_flow(self, original_query: str, current_query: str,
+                          all_contexts: list, gate_result,
+                          allowed_levels: list, role: str, department: str,
+                          collections: list, verbose: bool, log_trace: list,
+                          emit_log) -> dict:
+        """
+        补救流程：处理低置信度检索结果
+
+        根据门控决策触发不同的补救措施：
+        - REWRITE: 尝试查询重写后重新检索
+        - WEB_SEARCH: 触发网络搜索
+        - FALLBACK: 直接返回降级回答
+
+        Args:
+            original_query: 原始用户查询
+            current_query: 当前处理的查询
+            all_contexts: 已收集的上下文
+            gate_result: 门控评估结果
+            allowed_levels: 允许的权限级别
+            role: 用户角色
+            department: 用户部门
+            collections: 目标向量库列表
+            verbose: 是否打印详细日志
+            log_trace: 日志追踪列表
+            emit_log: 日志发送函数
+
+        Returns:
+            dict: 补救结果（如果有），否则返回 None 继续正常流程
+        """
+        from core.confidence_gate import GateAction
+
+        action = gate_result.action
+        emit_log("remediation", {
+            "action": action.value,
+            "confidence": gate_result.confidence,
+            "reason": gate_result.reason
+        })
+
+        if action == GateAction.WEB_SEARCH:
+            # 触发网络搜索
+            if not self.enable_web_search:
+                if verbose:
+                    print("   [补救] 网络搜索未启用，跳过")
+                return None
+
+            if verbose:
+                print(f"   [补救] 触发网络搜索...")
+
+            search_query = current_query
+            web_results = self._web_search(search_query)
+
+            if web_results:
+                for result in web_results:
+                    all_contexts.append({
+                        'doc': result['snippet'],
+                        'meta': {
+                            'source': result['link'],
+                            'title': result['title'],
+                            'date': result.get('date', '')
+                        },
+                        'source_type': self.SOURCE_WEB,
+                        'query': search_query
+                    })
+
+                if verbose:
+                    print(f"      网络搜索找到 {len(web_results)} 条结果")
+
+                # 返回融合后的结果
+                answer = self._generate_fused_answer(original_query, all_contexts, allowed_levels)
+                sources = self._extract_sources(all_contexts)
+                source_names = [s.get("source") for s in sources if s.get("source")]
+                rich_media = self._extract_rich_media(all_contexts, sources_filter=source_names, original_query=original_query)
+
+                return {
+                    "answer": answer,
+                    "iterations": 1,
+                    "reasoning": [{
+                        "type": "remediation_web_search",
+                        "trigger": gate_result.reason,
+                        "query": search_query,
+                        "results_count": len(web_results)
+                    }],
+                    "contexts": all_contexts,
+                    "sources": sources,
+                    "log_trace": log_trace,
+                    "classified": None,
+                    "images": rich_media["images"],
+                    "tables": rich_media["tables"],
+                    "sections": rich_media["sections"]
+                }
+            else:
+                if verbose:
+                    print("      网络搜索无结果")
+                return None
+
+        elif action == GateAction.REWRITE:
+            # 查询重写（简化实现：提取关键词重新检索）
+            if verbose:
+                print(f"   [补救] 尝试查询重写...")
+
+            # 使用 LLM 重写查询
+            rewritten_query = self._rewrite_query(current_query)
+
+            if rewritten_query and rewritten_query != current_query:
+                if verbose:
+                    print(f"      重写后查询: {rewritten_query}")
+
+                # 重新检索
+                results = get_engine().search_knowledge(
+                    rewritten_query,
+                    top_k=5,
+                    allowed_levels=allowed_levels,
+                    role=role,
+                    department=department,
+                    collections=collections
+                )
+                docs = results.get('documents', [[]])[0]
+                metas = results.get('metadatas', [[]])[0]
+
+                if docs:
+                    # 检查重写后的置信度
+                    new_gate_result = self.confidence_gate.evaluate(rewritten_query, docs)
+
+                    if new_gate_result.top_score > gate_result.top_score:
+                        # 置信度提升，使用新结果
+                        if verbose:
+                            print(f"      置信度提升: {gate_result.top_score:.3f} → {new_gate_result.top_score:.3f}")
+
+                        for doc, meta in zip(docs, metas):
+                            all_contexts.append({
+                                'doc': doc,
+                                'meta': meta,
+                                'source_type': self.SOURCE_KB,
+                                'query': rewritten_query
+                            })
+
+                        # 返回融合后的结果
+                        answer = self._generate_fused_answer(original_query, all_contexts, allowed_levels)
+                        sources = self._extract_sources(all_contexts)
+                        source_names = [s.get("source") for s in sources if s.get("source")]
+                        rich_media = self._extract_rich_media(all_contexts, sources_filter=source_names, original_query=original_query)
+
+                        return {
+                            "answer": answer,
+                            "iterations": 1,
+                            "reasoning": [{
+                                "type": "remediation_rewrite",
+                                "original_query": current_query,
+                                "rewritten_query": rewritten_query,
+                                "confidence_improvement": new_gate_result.top_score - gate_result.top_score
+                            }],
+                            "contexts": all_contexts,
+                            "sources": sources,
+                            "log_trace": log_trace,
+                            "classified": None,
+                            "images": rich_media["images"],
+                            "tables": rich_media["tables"],
+                            "sections": rich_media["sections"]
+                        }
+                    else:
+                        if verbose:
+                            print(f"      置信度未提升，保持原结果")
+
+            return None  # 重写未改善，继续正常流程
+
+        elif action == GateAction.FALLBACK:
+            # 降级处理
+            if verbose:
+                print("   [补救] 无检索结果，返回降级回答")
+
+            return {
+                "answer": "抱歉，我在知识库中没有找到相关信息。请尝试：\n\n"
+                          "1. **换一种方式提问** - 使用更具体的描述\n"
+                          "2. **提供更多上下文** - 告诉我相关的背景信息\n"
+                          "3. **检查关键词** - 确保使用了正确的术语",
+                "iterations": 0,
+                "reasoning": [{
+                    "type": "fallback",
+                    "reason": gate_result.reason
+                }],
+                "contexts": [],
+                "sources": [],
+                "log_trace": log_trace,
+                "classified": None,
+                "images": [],
+                "tables": [],
+                "sections": []
+            }
+
+        return None  # 默认继续正常流程
+
+    def _rewrite_query(self, query: str, history: list = None,
+                       strategy: str = "professional") -> str:
+        """
+        增强版查询重写：将口语化表达转为专业术语
+
+        Args:
+            query: 原始查询
+            history: 对话历史（用于实体补全）
+            strategy: 重写策略
+                - professional: 口语化→专业术语
+                - expand: 扩展关键词
+                - clarify: 消歧义
+                - entity: 实体补全
+
+        Returns:
+            str: 重写后的查询
+        """
+        # 尝试多种策略组合
+        rewritten = query
+
+        # 策略1: 口语化→专业术语映射
+        if strategy in ["professional", "all"]:
+            rewritten = self._apply_professional_mapping(rewritten)
+
+        # 策略2: 实体补全（利用对话历史）
+        if strategy in ["entity", "all"] and history:
+            rewritten = self._complete_entities(rewritten, history)
+
+        # 策略3: LLM 深度重写（仅在需要时调用）
+        if strategy in ["professional", "all"]:
+            llm_rewritten = self._llm_rewrite(rewritten)
+            if llm_rewritten and len(llm_rewritten) > len(rewritten) * 0.5:
+                rewritten = llm_rewritten
+
+        return rewritten
+
+    def _apply_professional_mapping(self, query: str) -> str:
+        """
+        应用口语化→专业术语映射
+
+        常见的企业文档场景术语映射
+        """
+        # 术语映射表（可根据实际场景扩展）
+        TERM_MAPPING = {
+            # 通用业务术语
+            "报销": "差旅报销 费用报销 报销审批",
+            "请假": "休假申请 请假审批 考勤管理",
+            "加班": "加班申请 工时管理 加班审批",
+            "工资": "薪酬管理 工资发放 薪资结构",
+            "合同": "合同管理 合同签署 合同审批",
+            "流程": "审批流程 业务流程 工作流",
+            "制度": "管理制度 规章制度 企业规范",
+            "规定": "管理规定 制度规定 政策要求",
+
+            # 时间相关
+            "几天": "时限 审批时限 办理时限",
+            "多久": "处理时效 审批周期 办理周期",
+
+            # 数量相关
+            "多少": "标准 额度 限额 标准",
+            "能不能": "是否允许 是否可以 权限",
+
+            # 部门相关
+            "人事": "人力资源 HR 人力部门",
+            "财务": "财务部 财务部门 财务管理",
+            "技术": "技术部 研发部 IT部门",
+        }
+
+        result = query
+        for colloquial, professional in TERM_MAPPING.items():
+            if colloquial in query:
+                # 不替换，而是扩展
+                result = result.replace(colloquial, f"{colloquial} {professional.split()[0]}")
+
+        return result
+
+    def _complete_entities(self, query: str, history: list) -> str:
+        """
+        实体补全：利用对话历史补充缺失的实体
+
+        例如：
+        - 用户："标准是多少？"（缺少主语）
+        - 上一轮："出差报销有什么规定？"
+        - 补全后："出差报销标准是多少？"
+        """
+        if not history:
+            return query
+
+        # 获取最近用户消息
+        last_user_msg = None
+        for msg in reversed(history):
+            if msg.get("role") == "user":
+                last_user_msg = msg.get("content", "")
+                break
+
+        if not last_user_msg:
+            return query
+
+        # 检查当前查询是否缺少主语
+        BUSINESS_KEYWORDS = ["报销", "出差", "请假", "工资", "合同", "审批", "流程",
+                           "制度", "规定", "标准", "金额", "时间"]
+
+        has_subject = any(kw in query for kw in BUSINESS_KEYWORDS)
+
+        if not has_subject:
+            # 从上一轮提取实体
+            try:
+                import jieba
+                entities = []
+                for word in jieba.cut(last_user_msg):
+                    word = word.strip()
+                    if len(word) >= 2 and any(kw in word for kw in BUSINESS_KEYWORDS):
+                        entities.append(word)
+
+                if entities:
+                    # 补全实体
+                    return f"{entities[0]} {query}"
+            except ImportError:
+                pass
+
+        return query
+
+    def _llm_rewrite(self, query: str) -> str:
+        """
+        使用 LLM 进行深度查询重写
+        """
+        try:
+            prompt = f"""请将以下用户查询重写为更专业、更精确的搜索查询。
+
+原始查询: {query}
+
+重写要求:
+1. 保留核心意图
+2. 使用专业术语替换口语化表达
+3. 补充可能遗漏的关键词
+4. 保持简洁，不要添加解释
+
+请直接输出重写后的查询，不要有任何前缀或解释。"""
+
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=100
+            )
+
+            rewritten = response.choices[0].message.content.strip()
+            return rewritten
+
+        except Exception as e:
+            print(f"[警告] LLM 查询重写失败: {e}")
+            return query
+
     def _is_kb_result_sufficient(self, query: str, docs: list) -> bool:
         """
         评估知识库检索结果是否足够回答问题
@@ -700,7 +1728,10 @@ class AgenticRAG:
             "知识库有哪些", "库里有", "文档有哪些", "有哪些文档",
             "有什么文档", "有什么文件", "包含什么", "包含哪些",
             "你知道什么", "你都知道", "你能回答什么",
-            "系统里有什么", "库里有什么"
+            "系统里有什么", "库里有什么",
+            # 新增：向量库名称相关
+            "public_kb", "dept_tech", "dept_hr", "dept_finance", "dept_operation",
+            "kb里", "向量库", "有哪些库", "库列表", "kb有哪些"
         ]
         query_lower = query.lower()
         return any(kw in query_lower for kw in meta_patterns)
@@ -760,7 +1791,7 @@ class AgenticRAG:
 
             except ImportError:
                 # 降级：单向量库模式
-                all_docs = collection.get(include=['metadatas'])
+                all_docs = get_engine().collection.get(include=['metadatas'])
                 for meta in all_docs.get('metadatas', []):
                     source = meta.get('source', '未知')
                     level = meta.get('security_level', 'public')
@@ -937,7 +1968,7 @@ class AgenticRAG:
             kb_docs = [c['doc'] for c in kb_contexts]
             if not self._is_kb_result_sufficient(query, kb_docs):
                 # 结果不够相关，检查是否存在权限限制的文档
-                restricted_info = check_restricted_documents(query, allowed_levels)
+                restricted_info = get_engine().check_restricted_documents(query, allowed_levels)
                 if restricted_info.get("has_restricted"):
                     # 存在超出权限的相关文档，在回答中添加提示
                     levels_str = "、".join(restricted_info["restricted_levels"])
@@ -1100,7 +2131,7 @@ class AgenticRAG:
         # 检测是否存在超出权限的相关文档
         restricted_info = None
         if allowed_levels:
-            restricted_info = check_restricted_documents(query, allowed_levels)
+            restricted_info = get_engine().check_restricted_documents(query, allowed_levels)
 
         # 如果存在超出权限的相关文档，给出明确提示
         if restricted_info and restricted_info.get("has_restricted"):
@@ -1220,10 +2251,17 @@ class AgenticRAG:
             answer = self._direct_answer(query, history)
 
         sources = self._extract_sources(contexts)
+        # 只从相关来源提取图片（传入原始查询以提取特定文件名）
+        source_names = [s.get("source") for s in sources if s.get("source")]
+        rich_media = self._extract_rich_media(contexts, sources_filter=source_names, original_query=query)
         return {
             "answer": answer,
             "sources": sources,
-            "web_searched": need_web
+            "web_searched": need_web,
+            # 富媒体信息
+            "images": rich_media["images"],
+            "tables": rich_media["tables"],
+            "sections": rich_media["sections"]
         }
 
     def _should_web_search(self, query: str) -> bool:
@@ -1373,7 +2411,7 @@ def simple_query(query: str, history: list = None) -> dict:
 
 def main():
     """主函数"""
-    if collection.count() == 0:
+    if get_engine().collection.count() == 0:
         print("[错误] 知识库为空，请先运行: python rag_demo.py --rebuild")
         return
 

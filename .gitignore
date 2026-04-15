@@ -1,5 +1,6 @@
 # 敏感配置文件
 config.py
+.env
 
 # 模型文件（需单独下载）
 models/
@@ -67,3 +68,4 @@ docs/superpowers/
 # 以下为v5.0.0新增忽略：多向量库存储及SQLite数据
 data/
 vector_store/
+knowledge/vector_store/

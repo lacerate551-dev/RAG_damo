@@ -51,7 +51,16 @@
 
 ### 开发模式
 
-设置环境变量 `DEV_MODE=true` 后，不传 Header 会自动使用默认测试用户（admin/开发部）。
+设置环境变量 `DEV_MODE=true` 后：
+- 不传 Header 会自动使用默认测试用户（admin/开发部）
+- 支持通过 `Authorization: Bearer mock-token-<username>` 模拟登录
+
+**测试账号**：
+| 用户名 | 密码 | 角色 | 部门 |
+|---|---|---|---|
+| admin | admin123 | admin | 管理部 |
+| testuser | test123 | user | 技术部 |
+| manager | manager123 | manager | 财务部 |
 
 ### 认证失败响应
 
@@ -145,7 +154,7 @@ curl http://localhost:5001/auth/me \
 
 ### 2.3 `GET /stats` — 系统统计信息
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **权限**: 仅 `admin`
 
 **curl 示例**:
@@ -171,7 +180,7 @@ curl http://localhost:5001/stats \
 
 ### 3.1 `POST /chat` — 普通聊天
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **说明**: 直接使用 LLM 回复，支持网络搜索，速度快
 
 **请求体**:
@@ -219,7 +228,7 @@ curl -X POST http://localhost:5001/chat \
 
 ### 3.2 `POST /rag` — 知识库问答
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **说明**: 使用 Agentic RAG 从知识库检索回答，支持基于角色的权限过滤
 
 **请求体**:
@@ -269,8 +278,8 @@ curl -X POST http://localhost:5001/rag \
 
 ### 3.3 `POST /rag/stream` — 知识库问答（SSE 流式）
 
-> **认证**: ✅ 需要  
-> **说明**: Server-Sent Events 流式返回，包含决策过程、检索过程、最终结果  
+> **认证**: ✅ 需要
+> **说明**: Server-Sent Events 流式返回，包含决策过程、检索过程、最终结果
 > **Content-Type**: `text/event-stream`
 
 **请求体**: 与 `/rag` 相同
@@ -294,30 +303,53 @@ curl -N -X POST http://localhost:5001/rag/stream \
 **SSE 流返回**（每行以 `data: ` 开头）:
 
 ```
-data: {"type": "decision", "message": "正在分析问题意图..."}
+data: {"type": "connected", "message": "开始处理..."}
 
-data: {"type": "retrieve", "message": "正在检索知识库...", "collections": ["public_kb"]}
+data: {"type": "start", "query": "出差报销标准是什么？", "timestamp": 0.0}
 
-data: {"type": "answer", "message": "正在生成回答..."}
+data: {"type": "decision", "action": "kb_search", "reason": "首次检索知识库", "iteration": 1, "duration_ms": 500, "timestamp": 0.5}
 
-data: {"type": "result", "session_id": "abc123", "answer": "根据公司制度...", "mode": "rag", "sources": [...], "log_trace": [...]}
+data: {"type": "rewrite", "old_query": "出差报销", "new_query": "差旅费报销标准", "timestamp": 0.6}
+
+data: {"type": "decompose", "sub_queries": ["出差交通费标准", "出差住宿费标准", "出差餐费标准"], "timestamp": 0.7}
+
+data: {"type": "retrieve", "source": "知识库", "query": "出差报销标准", "count": 5, "duration_ms": 200, "snippets": [...], "timestamp": 0.7}
+
+data: {"type": "answer", "duration_ms": 1500, "timestamp": 2.2}
+
+data: {"type": "result", "session_id": "550e8400-e29b-41d4-a716-446655440000", "answer": "根据公司规定...", "mode": "rag", "sources": [...], "log_trace": [...]}
 ```
 
 **SSE 事件类型**:
 
-| type | 说明 | 附加字段 |
+| type | 说明 | 关键字段 |
 |---|---|---|
-| `decision` | 决策阶段 | `message` |
-| `retrieve` | 检索阶段 | `message`, `collections` |
-| `answer` | 生成回答阶段 | `message` |
-| `result` | 最终结果 | `session_id`, `answer`, `mode`, `sources`, `log_trace` |
+| `connected` | 连接建立 | `message` |
+| `start` | 开始处理 | `query`, `timestamp` |
+| `decision` | Agent 决策 | `action`, `reason`, `iteration`, `duration_ms` |
+| `rewrite` | 查询重写 | `old_query`, `new_query` |
+| `decompose` | 问题分解 | `sub_queries` |
+| `retrieve` | 检索结果 | `source`, `query`, `count`, `snippets` |
+| `answer` | 生成答案中 | `duration_ms` |
+| `result` | 最终结果 | `session_id`, `answer`, `sources`, `log_trace` |
 | `error` | 错误 | `message` |
+
+**决策动作说明**:
+
+| action | 说明 |
+|---|---|
+| `kb_search` | 知识库检索 |
+| `web_search` | 网络搜索 |
+| `graph_search` | 知识图谱检索 |
+| `answer` | 生成答案 |
+| `rewrite` | 重写查询 |
+| `decompose` | 分解问题 |
 
 ---
 
 ### 3.4 `POST /search` — 混合检索（供 Dify 调用）
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **说明**: 混合检索接口（向量检索 + BM25 + Rerank），供 Dify 工作流调用
 
 **请求体**:
@@ -399,7 +431,7 @@ curl http://localhost:5001/sessions \
 
 ### 4.2 `GET /history/<session_id>` — 获取会话历史
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **限制**: 只能查看自己的会话
 
 **curl 示例**:
@@ -438,7 +470,7 @@ curl http://localhost:5001/history/a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
 
 ### 4.3 `DELETE /session/<session_id>` — 删除会话
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **限制**: 只能删除自己的会话
 
 **curl 示例**:
@@ -460,7 +492,7 @@ curl -X DELETE http://localhost:5001/session/a1b2c3d4-e5f6-7890-abcd-ef123456789
 
 ### 4.4 `POST /clear/<session_id>` — 清空会话历史
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **说明**: 保留会话但清空所有消息记录
 
 **curl 示例**:
@@ -484,7 +516,7 @@ curl -X POST http://localhost:5001/clear/a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
 
 ### 5.1 `GET /collections` — 获取向量库列表
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **说明**: 仅返回当前用户有权限访问的向量库
 
 **curl 示例**:
@@ -530,7 +562,7 @@ curl http://localhost:5001/collections \
 
 ### 5.2 `POST /collections` — 创建向量库
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **权限**: 仅 `admin`
 
 **请求体**:
@@ -580,7 +612,7 @@ curl -X POST http://localhost:5001/collections \
 
 ### 5.3 `DELETE /collections/<kb_name>` — 删除向量库
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **权限**: 仅 `admin`
 
 **curl 示例**:
@@ -602,7 +634,7 @@ curl -X DELETE http://localhost:5001/collections/dept_marketing \
 
 ### 5.4 `GET /collections/<kb_name>/documents` — 获取向量库文档列表
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **权限**: 需要读权限
 
 **curl 示例**:
@@ -632,7 +664,7 @@ curl http://localhost:5001/collections/public_kb/documents \
 
 ### 5.5 `POST /documents/sync` — 触发文档向量化同步
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **权限**: `admin` 可同步所有；`manager` 仅本部门
 
 **请求体** (可选):
@@ -717,9 +749,9 @@ curl -X POST http://localhost:5001/kb/route \
 
 ### 6.1 `POST /documents/upload` — 上传文件
 
-> **认证**: ✅ 需要  
-> **权限**: `admin` 所有库；`manager` 本部门库；`user` 无权限  
-> **Content-Type**: `multipart/form-data`  
+> **认证**: ✅ 需要
+> **权限**: `admin` 所有库；`manager` 本部门库；`user` 无权限
+> **Content-Type**: `multipart/form-data`
 > **文件限制**: pdf/docx/doc/xlsx/txt，最大 10MB
 
 **curl 示例**:
@@ -756,7 +788,7 @@ curl -X POST http://localhost:5001/documents/upload \
 
 ### 6.2 `GET /documents/list` — 获取文档列表
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **参数**: `collection` 过滤向量库（可选）
 
 **curl 示例**:
@@ -800,8 +832,8 @@ curl "http://localhost:5001/documents/list?collection=public_kb" \
 
 ### 6.3 `DELETE /documents/<path:doc_path>` — 删除文档
 
-> **认证**: ✅ 需要  
-> **权限**: `admin` 所有；`manager` 本部门；`user` 无权限  
+> **认证**: ✅ 需要
+> **权限**: `admin` 所有；`manager` 本部门；`user` 无权限
 > **路径参数**: `doc_path` 格式为 `子目录/文件名`
 
 **curl 示例**:
@@ -832,7 +864,7 @@ curl -X DELETE http://localhost:5001/documents/public/old_policy.pdf \
 
 ### 7.1 `POST /sync` — 手动触发同步
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **权限**: 仅 `admin`
 
 **请求体** (可选):
@@ -980,7 +1012,7 @@ curl "http://localhost:5001/sync/changes?processed=false&limit=20" \
 
 ### 7.5 `POST /sync/start` — 启动文件监控
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **权限**: 仅 `admin`
 
 **curl 示例**:
@@ -1001,7 +1033,7 @@ curl -X POST http://localhost:5001/sync/start \
 
 ### 7.6 `POST /sync/stop` — 停止文件监控
 
-> **认证**: ✅ 需要  
+> **认证**: ✅ 需要
 > **权限**: 仅 `admin`
 
 **curl 示例**:
@@ -1204,12 +1236,32 @@ curl -X POST http://localhost:5001/notifications/read-all \
 
 ## 9. 出题系统
 
-> **前缀**: `/exam`  
+> **前缀**: `/exam`
 > **认证**: 出题系统使用 **JWT Bearer Token**（与主系统的 Header 认证不同）
-> 
+>
 > ```
 > Authorization: Bearer <jwt_token>
 > ```
+
+### 试卷状态流程
+
+```
+生成试卷 → draft (草稿)
+     ↓
+提交审核 → pending_review (待审核)
+     ↓
+管理员审核 → approved (通过) / rejected (驳回)
+     ↓
+学生答题 → 批阅 → 生成报告
+```
+
+**状态说明**：
+| 状态 | 说明 | 可见范围 |
+|---|---|---|
+| `draft` | 草稿，刚生成尚未提交审核 | 创建者可见 |
+| `pending_review` | 待审核，已提交等待管理员审核 | 管理员可见 |
+| `approved` | 已通过，可用于学生答题 | 所有用户可见 |
+| `rejected` | 已驳回，不可使用 | 创建者可见 |
 
 ### 9.1 `POST /exam/generate` — 生成试卷
 
@@ -1407,7 +1459,7 @@ curl -X POST http://localhost:5001/exam/e1a2b3c4-.../submit \
 
 ### 9.7 `POST /exam/<exam_id>/review` — 审核试卷
 
-> **认证**: ✅ Bearer Token  
+> **认证**: ✅ Bearer Token
 > **权限**: 仅 `admin`
 
 **整体审核**:
@@ -1457,7 +1509,7 @@ curl -X POST http://localhost:5001/exam/e1a2b3c4-.../review \
 
 ### 9.8 `POST /exam/<exam_id>/grade` — 批阅试卷
 
-> **认证**: ✅ Bearer Token  
+> **认证**: ✅ Bearer Token
 > **前提**: 试卷状态必须为 `approved`
 
 **请求体**:
@@ -1955,7 +2007,7 @@ curl "http://localhost:5001/knowledge-points?category=安全" \
 
 ### 12.1 `POST /documents/<collection>/<path:doc_path>/deprecate` — 废止文档
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: `admin` 或 `manager`（本部门）
 
 **请求体**:
@@ -1990,7 +2042,7 @@ curl -X POST http://localhost:5001/documents/public_kb/old_policy.pdf/deprecate 
 
 ### 12.2 `POST /documents/<collection>/<path:doc_path>/restore` — 恢复文档
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: `admin` 或 `manager`（本部门）
 
 **curl 示例**:
@@ -2015,7 +2067,7 @@ curl -X POST http://localhost:5001/documents/public_kb/old_policy.pdf/restore \
 
 ### 12.3 `GET /documents/<collection>/<path:doc_path>/versions` — 版本历史
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: 需要读权限
 
 | 参数 | 类型 | 必需 | 说明 |
@@ -2059,7 +2111,7 @@ curl "http://localhost:5001/documents/public_kb/员工手册_v2.pdf/versions?lim
 
 ### 12.4 `GET /documents/<collection>/<path:doc_path>/info` — 文档状态信息
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: 需要读权限
 
 **curl 示例**:
@@ -2123,7 +2175,7 @@ curl "http://localhost:5001/documents/deprecated?collection=public_kb" \
 
 ### 12.6 `POST /search/version-aware` — 版本感知检索
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **说明**: 自动过滤废止版本，返回相关废止提示
 
 **请求体**:
@@ -2178,7 +2230,7 @@ curl -X POST http://localhost:5001/search/version-aware \
 
 ### 12.7 `POST /documents/<collection>/<path:doc_path>/diff` — 版本差异对比
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: 需要读权限
 
 **请求体**:
@@ -2319,7 +2371,7 @@ curl "http://localhost:5001/outline/员工手册_v2.pdf/export?format=markdown" 
 
 ### 13.4 `DELETE /outline/<document_id>` — 删除纲要缓存
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: 仅 `admin`
 
 **返回** (200):
@@ -2428,7 +2480,7 @@ curl "http://localhost:5001/recommend/员工手册_v2.pdf?top_k=5" \
 
 ### 14.2 `POST /recommend/compute-vectors` — 计算所有文档向量
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: 仅 `admin`
 
 **curl 示例**:
@@ -2486,6 +2538,8 @@ curl -X POST http://localhost:5001/recommend/compute-vectors \
   "suggestion_id": 15
 }
 ```
+
+**说明**: 如果正面反馈且问题出现多次，系统会自动建议沉淀为 FAQ。
 
 ---
 
@@ -2626,7 +2680,7 @@ curl "http://localhost:5001/faq?limit=20" \
 
 ### 16.2 `POST /faq` — 新增 FAQ
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: 仅 `admin`
 
 **请求体**:
@@ -2659,7 +2713,7 @@ curl "http://localhost:5001/faq?limit=20" \
 
 ### 16.3 `PUT /faq/<faq_id>` — 更新 FAQ
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: 仅 `admin`
 
 **请求体** (部分更新):
@@ -2682,7 +2736,7 @@ curl "http://localhost:5001/faq?limit=20" \
 
 ### 16.4 `DELETE /faq/<faq_id>` — 删除 FAQ
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: 仅 `admin`
 
 **返回** (200):
@@ -2697,7 +2751,7 @@ curl "http://localhost:5001/faq?limit=20" \
 
 ### 16.5 `GET /faq/suggestions` — FAQ 建议列表
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: 仅 `admin`
 
 | 参数 | 类型 | 必需 | 说明 |
@@ -2726,7 +2780,7 @@ curl "http://localhost:5001/faq?limit=20" \
 
 ### 16.6 `POST /faq/suggestions/<suggestion_id>/approve` — 批准建议
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: 仅 `admin`
 
 **curl 示例**:
@@ -2749,7 +2803,7 @@ curl -X POST http://localhost:5001/faq/suggestions/15/approve \
 
 ### 16.7 `POST /faq/suggestions/<suggestion_id>/reject` — 拒绝建议
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: 仅 `admin`
 
 **返回** (200):
@@ -2766,7 +2820,7 @@ curl -X POST http://localhost:5001/faq/suggestions/15/approve \
 
 ### 17.1 `GET /audit/logs` — 获取审计日志
 
-> **认证**: ✅ Header 认证  
+> **认证**: ✅ Header 认证
 > **权限**: 仅 `admin`
 
 | 参数 | 类型 | 必需 | 说明 |
@@ -2907,3 +2961,15 @@ curl "http://localhost:5001/audit/logs?action=rag_query&limit=50" \
 | `GET` | `/audit/logs` | ✅ | admin | 审计日志 |
 
 > **说明**: ✅ = Header 认证, JWT = Bearer Token 认证, all = 所有已认证用户, owner = 仅会话所有者, read = 需要读权限, admin/mgr = admin 或 manager
+
+---
+
+## 更新日志
+
+| 日期 | 版本 | 更新内容 |
+|---|---|---|
+| 2026-04-13 | 3.0 | 合并 `api_documentation.md` 和 `API对接文档.md`，补充 SSE 事件类型详情和试卷状态流程说明 |
+| 2026-04-10 | 2.1 | 完善出题系统状态流程说明，明确 draft → pending_review → approved/rejected 流程 |
+| 2026-04-07 | 2.0 | 新增知识库同步、订阅通知、题库维护、整卷分析、纲要生成、关联推荐、问答质量闭环 API |
+| 2024-04-03 | 1.1 | 出题系统：添加试卷名称字段、完善审核流程说明 |
+| 2024-04-02 | 1.0 | 初始版本 |

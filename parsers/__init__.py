@@ -1,4 +1,4 @@
-"""
+﻿"""
 文档解析器模块
 
 包含：
@@ -38,13 +38,50 @@ try:
 except ImportError:
     EXCEL_ENHANCED_AVAILABLE = False
 
+# 图片提取模块
+try:
+    from parsers.image_extractor import (
+        extract_images_from_pdf,
+        extract_images_batch,
+        enrich_chunks_with_images,
+        get_images_base_path,
+        ImageInfo
+    )
+    IMAGE_EXTRACTOR_AVAILABLE = True
+except ImportError:
+    IMAGE_EXTRACTOR_AVAILABLE = False
 
-def extract_text_from_pdf(filepath, use_odl=True, odl_use_struct_tree=True, odl_use_hybrid=False):
+
+def extract_text_from_pdf(filepath, use_odl=True, odl_use_struct_tree=True, odl_use_hybrid=True,
+                          extract_images=True, images_output_dir=None):
     """
     从PDF提取文本 - 统一入口
 
     优先使用 OpenDataLoader，回退到 pdfplumber。
+
+    Args:
+        filepath: PDF 文件路径
+        use_odl: 是否使用 OpenDataLoader 解析器
+        odl_use_struct_tree: 是否使用 PDF 结构树
+        odl_use_hybrid: 是否使用混合模式
+        extract_images: 是否提取图片
+        images_output_dir: 图片输出目录
+
+    Returns:
+        [{'text': ..., 'page': ..., 'images': [...], ...}, ...]
     """
+    images_info = []
+
+    # 提取图片（如果启用）
+    if extract_images and IMAGE_EXTRACTOR_AVAILABLE:
+        try:
+            from parsers.image_extractor import extract_images_from_pdf, get_images_base_path
+            img_output = images_output_dir or get_images_base_path()
+            images_info = extract_images_from_pdf(filepath, img_output)
+            print(f"      提取到 {len(images_info)} 张图片")
+        except Exception as e:
+            print(f"      图片提取失败: {e}")
+
     if use_odl and ODL_AVAILABLE:
         try:
             from parsers.pdf_odl import parse_pdf_with_odl
@@ -55,6 +92,19 @@ def extract_text_from_pdf(filepath, use_odl=True, odl_use_struct_tree=True, odl_
             )
             pages_content = []
             for chunk in result['chunks']:
+                # 获取该分块关联的图片
+                chunk_images = []
+                if images_info:
+                    for img in images_info:
+                        if chunk.page_start <= img.page <= chunk.page_end:
+                            chunk_images.append({
+                                'id': img.image_id,
+                                'caption': img.caption,
+                                'page': img.page,
+                                'width': img.width,
+                                'height': img.height
+                            })
+
                 pages_content.append({
                     'text': chunk.content,
                     'page': chunk.page_start,
@@ -65,15 +115,17 @@ def extract_text_from_pdf(filepath, use_odl=True, odl_use_struct_tree=True, odl_
                     'level': chunk.level,
                     'bbox': chunk.bbox,
                     'source_file': chunk.source_file,
+                    'images': chunk_images,
                     'is_odl_chunk': True
                 })
             if pages_content:
-                return pages_content
+                return pages_content, images_info
             print(f"      OpenDataLoader 未提取到内容，回退到 pdfplumber: {filepath}")
         except Exception as e:
             print(f"      OpenDataLoader 解析错误，回退到 pdfplumber: {e}")
 
-    return extract_text_from_pdf_plumber(filepath)
+    # pdfplumber 回退（不支持图片）
+    return extract_text_from_pdf_plumber(filepath), images_info
 
 
 def extract_text_from_docx(filepath, use_docling=True):

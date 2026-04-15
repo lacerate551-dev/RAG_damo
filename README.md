@@ -51,9 +51,10 @@
 RAG_damo/
 ├── models/                    # 模型目录（需手动下载/配置）
 ├── documents/                 # 知识库文档源目录
-├── vector_store/              # Chroma与BM25多向量/索引存储
-│   ├── chroma/                # public_kb与dept_xxx隔离存储
-│   └── bm25/                  # 各库的独立BM25缓存
+├── knowledge/                 # 知识库管理模块
+│   └── vector_store/          # Chroma与BM25多向量/索引存储
+│       ├── chroma/            # public_kb与dept_xxx隔离存储
+│       └── bm25/              # 各库的独立BM25缓存
 ├── data/                      # SQLite本地业务数据库
 │   ├── sessions.db            # 会话管理及审计日志
 │   ├── exam_local.db          # 本地试卷题库

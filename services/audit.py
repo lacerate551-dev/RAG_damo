@@ -15,58 +15,19 @@
     logs = logger.get_user_logs(user_id)
 """
 
-import sqlite3
 import json
 from datetime import datetime
 from typing import Optional, List, Dict
+
+from data.db import get_connection
 
 
 class AuditLogger:
     """审计日志记录器"""
 
-    def __init__(self, db_path: str = "./data/sessions.db"):
-        self.db_path = db_path
-        self._init_db()
-
-    def _init_db(self):
-        """初始化审计日志表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS audit_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                username TEXT DEFAULT '',
-                action TEXT NOT NULL,
-                query TEXT,
-                result_summary TEXT,
-                sources TEXT,
-                role TEXT,
-                department TEXT,
-                ip_address TEXT,
-                duration_ms INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_audit_user
-            ON audit_logs(user_id, created_at)
-        ''')
-
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_audit_action
-            ON audit_logs(action, created_at)
-        ''')
-
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_audit_created
-            ON audit_logs(created_at)
-        ''')
-
-        conn.commit()
-        conn.close()
+    def __init__(self):
+        from data.db import init_databases
+        init_databases()
 
     def log(self, user_id: str, action: str, resource: str = "",
             details: Dict = None, username: str = "", role: str = "",
@@ -89,22 +50,21 @@ class AuditLogger:
         """
         details_json = json.dumps(details or {}, ensure_ascii=False)[:2000]
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            INSERT INTO audit_logs
-            (user_id, username, action, query, result_summary, sources,
-             role, department, ip_address, duration_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            user_id, username, action, resource, "", details_json,
-            role, department, ip_address, 0
-        ))
+            cursor.execute('''
+                INSERT INTO audit_logs
+                (user_id, username, action, query, result_summary, sources,
+                 role, department, ip_address, duration_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id, username, action, resource, "", details_json,
+                role, department, ip_address, 0
+            ))
 
-        log_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+            log_id = cursor.lastrowid
+
         return log_id
 
     def log_query(self, user_id: str, query: str,
@@ -134,138 +94,132 @@ class AuditLogger:
         summary = (result_summary[:500] + "...") if len(result_summary) > 500 else result_summary
         sources_json = json.dumps(sources or [], ensure_ascii=False)[:2000]
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            INSERT INTO audit_logs
-            (user_id, username, action, query, result_summary, sources,
-             role, department, ip_address, duration_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            user_id, username, action, query, summary, sources_json,
-            role, department, ip_address, duration_ms
-        ))
+            cursor.execute('''
+                INSERT INTO audit_logs
+                (user_id, username, action, query, result_summary, sources,
+                 role, department, ip_address, duration_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id, username, action, query, summary, sources_json,
+                role, department, ip_address, duration_ms
+            ))
 
-        log_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+            log_id = cursor.lastrowid
+
         return log_id
 
     def get_user_logs(self, user_id: str, limit: int = 50,
                       offset: int = 0) -> List[Dict]:
         """获取用户的操作日志"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            SELECT id, user_id, username, action, query, result_summary,
-                   sources, role, department, ip_address, duration_ms, created_at
-            FROM audit_logs
-            WHERE user_id = ?
-            ORDER BY created_at DESC
-            LIMIT ? OFFSET ?
-        ''', (user_id, limit, offset))
+            cursor.execute('''
+                SELECT id, user_id, username, action, query, result_summary,
+                       sources, role, department, ip_address, duration_ms, created_at
+                FROM audit_logs
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+            ''', (user_id, limit, offset))
 
-        rows = cursor.fetchall()
-        conn.close()
+            rows = cursor.fetchall()
 
         return [self._row_to_dict(r) for r in rows]
 
     def get_recent_logs(self, limit: int = 100, action: str = None) -> List[Dict]:
         """获取最近的操作日志"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        if action:
-            cursor.execute('''
-                SELECT id, user_id, username, action, query, result_summary,
-                       sources, role, department, ip_address, duration_ms, created_at
-                FROM audit_logs
-                WHERE action = ?
-                ORDER BY created_at DESC
-                LIMIT ?
-            ''', (action, limit))
-        else:
-            cursor.execute('''
-                SELECT id, user_id, username, action, query, result_summary,
-                       sources, role, department, ip_address, duration_ms, created_at
-                FROM audit_logs
-                ORDER BY created_at DESC
-                LIMIT ?
-            ''', (limit,))
+            if action:
+                cursor.execute('''
+                    SELECT id, user_id, username, action, query, result_summary,
+                           sources, role, department, ip_address, duration_ms, created_at
+                    FROM audit_logs
+                    WHERE action = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                ''', (action, limit))
+            else:
+                cursor.execute('''
+                    SELECT id, user_id, username, action, query, result_summary,
+                           sources, role, department, ip_address, duration_ms, created_at
+                    FROM audit_logs
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                ''', (limit,))
 
-        rows = cursor.fetchall()
-        conn.close()
+            rows = cursor.fetchall()
 
         return [self._row_to_dict(r) for r in rows]
 
     def get_logs_by_date_range(self, start_date: str, end_date: str,
                                user_id: str = None) -> List[Dict]:
         """按日期范围查询日志"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        if user_id:
-            cursor.execute('''
-                SELECT id, user_id, username, action, query, result_summary,
-                       sources, role, department, ip_address, duration_ms, created_at
-                FROM audit_logs
-                WHERE created_at BETWEEN ? AND ? AND user_id = ?
-                ORDER BY created_at DESC
-            ''', (start_date, end_date, user_id))
-        else:
-            cursor.execute('''
-                SELECT id, user_id, username, action, query, result_summary,
-                       sources, role, department, ip_address, duration_ms, created_at
-                FROM audit_logs
-                WHERE created_at BETWEEN ? AND ?
-                ORDER BY created_at DESC
-            ''', (start_date, end_date))
+            if user_id:
+                cursor.execute('''
+                    SELECT id, user_id, username, action, query, result_summary,
+                           sources, role, department, ip_address, duration_ms, created_at
+                    FROM audit_logs
+                    WHERE created_at BETWEEN ? AND ? AND user_id = ?
+                    ORDER BY created_at DESC
+                ''', (start_date, end_date, user_id))
+            else:
+                cursor.execute('''
+                    SELECT id, user_id, username, action, query, result_summary,
+                           sources, role, department, ip_address, duration_ms, created_at
+                    FROM audit_logs
+                    WHERE created_at BETWEEN ? AND ?
+                    ORDER BY created_at DESC
+                ''', (start_date, end_date))
 
-        rows = cursor.fetchall()
-        conn.close()
+            rows = cursor.fetchall()
 
         return [self._row_to_dict(r) for r in rows]
 
     def get_document_access_stats(self, limit: int = 20) -> List[Dict]:
         """获取文档访问统计（哪些文档被查询最多）"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            SELECT
-                json_extract(value, '$.source') as doc_source,
-                COUNT(*) as access_count
-            FROM audit_logs, json_each(sources)
-            WHERE json_valid(sources) AND sources != '[]'
-            GROUP BY doc_source
-            ORDER BY access_count DESC
-            LIMIT ?
-        ''', (limit,))
+            cursor.execute('''
+                SELECT
+                    json_extract(value, '$.source') as doc_source,
+                    COUNT(*) as access_count
+                FROM audit_logs, json_each(sources)
+                WHERE json_valid(sources) AND sources != '[]'
+                GROUP BY doc_source
+                ORDER BY access_count DESC
+                LIMIT ?
+            ''', (limit,))
 
-        rows = cursor.fetchall()
-        conn.close()
+            rows = cursor.fetchall()
 
         return [{"source": r[0], "access_count": r[1]} for r in rows if r[0]]
 
     def get_user_stats(self) -> List[Dict]:
         """获取用户活跃度统计"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            SELECT user_id, username, role, department,
-                   COUNT(*) as query_count,
-                   MIN(created_at) as first_seen,
-                   MAX(created_at) as last_seen
-            FROM audit_logs
-            GROUP BY user_id
-            ORDER BY query_count DESC
-        ''')
+            cursor.execute('''
+                SELECT user_id, username, role, department,
+                       COUNT(*) as query_count,
+                       MIN(created_at) as first_seen,
+                       MAX(created_at) as last_seen
+                FROM audit_logs
+                GROUP BY user_id
+                ORDER BY query_count DESC
+            ''')
 
-        rows = cursor.fetchall()
-        conn.close()
+            rows = cursor.fetchall()
 
         return [
             {
@@ -278,17 +232,16 @@ class AuditLogger:
 
     def cleanup_old_logs(self, days: int = 90) -> int:
         """清理指定天数之前的日志"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            DELETE FROM audit_logs
-            WHERE created_at < datetime('now', ?)
-        ''', (f'-{days} days',))
+            cursor.execute('''
+                DELETE FROM audit_logs
+                WHERE created_at < datetime('now', ?)
+            ''', (f'-{days} days',))
 
-        deleted = cursor.rowcount
-        conn.commit()
-        conn.close()
+            deleted = cursor.rowcount
+
         return deleted
 
     @staticmethod

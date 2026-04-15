@@ -72,6 +72,65 @@ PUBLIC_KB_NAME = "public_kb"
 # 默认部门列表（可根据实际情况扩展）
 DEFAULT_DEPARTMENTS = ["finance", "hr", "tech", "operation", "marketing"]
 
+# 部门名称映射：中文名 -> 英文标识（用于向量库命名）
+# 向量库名称必须符合 ChromaDB 规范：只能包含 [a-zA-Z0-9._-]
+DEPARTMENT_NAME_MAP = {
+    # 中文名 -> 英文标识
+    "财务部": "finance",
+    "财务": "finance",
+    "人事部": "hr",
+    "人事": "hr",
+    "人力资源部": "hr",
+    "人力资源": "hr",
+    "技术部": "tech",
+    "技术": "tech",
+    "研发部": "tech",
+    "研发": "tech",
+    "运营部": "operation",
+    "运营": "operation",
+    "市场部": "marketing",
+    "市场": "marketing",
+    "法务部": "legal",
+    "法务": "legal",
+    "行政部": "admin",
+    "行政": "admin",
+    # 英文标识 -> 英文标识（保持不变）
+    "finance": "finance",
+    "hr": "hr",
+    "tech": "tech",
+    "operation": "operation",
+    "marketing": "marketing",
+    "legal": "legal",
+    "admin": "admin",
+}
+
+
+def normalize_department_name(department: str) -> str:
+    """
+    将部门名称标准化为英文标识
+
+    Args:
+        department: 原始部门名称（可能是中文或英文）
+
+    Returns:
+        标准化的英文标识（用于向量库命名）
+    """
+    if not department:
+        return ""
+
+    # 优先查找映射表
+    if department in DEPARTMENT_NAME_MAP:
+        return DEPARTMENT_NAME_MAP[department]
+
+    # 如果不在映射表中，尝试转换为拼音或返回空
+    # 这里简单处理：如果是纯英文则直接返回，否则返回空
+    if department.replace("_", "").replace("-", "").isalnum() and department.isascii():
+        return department.lower()
+
+    # 无法识别的中文部门名，记录警告
+    logger.warning(f"无法识别的部门名称: {department}，请添加到 DEPARTMENT_NAME_MAP")
+    return ""
+
 
 # ==================== 数据结构 ====================
 
@@ -317,7 +376,12 @@ class KnowledgeBaseManager:
 
         # 检查是否已存在
         if kb_name in self._metadata.get("collections", {}):
-            return False, f"向量库 '{kb_name}' 已存在"
+            # 检查向量库是否实际存在
+            existing = self.get_collection(kb_name)
+            if existing and existing.count() > 0:
+                return False, f"向量库 '{kb_name}' 已存在"
+            # 元数据存在但向量库不存在，清理元数据继续创建
+            del self._metadata["collections"][kb_name]
 
         try:
             # 创建集合
@@ -502,7 +566,7 @@ class KnowledgeBaseManager:
 
         Args:
             role: 用户角色 (admin/manager/user)
-            department: 用户部门
+            department: 用户部门（支持中文名或英文标识）
             operation: 操作类型 (read/write/delete/sync)
 
         Returns:
@@ -520,17 +584,22 @@ class KnowledgeBaseManager:
         if PUBLIC_KB_NAME in self._metadata.get("collections", {}):
             result.append(PUBLIC_KB_NAME)
 
-        # 本部门向量库
+        # 本部门向量库 - 使用标准化部门名称
         if department:
-            dept_kb = f"dept_{department}"
-            if dept_kb in self._metadata.get("collections", {}):
-                # 检查操作权限
-                if operation == "read":
-                    result.append(dept_kb)
-                elif operation in ("write", "delete", "sync"):
-                    # 只有 manager 可以对本部门进行写操作
-                    if role == "manager":
+            # 将部门名称标准化为英文标识
+            normalized_dept = normalize_department_name(department)
+            if normalized_dept:
+                dept_kb = f"dept_{normalized_dept}"
+                if dept_kb in self._metadata.get("collections", {}):
+                    # 检查操作权限
+                    if operation == "read":
                         result.append(dept_kb)
+                    elif operation in ("write", "delete", "sync"):
+                        # 只有 manager 可以对本部门进行写操作
+                        if role == "manager":
+                            result.append(dept_kb)
+            else:
+                logger.warning(f"部门名称无法标准化: {department}")
 
         return result
 
@@ -699,21 +768,42 @@ class KnowledgeBaseManager:
     def _add_pdf_to_collection(self, collection, filepath, filename, embedding_model, extra_metadata):
         """添加 PDF 文件"""
         try:
-            from parsers import extract_text_from_pdf
+            from parsers import extract_text_from_pdf, IMAGE_EXTRACTOR_AVAILABLE, get_images_base_path
             from core.chunker import split_text
+            import json
         except ImportError:
             logger.error("无法导入 PDF 处理函数")
             return 0
 
         total_chunks = 0
-        pages = extract_text_from_pdf(filepath)
+
+        # 提取图片（启用图片提取）
+        images_output_dir = None
+        if IMAGE_EXTRACTOR_AVAILABLE:
+            try:
+                images_output_dir = get_images_base_path()
+            except:
+                pass
+
+        result = extract_text_from_pdf(filepath, extract_images=True, images_output_dir=images_output_dir)
+
+        # 处理返回值（可能是 tuple 或 list）
+        if isinstance(result, tuple):
+            pages, images_info = result
+        else:
+            pages = result
+            images_info = []
 
         if pages:
             for page_info in pages:
-                page_text = page_info['text']
-                page_num = page_info['page']
-                has_table = page_info.get('has_table', False)
+                page_text = page_info.get('text', '')
+                if not page_text.strip():
+                    continue
+
+                page_num = page_info.get('page', 0)
+                has_table = page_info.get('has_table', False) or page_info.get('chunk_type') == 'table'
                 section = page_info.get('section', '')
+                images = page_info.get('images', [])
 
                 chunks = split_text(page_text)
 
@@ -730,6 +820,10 @@ class KnowledgeBaseManager:
                         'collection': collection.name,
                         **extra_metadata
                     }
+
+                    # 序列化图片信息
+                    if images:
+                        metadata['images_json'] = json.dumps(images, ensure_ascii=False)
 
                     collection.add(
                         ids=[chunk_id],

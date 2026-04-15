@@ -24,70 +24,31 @@
     context = sm.build_context(session_id, "那请假呢？")
 """
 
-import sqlite3
 import json
-import os
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
-import uuid
+
+from data.db import get_connection
 
 
 class SessionManager:
     """会话管理器"""
 
-    def __init__(self, db_path: str = "./data/sessions.db", session_expire_hours: int = 24):
+    def __init__(self, session_expire_hours: int = 24):
         """
         初始化会话管理器
 
         Args:
-            db_path: SQLite数据库路径
             session_expire_hours: 会话过期时间（小时）
         """
-        self.db_path = db_path
         self.session_expire_hours = session_expire_hours
         self._init_db()
 
     def _init_db(self):
         """初始化数据库表"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        # 会话表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                metadata TEXT
-            )
-        ''')
-
-        # 消息历史表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-            )
-        ''')
-
-        # 创建索引加速查询
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_messages_session
-            ON messages(session_id, created_at)
-        ''')
-
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_sessions_user
-            ON sessions(user_id)
-        ''')
-
-        conn.commit()
-        conn.close()
+        from data.db import init_databases
+        init_databases()
 
     def create_session(self, user_id: str, metadata: dict = None) -> str:
         """
@@ -102,16 +63,12 @@ class SessionManager:
         """
         session_id = str(uuid.uuid4())
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            INSERT INTO sessions (session_id, user_id, metadata)
-            VALUES (?, ?, ?)
-        ''', (session_id, user_id, json.dumps(metadata or {})))
-
-        conn.commit()
-        conn.close()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO sessions (session_id, user_id, metadata)
+                VALUES (?, ?, ?)
+            ''', (session_id, user_id, json.dumps(metadata or {})))
 
         return session_id
 
@@ -128,38 +85,32 @@ class SessionManager:
         """
         if session_id:
             # 验证会话是否存在且属于该用户
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            with get_connection("core") as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT session_id FROM sessions
+                    WHERE session_id = ? AND user_id = ?
+                ''', (session_id, user_id))
 
-            cursor.execute('''
-                SELECT session_id FROM sessions
-                WHERE session_id = ? AND user_id = ?
-            ''', (session_id, user_id))
+                result = cursor.fetchone()
 
-            result = cursor.fetchone()
-            conn.close()
-
-            if result:
-                # 更新最后活跃时间
-                self._update_last_active(session_id)
-                return session_id
+                if result:
+                    # 更新最后活跃时间
+                    self._update_last_active(session_id)
+                    return session_id
 
         # 创建新会话
         return self.create_session(user_id)
 
     def _update_last_active(self, session_id: str):
         """更新会话最后活跃时间"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            UPDATE sessions
-            SET last_active = CURRENT_TIMESTAMP
-            WHERE session_id = ?
-        ''', (session_id,))
-
-        conn.commit()
-        conn.close()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE sessions
+                SET last_active = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+            ''', (session_id,))
 
     def add_message(self, session_id: str, role: str, content: str):
         """
@@ -170,23 +121,20 @@ class SessionManager:
             role: 角色 (user/assistant)
             content: 消息内容
         """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            INSERT INTO messages (session_id, role, content)
-            VALUES (?, ?, ?)
-        ''', (session_id, role, content))
+            cursor.execute('''
+                INSERT INTO messages (session_id, role, content)
+                VALUES (?, ?, ?)
+            ''', (session_id, role, content))
 
-        # 更新会话活跃时间
-        cursor.execute('''
-            UPDATE sessions
-            SET last_active = CURRENT_TIMESTAMP
-            WHERE session_id = ?
-        ''', (session_id,))
-
-        conn.commit()
-        conn.close()
+            # 更新会话活跃时间
+            cursor.execute('''
+                UPDATE sessions
+                SET last_active = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+            ''', (session_id,))
 
     def get_history(self, session_id: str, limit: int = 20) -> List[Dict]:
         """
@@ -199,19 +147,18 @@ class SessionManager:
         Returns:
             [{"role": "user/assistant", "content": "..."}, ...]
         """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            SELECT role, content, created_at
-            FROM messages
-            WHERE session_id = ?
-            ORDER BY created_at DESC
-            LIMIT ?
-        ''', (session_id, limit))
+            cursor.execute('''
+                SELECT role, content, created_at
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            ''', (session_id, limit))
 
-        rows = cursor.fetchall()
-        conn.close()
+            rows = cursor.fetchall()
 
         # 按时间正序排列（旧的在前）
         history = []
@@ -322,57 +269,48 @@ class SessionManager:
 
     def clear_history(self, session_id: str):
         """清空会话历史"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            DELETE FROM messages WHERE session_id = ?
-        ''', (session_id,))
-
-        conn.commit()
-        conn.close()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                DELETE FROM messages WHERE session_id = ?
+            ''', (session_id,))
 
     def delete_session(self, session_id: str):
         """删除会话"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            DELETE FROM messages WHERE session_id = ?
-        ''', (session_id,))
+            cursor.execute('''
+                DELETE FROM messages WHERE session_id = ?
+            ''', (session_id,))
 
-        cursor.execute('''
-            DELETE FROM sessions WHERE session_id = ?
-        ''', (session_id,))
-
-        conn.commit()
-        conn.close()
+            cursor.execute('''
+                DELETE FROM sessions WHERE session_id = ?
+            ''', (session_id,))
 
     def cleanup_expired_sessions(self):
         """清理过期会话"""
         expire_time = datetime.now() - timedelta(hours=self.session_expire_hours)
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        # 删除过期会话的消息
-        cursor.execute('''
-            DELETE FROM messages
-            WHERE session_id IN (
-                SELECT session_id FROM sessions
+            # 删除过期会话的消息
+            cursor.execute('''
+                DELETE FROM messages
+                WHERE session_id IN (
+                    SELECT session_id FROM sessions
+                    WHERE last_active < ?
+                )
+            ''', (expire_time,))
+
+            # 删除过期会话
+            cursor.execute('''
+                DELETE FROM sessions
                 WHERE last_active < ?
-            )
-        ''', (expire_time,))
+            ''', (expire_time,))
 
-        # 删除过期会话
-        cursor.execute('''
-            DELETE FROM sessions
-            WHERE last_active < ?
-        ''', (expire_time,))
-
-        deleted = cursor.rowcount
-        conn.commit()
-        conn.close()
+            deleted = cursor.rowcount
 
         return deleted
 
@@ -383,19 +321,18 @@ class SessionManager:
         Returns:
             [{"session_id": "...", "created_at": "...", "last_active": "..."}, ...]
         """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            SELECT session_id, created_at, last_active, metadata
-            FROM sessions
-            WHERE user_id = ?
-            ORDER BY last_active DESC
-            LIMIT ?
-        ''', (user_id, limit))
+            cursor.execute('''
+                SELECT session_id, created_at, last_active, metadata
+                FROM sessions
+                WHERE user_id = ?
+                ORDER BY last_active DESC
+                LIMIT ?
+            ''', (user_id, limit))
 
-        rows = cursor.fetchall()
-        conn.close()
+            rows = cursor.fetchall()
 
         sessions = []
         for row in rows:
@@ -410,19 +347,17 @@ class SessionManager:
 
     def get_stats(self) -> Dict:
         """获取统计信息"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('SELECT COUNT(*) FROM sessions')
-        total_sessions = cursor.fetchone()[0]
+            cursor.execute('SELECT COUNT(*) FROM sessions')
+            total_sessions = cursor.fetchone()[0]
 
-        cursor.execute('SELECT COUNT(*) FROM messages')
-        total_messages = cursor.fetchone()[0]
+            cursor.execute('SELECT COUNT(*) FROM messages')
+            total_messages = cursor.fetchone()[0]
 
-        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM sessions')
-        total_users = cursor.fetchone()[0]
-
-        conn.close()
+            cursor.execute('SELECT COUNT(DISTINCT user_id) FROM sessions')
+            total_users = cursor.fetchone()[0]
 
         return {
             "total_sessions": total_sessions,

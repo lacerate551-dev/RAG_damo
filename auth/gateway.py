@@ -37,6 +37,12 @@ from functools import wraps
 from flask import request, jsonify
 from typing import Dict, Optional, List
 import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# 加载 .env 文件（从项目根目录）
+env_path = Path(__file__).parent.parent / '.env'
+load_dotenv(env_path)
 
 
 # ==================== 角色映射配置 ====================
@@ -98,6 +104,30 @@ COLLECTION_PERMISSIONS = {
 PUBLIC_KB_NAME = 'public_kb'
 
 
+# ==================== 模拟用户数据（开发环境）====================
+# 用于前端模拟登录测试，仅 DEV_MODE=true 时生效
+MOCK_USERS = {
+    'admin': {
+        'password': 'admin123',
+        'user_id': 'admin001',
+        'role': 'admin',
+        'department': '管理部'
+    },
+    'testuser': {
+        'password': 'test123',
+        'user_id': 'user001',
+        'role': 'user',
+        'department': '技术部'
+    },
+    'manager': {
+        'password': 'manager123',
+        'user_id': 'manager001',
+        'role': 'manager',
+        'department': '财务部'
+    }
+}
+
+
 def get_user_permissions(role: str) -> List[str]:
     """
     获取角色对应的可访问安全级别
@@ -155,7 +185,24 @@ def require_gateway_auth(f):
     def decorated(*args, **kwargs):
         print(f"[DEBUG require_gateway_auth] 被调用, 函数名: {f.__name__}")
         # 开发模式：允许通过 Header 模拟用户（无网关时测试用）
-        dev_mode = os.environ.get('DEV_MODE', '').lower() == 'true'
+        # 默认开启开发模式（生产环境需设置 DEV_MODE=false）
+        dev_mode = os.environ.get('DEV_MODE', 'true').lower() != 'false'
+
+        # 开发模式：支持 mock token（前端 Authorization: Bearer mock-token-xxx）
+        if dev_mode:
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer mock-token-'):
+                username = auth_header.replace('Bearer mock-token-', '')
+                mock_user = MOCK_USERS.get(username, {})
+                if mock_user:
+                    request.current_user = {
+                        "user_id": mock_user.get('user_id', username),
+                        "username": username,
+                        "role": mock_user.get('role', 'user'),
+                        "department": mock_user.get('department', '')
+                    }
+                    print(f"[DEBUG auth_gateway] mock token 认证成功: {request.current_user}")
+                    return f(*args, **kwargs)
 
         # 从 Header 读取用户信息
         user_id = request.headers.get('X-User-ID')
@@ -269,6 +316,64 @@ def is_manager_or_above() -> bool:
 
 # ==================== 向量库权限管理 ====================
 
+# 部门名称映射：中文名 -> 英文标识（用于向量库命名）
+# 向量库名称必须符合 ChromaDB 规范：只能包含 [a-zA-Z0-9._-]
+DEPARTMENT_NAME_MAP = {
+    # 中文名 -> 英文标识
+    "财务部": "finance",
+    "财务": "finance",
+    "人事部": "hr",
+    "人事": "hr",
+    "人力资源部": "hr",
+    "人力资源": "hr",
+    "技术部": "tech",
+    "技术": "tech",
+    "研发部": "tech",
+    "研发": "tech",
+    "运营部": "operation",
+    "运营": "operation",
+    "市场部": "marketing",
+    "市场": "marketing",
+    "法务部": "legal",
+    "法务": "legal",
+    "行政部": "admin",
+    "行政": "admin",
+    # 英文标识 -> 英文标识（保持不变）
+    "finance": "finance",
+    "hr": "hr",
+    "tech": "tech",
+    "operation": "operation",
+    "marketing": "marketing",
+    "legal": "legal",
+    "admin": "admin",
+}
+
+
+def normalize_department_name(department: str) -> str:
+    """
+    将部门名称标准化为英文标识
+
+    Args:
+        department: 原始部门名称（可能是中文或英文）
+
+    Returns:
+        标准化的英文标识（用于向量库命名）
+    """
+    if not department:
+        return ""
+
+    # 优先查找映射表
+    if department in DEPARTMENT_NAME_MAP:
+        return DEPARTMENT_NAME_MAP[department]
+
+    # 如果不在映射表中，检查是否是有效的 ASCII 名称
+    if department.replace("_", "").replace("-", "").isalnum() and department.isascii():
+        return department.lower()
+
+    # 无法识别的中文部门名，返回空字符串
+    return ""
+
+
 def get_accessible_collections(
     role: str,
     department: str,
@@ -280,7 +385,7 @@ def get_accessible_collections(
 
     Args:
         role: 用户角色
-        department: 用户部门
+        department: 用户部门（支持中文名或英文标识）
         operation: 操作类型 (read/write/delete/sync)
         all_collections: 所有可用的向量库列表（用于 admin 通配符展开）
 
@@ -301,13 +406,16 @@ def get_accessible_collections(
             # 如果没有传入 all_collections，返回默认列表
             return [PUBLIC_KB_NAME] + [f"dept_{dept}" for dept in ['finance', 'hr', 'tech', 'operation', 'marketing']]
 
+    # 标准化部门名称
+    normalized_dept = normalize_department_name(department)
+
     # 处理部门变量替换
     result = []
     for coll in allowed:
         if '{dept}' in coll:
-            # 替换为用户部门
-            if department:
-                result.append(coll.replace('{dept}', department))
+            # 替换为用户部门（使用标准化后的名称）
+            if normalized_dept:
+                result.append(coll.replace('{dept}', normalized_dept))
         else:
             result.append(coll)
 

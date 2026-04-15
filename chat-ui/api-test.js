@@ -25,8 +25,10 @@ const endpointGroups = [
         items: [
             { name: "基础聊天", method: "POST", path: "/chat", desc: "普通对话模式（纯LLM）", pathParams: [], bodyParams: [ {key: "session_id", type: "string"}, {key: "message", type: "string", default: "你好"} ] },
             { name: "知识库问答", method: "POST", path: "/rag", desc: "调用 Agentic RAG 从多向量库联合检索回复", pathParams: [], bodyParams: [ {key: "session_id", type: "string"}, {key: "message", type: "string", default: "介绍一下公司考勤制度"} ] },
+            { name: "流式知识库问答", method: "POST", path: "/rag/stream", desc: "SSE 流式返回 RAG 问答过程与结果", pathParams: [], bodyParams: [ {key: "session_id", type: "string"}, {key: "message", type: "string", default: "介绍一下公司考勤制度"} ], isStream: true },
             { name: "内部混合检索", method: "POST", path: "/search", desc: "Dify使用的高性能混合检索（RRF融合）", pathParams: [], bodyParams: [ {key: "query", type: "string", default: "请假流程"}, {key: "top_k", type: "number", default: 5} ] },
-            { name: "版本感知检索", method: "POST", path: "/search/version-aware", desc: "检索指定知识库中存活的最新条款", pathParams: [], bodyParams: [ {key: "query", type: "string"}, {key: "collection", type: "string", default: "public_kb"}, {key: "top_k", type: "number", default: 5} ] }
+            { name: "版本感知检索", method: "POST", path: "/search/version-aware", desc: "检索指定知识库中存活的最新条款", pathParams: [], bodyParams: [ {key: "query", type: "string"}, {key: "collection", type: "string", default: "public_kb"}, {key: "top_k", type: "number", default: 5} ] },
+            { name: "知识库路由查询", method: "POST", path: "/kb/route", desc: "根据查询内容智能路由到最合适的知识库", pathParams: [], bodyParams: [ {key: "query", type: "string", default: "财务报销流程"} ] }
         ]
     },
     {
@@ -51,6 +53,7 @@ const endpointGroups = [
         group: '文档生命周期 (Doc Lifecycle)',
         items: [
             { name: "系统可用文档汇编", method: "GET", path: "/documents/list", desc: "获取全系统被纳管的文档及状态", pathParams: [], bodyParams: [] },
+            { name: "上传新文档", method: "POST", path: "/documents/upload", desc: "上传文档到指定知识库（需选择文件）", pathParams: [], bodyParams: [ {key: "collection", type: "string", default: "public_kb"}, {key: "security_level", type: "string", default: "public"} ], isUpload: true },
             { name: "查询已废止文档", method: "GET", path: "/documents/deprecated", desc: "罗列已经打上作废下划线的旧规章", pathParams: [], bodyParams: [] },
             { name: "彻底物理删除文档", method: "DELETE", path: "/documents/<path>", desc: "连根拔起向量及其物理文件", pathParams: ["path"], bodyParams: [] },
             { name: "废止指定文档", method: "POST", path: "/documents/<collection>/<path>/deprecate", desc: "仅打死不删，保留追溯期，标注为被取代", pathParams: ["collection", "path"], bodyParams: [ {key:"reason", type:"string", default:"因更新换代被取代"}, {key:"replaced_by", type:"string"} ] },
@@ -81,6 +84,7 @@ const endpointGroups = [
             { name: "开始后台长轮询", method: "POST", path: "/sync/start", desc: "启动后台进程无限刷新同步机制", pathParams: [], bodyParams: [] },
             { name: "挂起后台同异步", method: "POST", path: "/sync/stop", desc: "停止并释放掉系统轮询", pathParams: [], bodyParams: [] },
             { name: "强行推送至特定库", method: "POST", path: "/documents/sync", desc: "（老接口遗留）单点触发更新", pathParams: [], bodyParams: [] },
+            { name: "SSE 实时订阅", method: "GET", path: "/subscribe", desc: "建立 SSE 连接，实时接收系统事件通知", pathParams: [], bodyParams: [], isSSE: true },
             { name: "收取站内信", method: "GET", path: "/notifications", desc: "查看文档被废纸/更新时收到的通知", pathParams: [], bodyParams: [] },
             { name: "一键清除数字红点", method: "POST", path: "/notifications/read-all", desc: "全部标为已读", pathParams: [], bodyParams: [] }
         ]
@@ -193,7 +197,7 @@ function selectApi(id) {
 function buildForms(apiInfo) {
     const pCont = $('pathParamsContainer');
     const bCont = $('bodyParamsContainer');
-    
+
     pCont.innerHTML = '';
     bCont.innerHTML = '';
 
@@ -214,11 +218,22 @@ function buildForms(apiInfo) {
     // 渲染请求体参数
     if (apiInfo.method !== 'GET' && apiInfo.method !== 'DELETE' && apiInfo.bodyParams && apiInfo.bodyParams.length > 0) {
         let html = '<h4 style="margin:20px 0 10px 0; color:var(--primary-color);">请求体负载 (JSON Body)</h4>';
+
+        // 文件上传特殊处理
+        if (apiInfo.isUpload) {
+            html += `
+                <div class="param-group">
+                    <label>选择文件 <span>(file)</span></label>
+                    <input type="file" id="fileInput" accept=".pdf,.docx,.doc,.xlsx,.xls,.txt,.md" style="padding: 8px;">
+                </div>
+            `;
+        }
+
         apiInfo.bodyParams.forEach(param => {
             html += `
                 <div class="param-group">
                     <label>${param.key} <span>(${param.type})</span></label>
-                    ${param.type === 'string' && param.key.includes('content') ? 
+                    ${param.type === 'string' && param.key.includes('content') ?
                         `<textarea class="body-param-input" data-param="${param.key}" required>${param.default || ''}</textarea>` :
                         `<input type="${param.type === 'number' ? 'number' : 'text'}" class="body-param-input" data-param="${param.key}" value="${param.default || ''}" required>`
                     }
@@ -226,6 +241,22 @@ function buildForms(apiInfo) {
             `;
         });
         bCont.innerHTML = html;
+    }
+
+    // 特殊提示
+    if (apiInfo.isSSE) {
+        bCont.innerHTML += `
+            <div style="margin-top: 15px; padding: 10px; background: rgba(33, 150, 243, 0.1); border-radius: 6px; font-size: 0.9rem;">
+                <strong>ℹ️ SSE 说明：</strong>将建立 Server-Sent Events 连接，10秒后自动断开（演示用）。
+            </div>
+        `;
+    }
+    if (apiInfo.isStream) {
+        bCont.innerHTML += `
+            <div style="margin-top: 15px; padding: 10px; background: rgba(33, 150, 243, 0.1); border-radius: 6px; font-size: 0.9rem;">
+                <strong>ℹ️ 流式响应：</strong>将实时显示 RAG 处理过程的各个阶段（决策、检索、生成等）。
+            </div>
+        `;
     }
 }
 
@@ -265,7 +296,25 @@ async function invokeApi() {
 
     const url = `${API_BASE}${path}`;
 
-    // 2. 构建 JSON Payload
+    // 2. 特殊处理：SSE 订阅
+    if (apiInfo.isSSE) {
+        invokeSSE(url);
+        return;
+    }
+
+    // 3. 特殊处理：文件上传
+    if (apiInfo.isUpload) {
+        invokeUpload(url, apiInfo);
+        return;
+    }
+
+    // 4. 特殊处理：流式响应
+    if (apiInfo.isStream) {
+        invokeStream(url, apiInfo);
+        return;
+    }
+
+    // 5. 构建 JSON Payload
     let payload = null;
     if (apiInfo.method !== 'GET' && apiInfo.method !== 'DELETE' && apiInfo.bodyParams && apiInfo.bodyParams.length > 0) {
         payload = {};
@@ -278,7 +327,7 @@ async function invokeApi() {
         });
     }
 
-    // 3. UI 按钮锁定
+    // 6. UI 按钮锁定
     const btn = $('sendBtn');
     btn.disabled = true;
     btn.textContent = '请求中...';
@@ -286,7 +335,7 @@ async function invokeApi() {
     $('responseStatus').className = 'status-badge status-loading';
     $('responseStatus').textContent = 'Loading...';
 
-    // 4. 发起 Fetch
+    // 7. 发起 Fetch
     try {
         const fetchOptions = {
             method: apiInfo.method,
@@ -317,7 +366,7 @@ async function invokeApi() {
         $('responseStatus').textContent = `HTTP ${response.status} | 耗时: ${_duration}ms`;
         if (response.ok) {
             $('responseStatus').className = 'status-badge status-ok';
-            $('jsonOutput').style.color = '#4CAF50'; 
+            $('jsonOutput').style.color = '#4CAF50';
         } else {
             $('responseStatus').className = 'status-badge status-error';
             $('jsonOutput').style.color = '#F44336';
@@ -330,6 +379,186 @@ async function invokeApi() {
         $('responseStatus').textContent = 'Network Error / Cors Issue';
         $('jsonOutput').style.color = '#F44336';
         $('jsonOutput').textContent = JSON.stringify({ error: err.message }, null, 4);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '发送请求 🚀';
+    }
+}
+
+// SSE 订阅处理
+function invokeSSE(url) {
+    const btn = $('sendBtn');
+    btn.disabled = true;
+    btn.textContent = '订阅中...';
+    $('responseStatus').style.display = 'inline-block';
+    $('responseStatus').className = 'status-badge status-loading';
+    $('responseStatus').textContent = 'SSE 连接中...';
+    $('jsonOutput').textContent = '// SSE 事件流开始...\n';
+    $('jsonOutput').style.color = '#4CAF50';
+
+    const eventSource = new EventSource(`${url}?token=${encodeURIComponent(state.token)}`);
+
+    eventSource.onopen = () => {
+        $('responseStatus').className = 'status-badge status-ok';
+        $('responseStatus').textContent = 'SSE 已连接';
+    };
+
+    eventSource.onmessage = (event) => {
+        const line = `[${new Date().toLocaleTimeString()}] ${event.data}\n`;
+        $('jsonOutput').textContent += line;
+        $('jsonOutput').scrollTop = $('jsonOutput').scrollHeight;
+    };
+
+    eventSource.onerror = (err) => {
+        $('responseStatus').className = 'status-badge status-error';
+        $('responseStatus').textContent = 'SSE 连接错误或已关闭';
+        eventSource.close();
+        btn.disabled = false;
+        btn.textContent = '发送请求 🚀';
+    };
+
+    // 10秒后自动关闭（演示用）
+    setTimeout(() => {
+        if (eventSource.readyState !== EventSource.CLOSED) {
+            eventSource.close();
+            $('jsonOutput').textContent += '\n// 10秒演示后自动断开\n';
+            $('responseStatus').textContent = 'SSE 已断开（演示结束）';
+            btn.disabled = false;
+            btn.textContent = '发送请求 🚀';
+        }
+    }, 10000);
+}
+
+// 文件上传处理
+async function invokeUpload(url, apiInfo) {
+    const fileInput = $('fileInput');
+    if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
+        showToast("请选择要上传的文件！", "error");
+        return;
+    }
+
+    const btn = $('sendBtn');
+    btn.disabled = true;
+    btn.textContent = '上传中...';
+    $('responseStatus').style.display = 'inline-block';
+    $('responseStatus').className = 'status-badge status-loading';
+    $('responseStatus').textContent = 'Uploading...';
+
+    try {
+        const formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+
+        // 添加其他参数
+        document.querySelectorAll('.body-param-input').forEach(input => {
+            const key = input.dataset.param;
+            if (key !== 'file') {
+                formData.append(key, input.value);
+            }
+        });
+
+        const _start = performance.now();
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${state.token}`
+            },
+            body: formData
+        });
+        const _duration = Math.round(performance.now() - _start);
+
+        const data = await response.json();
+
+        $('responseStatus').textContent = `HTTP ${response.status} | 耗时: ${_duration}ms`;
+        if (response.ok) {
+            $('responseStatus').className = 'status-badge status-ok';
+            $('jsonOutput').style.color = '#4CAF50';
+        } else {
+            $('responseStatus').className = 'status-badge status-error';
+            $('jsonOutput').style.color = '#F44336';
+        }
+
+        $('jsonOutput').textContent = JSON.stringify(data, null, 4);
+
+    } catch (err) {
+        $('responseStatus').className = 'status-badge status-error';
+        $('responseStatus').textContent = 'Upload Error';
+        $('jsonOutput').style.color = '#F44336';
+        $('jsonOutput').textContent = JSON.stringify({ error: err.message }, null, 4);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '发送请求 🚀';
+    }
+}
+
+// 流式响应处理
+async function invokeStream(url, apiInfo) {
+    const btn = $('sendBtn');
+    btn.disabled = true;
+    btn.textContent = '流式请求中...';
+    $('responseStatus').style.display = 'inline-block';
+    $('responseStatus').className = 'status-badge status-loading';
+    $('responseStatus').textContent = 'Streaming...';
+    $('jsonOutput').textContent = '// 流式响应开始...\n';
+    $('jsonOutput').style.color = '#4CAF50';
+
+    // 构建 payload
+    let payload = {};
+    document.querySelectorAll('.body-param-input').forEach(input => {
+        const key = input.dataset.param;
+        let val = input.value;
+        if (input.type === 'number') val = Number(val);
+        payload[key] = val;
+    });
+
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${state.token}`
+            },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            const errData = await response.json();
+            throw new Error(errData.error || `HTTP ${response.status}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const event = JSON.parse(line.slice(6));
+                        const time = new Date().toLocaleTimeString();
+                        $('jsonOutput').textContent += `[${time}] [${event.type}] ${JSON.stringify(event, null, 2)}\n`;
+                        $('jsonOutput').scrollTop = $('jsonOutput').scrollHeight;
+                    } catch (e) {
+                        $('jsonOutput').textContent += `[${new Date().toLocaleTimeString()}] ${line}\n`;
+                    }
+                }
+            }
+        }
+
+        $('responseStatus').className = 'status-badge status-ok';
+        $('responseStatus').textContent = 'Streaming Complete';
+
+    } catch (err) {
+        $('responseStatus').className = 'status-badge status-error';
+        $('responseStatus').textContent = 'Stream Error';
+        $('jsonOutput').style.color = '#F44336';
+        $('jsonOutput').textContent += `\n// Error: ${err.message}\n`;
     } finally {
         btn.disabled = false;
         btn.textContent = '发送请求 🚀';

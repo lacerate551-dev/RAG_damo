@@ -8,3 +8,15 @@
 - lifecycle: 文档生命周期管理
 - diff: 文档差异分析
 """
+
+from .manager import KnowledgeBaseManager
+from .router import KnowledgeBaseRouter
+
+try:
+    from .sync import KnowledgeSyncService
+except ImportError:
+    pass
+
+__all__ = [
+    'KnowledgeBaseManager', 'KnowledgeBaseRouter', 'KnowledgeSyncService'
+]
