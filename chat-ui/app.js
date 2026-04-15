@@ -277,7 +277,7 @@ async function sendMessage() {
             });
             state.sessionId = data.session_id;
             $('currentSessionId').textContent = state.sessionId.substring(0, 8);
-            addMessage('assistant', data.answer, data.sources, data.web_searched, false);
+            addMessage('assistant', data.answer, data.sources, data.web_searched, false, data.images);
             loadSessions();
         } else {
             // RAG 模式（SSE流式）
@@ -335,7 +335,7 @@ async function sendRagMessage(msg) {
     if (result) {
         state.sessionId = result.session_id;
         $('currentSessionId').textContent = state.sessionId.substring(0, 8);
-        addMessage('assistant', result.answer, result.sources, false, true);
+        addMessage('assistant', result.answer, result.sources, false, true, result.images);
         loadSessions();
     }
 }
@@ -358,7 +358,7 @@ function handleStreamEvent(event) {
     addLog(type, msg, event);
 }
 
-function addMessage(role, content, sources, webSearched, isRag) {
+function addMessage(role, content, sources, webSearched, isRag, images) {
     const container = $('chatMessages');
     // 移除空状态
     const empty = container.querySelector('.empty-state');
@@ -382,6 +382,25 @@ function addMessage(role, content, sources, webSearched, isRag) {
     }
 
     html += `<div class="message-content">${escapeHtml(content)}</div>`;
+
+    // 显示图片
+    if (images && images.length > 0) {
+        html += '<div class="message-images"><strong>相关图片:</strong><div class="images-grid">';
+        images.forEach(img => {
+            const caption = img.caption ? `<div class="image-caption">${escapeHtml(img.caption)}</div>` : '';
+            const pageLabel = img.page ? `<span class="image-page">第${img.page}页</span>` : '';
+            html += `
+                <div class="image-card">
+                    <img src="${API_BASE}${img.url}" alt="${img.id}" loading="lazy" onclick="showImageModal('${API_BASE}${img.url}', '${escapeHtml(img.id)}')">
+                    <div class="image-info">
+                        ${pageLabel}
+                        ${caption}
+                    </div>
+                </div>
+            `;
+        });
+        html += '</div></div>';
+    }
 
     // 显示来源
     if (sources && sources.length > 0) {
@@ -645,5 +664,32 @@ function showToast(message, type = 'info') {
     }, 3000);
 }
 
+// ===== 图片弹窗 =====
+function showImageModal(url, caption) {
+    const modal = $('imageModal');
+    const img = $('modalImage');
+    const captionEl = $('modalCaption');
+
+    img.src = url;
+    captionEl.textContent = caption || '';
+    modal.style.display = 'flex';
+
+    // 点击背景关闭
+    modal.onclick = (e) => {
+        if (e.target === modal) closeImageModal();
+    };
+}
+
+function closeImageModal() {
+    $('imageModal').style.display = 'none';
+}
+
+// ESC 键关闭弹窗
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeImageModal();
+});
+
 // 暴露给 HTML 的全局函数
 window.toggleUserStatus = toggleUserStatus;
+window.showImageModal = showImageModal;
+window.closeImageModal = closeImageModal;
