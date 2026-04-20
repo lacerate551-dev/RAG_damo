@@ -144,6 +144,68 @@ class AgenticRAG:
         except ImportError:
             self.loop_guard = None
 
+        # Context Compression 配置
+        self.MAX_CONTEXT_TOKENS = 3500  # 最大上下文 token 数（模型窗口 * 0.35）
+        self.MAX_CONTEXT_COUNT = 20     # 最大上下文数量
+        self.RERANK_THRESHOLD = 0.3    # Rerank 过滤阈值
+
+        # Answer Grounding 配置
+        self.MAX_GROUNDING_RETRY = 1   # 幻觉修正最多重试 1 次
+        self.grounding_retry_count = 0
+
+    def should_rewrite(self, query: str, history: list = None) -> bool:
+        """
+        判断是否需要重写查询
+
+        触发条件：
+        1. 有历史对话 → 强制改写（消歧）
+        2. 短查询（< 10 字符）→ 强制改写（扩展）
+        3. 其他情况 → LLM 判断
+
+        Args:
+            query: 用户问题
+            history: 对话历史
+
+        Returns:
+            bool: 是否需要重写
+        """
+        # 条件 1: 有历史对话，强制改写（消歧）
+        if history and len(history) > 0:
+            return True
+
+        # 条件 2: 短查询，强制改写（扩展）
+        if len(query) < 10:
+            return True
+
+        # 条件 3: LLM 判断是否需要改写
+        try:
+            prompt = f"""判断以下问题是否需要重写以获得更好的检索效果。
+问题：{query}
+
+需要重写的情况：
+- 包含代词（它、这个、那个）指代不清
+- 过于口语化
+- 缺少关键上下文
+
+不需要重写的情况：
+- 问题清晰完整
+- 包含具体的专业术语
+- 可以直接检索
+
+请只回答 "需要" 或 "不需要"："""
+
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=10
+            )
+            answer = response.choices[0].message.content.strip()
+            return "需要" in answer
+        except Exception:
+            # 出错时默认不重写
+            return False
+
     def process(self, query: str, verbose: bool = True, history: list = None,
                 log_callback=None, allowed_levels: list = None,
                 role: str = None, department: str = None,
@@ -192,6 +254,18 @@ class AgenticRAG:
             print("\n" + "=" * 60)
             print(f"[用户] {query}")
             print("=" * 60)
+
+        # ==================== 统一 Query Rewriting 入口 ====================
+        original_query = query
+        if self.should_rewrite(query, history):
+            rewritten = self._rewrite_query(query, history, strategy="all")
+            if verbose:
+                print(f"\n[查询重写] {query} → {rewritten}")
+            emit_log("rewrite", {
+                "original": query,
+                "rewritten": rewritten
+            })
+            query = rewritten  # 使用重写后的查询
 
         # ==================== 新增：查询分类 ====================
         classified = None
@@ -355,8 +429,16 @@ class AgenticRAG:
             quality_assessment = self._assess_quality(current_query, docs, metas, verbose)
             # 质量评估结果可用于后续决策，暂时只记录
 
+            # ==================== Context Compression ====================
+            all_contexts = self._compress_contexts(query, all_contexts)
+
             # 直接生成答案
             answer = self._generate_fused_answer(query, all_contexts, allowed_levels)
+
+            # ==================== Answer Grounding 闭环 ====================
+            # 重置 grounding 重试计数
+            self.grounding_retry_count = 0
+            answer = self._verify_and_refine_answer(query, answer, all_contexts)
 
             # ==================== 推理反思 ====================
             reflection = self._reflect_on_answer(query, answer, all_contexts, verbose)
@@ -485,6 +567,9 @@ class AgenticRAG:
 
             # 执行决策
             if decision["action"] == "answer":
+                # ==================== Context Compression ====================
+                all_contexts = self._compress_contexts(query, all_contexts)
+
                 # 生成答案
                 answer_start = time.time()
                 answer = self._generate_fused_answer(query, all_contexts, allowed_levels)
@@ -494,6 +579,10 @@ class AgenticRAG:
                     "duration_ms": round(answer_duration, 0),
                     "total_duration_ms": round((time.time() - start_time) * 1000, 0)
                 })
+
+                # ==================== Answer Grounding 闭环 ====================
+                self.grounding_retry_count = 0
+                answer = self._verify_and_refine_answer(query, answer, all_contexts)
 
                 # ==================== 推理反思 ====================
                 reflection = self._reflect_on_answer(query, answer, all_contexts, verbose)
@@ -707,6 +796,10 @@ class AgenticRAG:
 
         # 达到迭代上限
         emit_log("max_iterations", {"iterations": iteration})
+
+        # ==================== Context Compression ====================
+        all_contexts = self._compress_contexts(query, all_contexts)
+
         answer = self._generate_fused_answer(query, all_contexts, allowed_levels)
         sources = self._extract_sources(all_contexts)
         # 只从相关来源提取图片（传入原始查询以提取特定文件名）
@@ -783,6 +876,9 @@ class AgenticRAG:
 
         if verbose:
             print(f"   找到 {len(web_results)} 条网络结果")
+
+        # ==================== Context Compression ====================
+        contexts = self._compress_contexts(query, contexts)
 
         answer = self._generate_fused_answer(query, contexts)
         sources = self._extract_sources(contexts)
@@ -1382,6 +1478,9 @@ class AgenticRAG:
                 if verbose:
                     print(f"      网络搜索找到 {len(web_results)} 条结果")
 
+                # ==================== Context Compression ====================
+                all_contexts = self._compress_contexts(original_query, all_contexts)
+
                 # 返回融合后的结果
                 answer = self._generate_fused_answer(original_query, all_contexts, allowed_levels)
                 sources = self._extract_sources(all_contexts)
@@ -1450,6 +1549,9 @@ class AgenticRAG:
                                 'source_type': self.SOURCE_KB,
                                 'query': rewritten_query
                             })
+
+                        # ==================== Context Compression ====================
+                        all_contexts = self._compress_contexts(original_query, all_contexts)
 
                         # 返回融合后的结果
                         answer = self._generate_fused_answer(original_query, all_contexts, allowed_levels)
@@ -1725,6 +1827,11 @@ class AgenticRAG:
             "有哪些文件", "什么文件", "哪些文件", "文件列表", "文件目录",
             "可以查看", "能查看", "有权限查看", "权限查看",
             "能访问", "可以访问", "有权限访问",
+            # 新增：更多权限相关表达
+            "我的权限", "用户权限", "查看权限", "访问权限",
+            "权限能", "权限可以", "有什么权限", "有哪些权限",
+            "我能看", "我可以看", "我能查", "我可以查",
+            "能看到什么", "能查到什么", "可以看什么", "可以查什么",
             "知识库有哪些", "库里有", "文档有哪些", "有哪些文档",
             "有什么文档", "有什么文件", "包含什么", "包含哪些",
             "你知道什么", "你都知道", "你能回答什么",
@@ -2012,9 +2119,29 @@ class AgenticRAG:
             return f"生成答案失败: {str(e)}"
 
     def _build_context_string(self, kb_contexts, web_contexts, graph_contexts):
-        """构建上下文字符串"""
+        """
+        构建上下文字符串
+
+        FAQ 优先策略：
+        1. FAQ 作为 Golden Context 放在最前面
+        2. 普通 Chunk 放在后面
+        3. LLM 融合所有上下文生成答案（不阻断）
+        """
+        # 分离 FAQ 和普通知识库内容
+        faq_contexts = [c for c in kb_contexts if c.get('meta', {}).get('chunk_type') == 'faq']
+        regular_contexts = [c for c in kb_contexts if c.get('meta', {}).get('chunk_type') != 'faq']
+
+        # FAQ 部分（优先展示）
+        faq_parts = []
+        for i, c in enumerate(faq_contexts[:3], 1):
+            meta = c['meta']
+            # FAQ 特殊格式：直接显示问题和答案
+            answer = meta.get('faq_answer', c['doc'])
+            faq_parts.append(f"[FAQ-{i}] 常见问题\n问题：{c['doc']}\n标准答案：{answer}")
+
+        # 普通知识库部分
         kb_parts = []
-        for i, c in enumerate(kb_contexts[:5], 1):
+        for i, c in enumerate(regular_contexts[:5], 1):
             meta = c['meta']
             source_str = meta.get('source', '未知')
             if 'page' in meta:
@@ -2030,7 +2157,8 @@ class AgenticRAG:
         for i, c in enumerate(graph_contexts[:3], 1):
             graph_parts.append(f"[图谱-{i}] {c['doc']}")
 
-        return "\n\n".join(kb_parts + web_parts + graph_parts)
+        # FAQ 优先排列
+        return "\n\n".join(faq_parts + kb_parts + web_parts + graph_parts)
 
     def _build_normal_answer_prompt(self, query, context_str, kb_contexts, web_contexts, graph_contexts):
         """构建正常回答的提示词"""
@@ -2187,16 +2315,6 @@ class AgenticRAG:
         except Exception as e:
             return f"抱歉，知识库中没有找到相关信息。请尝试换一种方式提问，或询问「有哪些文件可以查看」了解知识库内容。"
 
-    def _format_source(self, meta: dict, source_type: str) -> str:
-        """格式化来源信息"""
-        if source_type == self.SOURCE_WEB:
-            return f"{meta.get('title', '网络')} ({meta.get('source', '')})"
-        else:
-            source_parts = [meta.get('source', '未知文件')]
-            if 'page' in meta:
-                source_parts.append(f"第{meta['page']}页")
-            return " ".join(source_parts)
-
     def chat_search(
         self,
         query: str,
@@ -2243,6 +2361,9 @@ class AgenticRAG:
             if verbose:
                 print(f"   找到 {len(web_results)} 条结果")
 
+        # ==================== Context Compression ====================
+        contexts = self._compress_contexts(query, contexts)
+
         # 生成回答
         if contexts:
             answer = self._generate_fused_answer(query, contexts)
@@ -2284,6 +2405,230 @@ class AgenticRAG:
 
         query_lower = query.lower()
         return any(kw in query_lower for kw in realtime_keywords)
+
+    # ==================== Context Compression 方法 ====================
+
+    def _compress_contexts(self, query: str, contexts: list) -> list:
+        """
+        上下文压缩三步走：
+        1. Rerank 过滤（score < 0.3 丢弃）
+        2. 去重（相似度 > 0.9 只保留一个）
+        3. Token 控制
+
+        Args:
+            query: 用户问题
+            contexts: 检索到的上下文列表
+
+        Returns:
+            压缩后的上下文列表
+        """
+        if not contexts:
+            return contexts
+
+        # Step 1: Rerank 过滤（如果有分数信息）
+        filtered = self._rerank_filter(contexts)
+
+        # Step 2: 去重
+        deduped = self._deduplicate_contexts(filtered)
+
+        # Step 3: Token 控制
+        result = self._truncate_to_tokens(deduped, self.MAX_CONTEXT_TOKENS)
+
+        return result
+
+    def _rerank_filter(self, contexts: list) -> list:
+        """
+        Rerank 过滤 - 保留相关性分数 >= 阈值的上下文
+
+        Args:
+            contexts: 上下文列表
+
+        Returns:
+            过滤后的上下文列表
+        """
+        # 如果上下文中有 score 字段，使用阈值过滤
+        scored_contexts = [c for c in contexts if c.get('score') is not None]
+
+        if scored_contexts:
+            filtered = [c for c in contexts if c.get('score', 0) >= self.RERANK_THRESHOLD]
+            # 如果过滤后为空，保留原始列表
+            return filtered if filtered else contexts
+
+        # 没有分数信息，保留原始列表
+        return contexts
+
+    def _deduplicate_contexts(self, contexts: list, threshold: float = 0.9) -> list:
+        """
+        去重 - 基于内容相似度去重
+
+        Args:
+            contexts: 上下文列表
+            threshold: 相似度阈值
+
+        Returns:
+            去重后的上下文列表
+        """
+        if len(contexts) <= 1:
+            return contexts
+
+        result = []
+        seen_keys = set()
+
+        for c in contexts:
+            # 使用文档前 100 字符作为去重 key
+            doc = c.get('doc', '')
+            key = doc[:100] if doc else ''
+
+            # 同时检查来源是否相同
+            meta = c.get('meta', {})
+            source = meta.get('source', '')
+            page = meta.get('page', '')
+
+            # 组合 key：来源 + 页码 + 内容前缀
+            composite_key = f"{source}|{page}|{key}"
+
+            if composite_key not in seen_keys:
+                seen_keys.add(composite_key)
+                result.append(c)
+
+        return result
+
+    def _truncate_to_tokens(self, contexts: list, max_tokens: int) -> list:
+        """
+        Token 控制 - 限制上下文总 token 数
+
+        Args:
+            contexts: 上下文列表
+            max_tokens: 最大 token 数
+
+        Returns:
+            截断后的上下文列表
+        """
+        if not contexts:
+            return contexts
+
+        result = []
+        total_tokens = 0
+
+        for c in contexts:
+            doc = c.get('doc', '')
+            # 简单估算：中文约 1.5 字符/token，英文约 4 字符/token
+            # 使用保守估算：2 字符/token
+            estimated_tokens = len(doc) // 2
+
+            if total_tokens + estimated_tokens <= max_tokens:
+                result.append(c)
+                total_tokens += estimated_tokens
+            else:
+                # 达到上限，停止添加
+                break
+
+        return result
+
+    def _merge_and_deduplicate(self, old_contexts: list, new_contexts: list) -> list:
+        """
+        合并去重 - 合并新旧上下文，限制数量
+
+        Args:
+            old_contexts: 旧上下文列表
+            new_contexts: 新上下文列表
+
+        Returns:
+            合并去重后的上下文列表
+        """
+        all_contexts = old_contexts + new_contexts
+        seen_keys = set()
+        result = []
+
+        for c in all_contexts:
+            doc = c.get('doc', '')
+            key = doc[:100] if doc else ''
+
+            if key not in seen_keys:
+                seen_keys.add(key)
+                result.append(c)
+
+        # 限制最大数量
+        return result[:self.MAX_CONTEXT_COUNT]
+
+    # ==================== Answer Grounding 方法 ====================
+
+    def _verify_and_refine_answer(self, query: str, answer: str, contexts: list) -> str:
+        """
+        答案验证与修正闭环
+
+        Args:
+            query: 用户问题
+            answer: 生成的答案
+            contexts: 上下文列表
+
+        Returns:
+            验证后的答案（可能修正）
+        """
+        # 如果反思器不可用，直接返回原答案
+        if not self.reasoning_reflector:
+            return answer
+
+        try:
+            # 使用现有的反思方法检测幻觉
+            reflection = self._reflect_on_answer(query, answer, contexts, verbose=False)
+
+            if not reflection:
+                return answer
+
+            # 检查是否有未验证的声明
+            unverified_claims = reflection.get('unverified_claims', [])
+
+            if not unverified_claims:
+                return answer  # 无幻觉，直接返回
+
+            # 限制：最多重试 1 次
+            if self.grounding_retry_count >= self.MAX_GROUNDING_RETRY:
+                # 生成不确定回答
+                return self._generate_uncertain_answer(query, contexts)
+
+            # 获取新的 context（merge + 去重 + 限制长度）
+            verification_queries = reflection.get('verification_queries', [])
+
+            for vq in verification_queries[:2]:  # 最多使用 2 个验证查询
+                try:
+                    new_results = get_engine().search_knowledge(vq, top_k=3)
+                    if new_results and new_results.get('ids') and new_results['ids'][0]:
+                        docs = new_results['documents'][0]
+                        metas = new_results['metadatas'][0]
+                        for doc, meta in zip(docs, metas):
+                            contexts.append({
+                                'doc': doc,
+                                'meta': meta,
+                                'source_type': self.SOURCE_KB,
+                                'query': vq
+                            })
+                except Exception:
+                    pass
+
+            # 压缩 context
+            contexts = self._compress_contexts(query, contexts)
+
+            # 重新生成
+            self.grounding_retry_count += 1
+            return self._generate_fused_answer(query, contexts)
+
+        except Exception as e:
+            return answer  # 出错时返回原答案
+
+    def _generate_uncertain_answer(self, query: str, contexts: list) -> str:
+        """
+        生成不确定回答 - 当无法验证答案时使用
+
+        Args:
+            query: 用户问题
+            contexts: 上下文列表
+
+        Returns:
+            带不确定性标记的回答
+        """
+        base_answer = self._generate_fused_answer(query, contexts)
+        return f"根据现有信息，{base_answer}\n\n[注：部分信息未能完全验证，请谨慎参考]"
 
     def _direct_answer(self, query: str, history: list = None) -> str:
         """

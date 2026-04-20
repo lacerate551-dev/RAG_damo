@@ -1,4 +1,4 @@
-# RAG API Server 接口文档
+ RAG API Server 接口文档
 
 > **服务地址**: `http://localhost:5001`
 > **认证方式**: 网关 Header 注入（详见下方认证说明）

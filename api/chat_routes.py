@@ -2,19 +2,25 @@
 核心聊天与检索 API
 
 路由:
-- POST /chat        - 普通聊天模式
-- POST /rag         - 知识库问答模式
-- POST /rag/stream  - 知识库问答 SSE 流式返回
+- POST /chat        - 普通聊天模式（JSON 响应）
+- POST /rag         - 知识库问答模式（SSE 流式返回）
 - POST /search      - 混合检索接口（供 Dify 调用）
+
+注意：
+- 会话管理由后端负责，RAG 服务不存储对话历史
+- 权限验证由后端网关完成
+- /rag 接口已升级为 SSE 流式返回，不再返回阻塞 JSON
 """
 
 import json
+import os
 import queue
 import threading
+import time as _time
 
 import numpy as np
 from flask import Blueprint, request, jsonify, Response, current_app
-from auth.gateway import require_gateway_auth, get_auth_manager
+from auth.gateway import require_gateway_auth
 
 from auth.security import validate_query, filter_response
 
@@ -24,16 +30,76 @@ chat_bp = Blueprint('chat', __name__)
 CHAT_MODEL = "qwen3.5-flash"
 
 
-def _get_session_manager():
-    return current_app.config['SESSION_MANAGER']
-
-
-def _get_audit_logger():
-    return current_app.config['AUDIT_LOGGER']
-
-
 def _get_agentic_rag():
     return current_app.config['AGENTIC_RAG']
+
+
+def score_image_relevance(query: str, meta: dict) -> float:
+    """
+    图片相关性打分（Phase 5）
+
+    Args:
+        query: 用户查询
+        meta: 切片元数据
+
+    Returns:
+        相关性分数（>= 3.0 推荐展示）
+    """
+    score = 0.0
+
+    # 1. 查询意图匹配（最重要）
+    intent_keywords = ["结构", "流程", "图", "示意", "图表", "展示", "架构", "拓扑", "图示"]
+    if any(kw in query for kw in intent_keywords):
+        score += 3.0
+
+    # 2. 图片类型
+    if meta.get('chunk_type') == 'chart':
+        score += 2.0
+    elif meta.get('chunk_type') == 'image':
+        score += 1.0
+
+    # 3. 相似度
+    score += min(meta.get('score', 0), 1.0)
+
+    return score
+
+
+def select_images(contexts: list, query: str) -> list:
+    """
+    选择要展示的图片（打分排序 + 预算控制）（Phase 5）
+
+    Args:
+        contexts: 检索上下文列表
+        query: 用户查询
+
+    Returns:
+        精选图片列表（最多 2-5 张，根据查询意图动态调整）
+    """
+    # 动态预算：列举型查询允许更多图片
+    list_keywords = ["哪些", "有什么", "包含", "列出", "所有", "全部"]
+    is_list_query = any(kw in query for kw in list_keywords)
+
+    MAX_IMAGES = 5 if is_list_query else 2
+    MIN_SCORE = 2.5  # 降低阈值，避免过滤掉相关图片
+
+    scored_images = []
+    for ctx in contexts:
+        meta = ctx.get('meta', {})
+        if meta.get('chunk_type') in ('image', 'chart') and meta.get('image_path'):
+            s = score_image_relevance(query, meta)
+            if s >= MIN_SCORE:
+                scored_images.append({
+                    'score': s,
+                    'id': os.path.basename(meta['image_path']),
+                    'url': f"/images/{os.path.basename(meta['image_path'])}",
+                    'type': meta['chunk_type'],
+                    'source': meta.get('source'),
+                    'page': meta.get('page'),
+                    'description': ctx.get('doc', '')[:100]
+                })
+
+    scored_images.sort(key=lambda x: x['score'], reverse=True)
+    return scored_images[:MAX_IMAGES]
 
 
 def _extract_rich_media(contexts: list) -> dict:
@@ -46,34 +112,83 @@ def _extract_rich_media(contexts: list) -> dict:
     Returns:
         {"images": [...], "tables": [...], "sections": [...]}
     """
-    import json
     images = []
     tables = []
     sections = set()
 
+    # 白名单：只返回检索结果中存在的图片
+    valid_images = set()
+
     for ctx in contexts:
         meta = ctx.get("meta", {})
 
-        # 提取图片（支持 images_json 和 images 两种格式）
-        images_data = None
-        if meta.get("images_json"):
-            try:
-                images_data = json.loads(meta["images_json"])
-            except (json.JSONDecodeError, TypeError):
-                pass
-        elif meta.get("images"):
-            images_data = meta["images"]
-
-        if images_data:
-            for img in images_data:
+        # 1. 独立图片切片（image_path）- 图片/图表类型的独立切片
+        if meta.get("chunk_type") in ("image", "chart") and meta.get("image_path"):
+            img_path = meta.get("image_path", "")
+            img_id = os.path.basename(img_path)
+            if img_id and img_id not in valid_images:
+                valid_images.add(img_id)
                 images.append({
-                    "id": img.get("id"),
-                    "caption": img.get("caption", ""),
-                    "url": f"/images/{img.get('id')}",
-                    "page": meta.get("page"),
+                    "id": img_id,
+                    "url": f"/images/{img_id}",
+                    "type": meta.get("chunk_type"),
                     "source": meta.get("source"),
-                    "width": img.get("width"),
-                    "height": img.get("height")
+                    "page": meta.get("page"),
+                    "order": 0  # 独立图片默认 order=0
+                })
+
+        # 2. 关联图片（images 字段）- 表格/段落中嵌入的图片
+        # 统一格式：images = [{"id": "abc.jpg", "order": 1}, ...]
+        img_list = None
+        if meta.get("images"):
+            img_list = meta["images"]
+            # 兼容 JSON 字符串格式
+            if isinstance(img_list, str):
+                try:
+                    img_list = json.loads(img_list)
+                except (json.JSONDecodeError, TypeError):
+                    img_list = []
+        elif meta.get("images_json"):
+            # 兼容旧格式 images_json
+            try:
+                img_list = json.loads(meta["images_json"])
+            except (json.JSONDecodeError, TypeError):
+                img_list = []
+
+        if img_list and isinstance(img_list, list):
+            for img_info in img_list:
+                # 兼容两种格式：{"id": "xxx", "order": 1} 或直接字符串
+                if isinstance(img_info, dict):
+                    img_id = img_info.get("id") or img_info.get("path", "")
+                    order = img_info.get("order", 0)
+                else:
+                    img_id = str(img_info)
+                    order = 0
+
+                if img_id and img_id not in valid_images:
+                    valid_images.add(img_id)
+                    images.append({
+                        "id": img_id,
+                        "url": f"/images/{img_id}",
+                        "type": "associated",  # 关联图片
+                        "source": meta.get("source"),
+                        "page": meta.get("page"),
+                        "order": order
+                    })
+
+        # 3. 表格切片本身有 image_path（表格作为图片存储）
+        if meta.get("chunk_type") == "table" and meta.get("image_path"):
+            img_path = meta.get("image_path", "")
+            img_id = os.path.basename(img_path)
+            if img_id and img_id not in valid_images:
+                valid_images.add(img_id)
+                images.append({
+                    "id": img_id,
+                    "url": f"/images/{img_id}",
+                    "type": "table_image",
+                    "source": meta.get("source"),
+                    "page": meta.get("page"),
+                    "order": 0
                 })
 
         # 提取表格
@@ -89,6 +204,9 @@ def _extract_rich_media(contexts: list) -> dict:
         if meta.get("section_path"):
             sections.add(meta["section_path"])
 
+    # 按 order 排序
+    images.sort(key=lambda x: x.get("order", 0))
+
     return {
         "images": images,
         "tables": tables,
@@ -98,116 +216,136 @@ def _extract_rich_media(contexts: list) -> dict:
 
 def chat_with_llm(message: str, history: list = None, enable_web_search: bool = True) -> dict:
     """
-    智能聊天 - 使用 Agentic RAG 的网络搜索能力
+    普通聊天 - 使用LLM直接回复
 
     Args:
         message: 用户消息
-        history: 对话历史
+        history: 对话历史（由后端传入）
         enable_web_search: 是否启用网络搜索
 
     Returns:
-        {"answer": 回答内容, "sources": 来源列表, "web_searched": 是否进行了网络搜索}
+        {"answer": str, "sources": list, "web_searched": bool}
     """
-    agentic_rag = _get_agentic_rag()
-    result = agentic_rag.chat_search(
-        message,
-        history=history,
-        enable_web_search=enable_web_search,
-        verbose=False
+    from config import get_llm_client
+
+    client = get_llm_client()
+
+    # 构建消息
+    messages = []
+
+    # 添加历史
+    if history:
+        for h in history[-10:]:  # 最多10轮历史
+            messages.append({"role": h["role"], "content": h["content"]})
+
+    messages.append({"role": "user", "content": message})
+
+    # 调用 LLM
+    response = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=messages,
+        max_tokens=2048
     )
-    return result
 
+    answer = response.choices[0].message.content
 
-# ============== 混合检索功能（供 Dify 调用）==============
+    return {
+        "answer": answer,
+        "sources": [],
+        "web_searched": False
+    }
+
 
 def reciprocal_rank_fusion(results_list, weights=None, k=60):
-    """RRF 融合算法"""
+    """
+    倒数排名融合算法
+
+    Args:
+        results_list: 多个检索结果列表
+        weights: 各结果权重
+        k: RRF 参数
+
+    Returns:
+        融合后的排序结果
+    """
     if weights is None:
         weights = [1.0] * len(results_list)
 
-    doc_scores = {}
-    for results, weight in zip(results_list, weights):
-        if not results['documents'][0]:
-            continue
-        for rank, (doc_id, doc, meta) in enumerate(zip(
-            results['ids'][0],
-            results['documents'][0],
-            results['metadatas'][0]
-        )):
-            rrf_score = weight / (k + rank + 1)
-            if doc_id not in doc_scores:
-                doc_scores[doc_id] = {'score': 0.0, 'doc': doc, 'meta': meta}
-            doc_scores[doc_id]['score'] += rrf_score
+    fused_scores = {}
+    doc_data = {}
 
-    sorted_items = sorted(doc_scores.items(), key=lambda x: x[1]['score'], reverse=True)
+    for results, weight in zip(results_list, weights):
+        if not results or not results.get('ids'):
+            continue
+
+        ids = results['ids'][0]
+        docs = results['documents'][0] if results.get('documents') else [''] * len(ids)
+        metas = results['metadatas'][0] if results.get('metadatas') else [{}] * len(ids)
+        distances = results['distances'][0] if results.get('distances') else [0] * len(ids)
+
+        for rank, (doc_id, doc, meta, dist) in enumerate(zip(ids, docs, metas, distances)):
+            if doc_id not in fused_scores:
+                fused_scores[doc_id] = 0
+                doc_data[doc_id] = {'doc': doc, 'meta': meta, 'dist': dist}
+
+            # RRF 分数
+            fused_scores[doc_id] += weight / (rank + k)
+
+    # 按分数排序
+    sorted_ids = sorted(fused_scores.keys(), key=lambda x: fused_scores[x], reverse=True)
+
     return {
-        'ids': [[item[0] for item in sorted_items]],
-        'documents': [[item[1]['doc'] for item in sorted_items]],
-        'metadatas': [[item[1]['meta'] for item in sorted_items]],
-        'distances': [[item[1]['score'] for item in sorted_items]]
+        'ids': sorted_ids,
+        'documents': [doc_data[i]['doc'] for i in sorted_ids],
+        'metadatas': [doc_data[i]['meta'] for i in sorted_ids],
+        'scores': [fused_scores[i] for i in sorted_ids],
+        'distances': [doc_data[i]['dist'] for i in sorted_ids]
     }
 
 
 def search_hybrid(query: str, top_k: int = 5, candidates: int = 15,
-                   allowed_levels: list = None, allowed_collections: list = None) -> dict:
-    """混合检索 + Rerank，支持多向量库模式"""
-    from rag_demo import embedding_model, reranker, collection
+                  allowed_levels: list = None, allowed_collections: list = None):
+    """
+    混合检索：直接调用生产环境引擎，确保测试效果与生产一致
 
-    # 尝试使用最新的多数据库管理器
-    try:
-        from knowledge.manager import get_kb_manager
-        kb_manager = get_kb_manager()
+    Args:
+        query: 查询文本
+        top_k: 返回数量
+        candidates: 候选数量（用于 RERANK_CANDIDATES，由 config 控制）
+        allowed_levels: 允许的安全级别
+        allowed_collections: 允许的向量库列表
 
-        target_kbs = allowed_collections if allowed_collections else ["public_kb"]
-        query_vector = embedding_model.encode(query).tolist()
+    Returns:
+        融合后的检索结果
+    """
+    from core.engine import get_engine
 
-        multi_result = kb_manager.search_multiple(
-            kb_names=target_kbs,
-            query_vector=query_vector,
-            query_text=query,
-            top_k=candidates,
-            use_bm25=True
-        )
+    engine = get_engine()
 
-        fused_docs = multi_result.documents
-        fused_ids = multi_result.ids
-        fused_metas = multi_result.metadatas
-        fused_distances = multi_result.distances
+    # 直接调用生产环境的检索方法
+    result = engine.search_knowledge(
+        query=query,
+        top_k=top_k,
+        allowed_levels=allowed_levels,
+        collections=allowed_collections
+    )
 
-    except ImportError:
-        # 降级处理：原始单库模式 (向量检索)
-        query_vector = embedding_model.encode(query).tolist()
-        query_kwargs = {"query_embeddings": [query_vector], "n_results": candidates}
-        if allowed_levels:
-            query_kwargs["where"] = {"security_level": {"$in": allowed_levels}}
-        vector_results = collection.query(**query_kwargs)
-
-        if not vector_results['documents'] or not vector_results['documents'][0]:
-            return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
-
-        fused_docs = vector_results['documents'][0]
-        fused_ids = vector_results['ids'][0]
-        fused_metas = vector_results['metadatas'][0]
-        fused_distances = vector_results['distances'][0]
-
-    # Rerank
-    if reranker and len(fused_docs) > 0:
-        pairs = [(query, doc) for doc in fused_docs]
-        scores = reranker.predict(pairs)
-        sorted_indices = np.argsort(scores)[::-1][:top_k]
-        return {
-            'ids': [[fused_ids[i] for i in sorted_indices]],
-            'documents': [[fused_docs[i] for i in sorted_indices]],
-            'metadatas': [[fused_metas[i] for i in sorted_indices]],
-            'distances': [[float(scores[i]) for i in sorted_indices]]
+    # 添加 scores 字段（用于前端显示）
+    if result and result.get('ids') and result['ids'][0]:
+        distances = result.get('distances', [[]])[0]
+        # 将距离转换为相似度分数（距离越小，分数越高）
+        scores = [1.0 - d if d <= 1.0 else 1.0 / (1.0 + d) for d in distances]
+        result['scores'] = [scores]
+    else:
+        result = {
+            'ids': [[]],
+            'documents': [[]],
+            'metadatas': [[]],
+            'distances': [[]],
+            'scores': [[]]
         }
 
-    return {
-        'ids': [fused_ids[:top_k]],
-        'documents': [fused_docs[:top_k]],
-        'metadatas': [fused_metas[:top_k]],
-        'distances': [fused_distances[:top_k]]
-    }
+    return result
 
 
 # ==================== 路由 ====================
@@ -216,20 +354,17 @@ def search_hybrid(query: str, top_k: int = 5, candidates: int = 15,
 @require_gateway_auth
 def chat():
     """
-    普通聊天模式 - 直接使用LLM回复，速度快
+    普通聊天模式 - 直接使用LLM回复
 
     请求体:
     {
-        "session_id": "会话ID（首次为null）",
-        "message": "消息内容"
+        "message": "消息内容",
+        "history": [{"role": "user/assistant", "content": "..."}]  // 可选
     }
     """
-    data = request.json
-    session_manager = _get_session_manager()
-
-    user_id = request.current_user["user_id"]
-    session_id = data.get('session_id')
+    data = request.json or {}
     message = data.get('message')
+    history = data.get('history', [])
 
     if not message:
         return jsonify({"error": "缺少 message"}), 400
@@ -239,24 +374,13 @@ def chat():
     if not is_valid:
         return jsonify({"error": reason}), 400
 
-    # 获取或创建会话
-    session_id = session_manager.get_or_create_session(user_id, session_id)
-
-    # 保存用户消息
-    session_manager.add_message(session_id, "user", message)
-
-    # 获取历史上下文
-    history = session_manager.get_history(session_id, limit=10)
-
-    # 智能聊天（支持网络搜索）
+    # 智能聊天
     result = chat_with_llm(message, history)
 
-    # 保存助手回复（过滤敏感信息）
+    # 过滤敏感信息
     answer = filter_response(result["answer"])
-    session_manager.add_message(session_id, "assistant", answer)
 
     return jsonify({
-        "session_id": session_id,
         "answer": answer,
         "mode": "chat",
         "sources": result.get("sources", []),
@@ -264,20 +388,33 @@ def chat():
     })
 
 
-@chat_bp.route('/rag/stream', methods=['POST'])
+@chat_bp.route('/rag', methods=['POST'])
 @require_gateway_auth
-def rag_stream():
+def rag():
     """
-    知识库问答模式 - SSE 流式返回（包含思考过程日志）
-    """
-    data = request.json
-    session_manager = _get_session_manager()
-    agentic_rag = _get_agentic_rag()
-    auth_manager = get_auth_manager()
+    知识库问答模式 - SSE 流式返回
 
-    user_id = request.current_user["user_id"]
-    session_id = data.get('session_id')
+    请求体:
+    {
+        "message": "消息内容",
+        "history": [{"role": "user/assistant", "content": "..."}],  // 可选
+        "collections": ["public_kb"],  // 可选，知识库列表
+        "session_id": "xxx"  // 可选，会话ID
+    }
+
+    SSE 事件序列:
+    1. start: 开始处理
+    2. sources: 检索到的来源
+    3. chunk: 每个 token
+    4. finish: 完成响应（包含完整 answer 和 sources）
+    5. error: 错误事件
+    """
+    data = request.json or {}
+
     message = data.get('message')
+    history = data.get('history', [])
+    collections = data.get('collections')
+    session_id = data.get('session_id')
 
     if not message:
         return jsonify({"error": "缺少 message"}), 400
@@ -287,100 +424,172 @@ def rag_stream():
     if not is_valid:
         return jsonify({"error": reason}), 400
 
-    # 获取或创建会话
-    session_id = session_manager.get_or_create_session(user_id, session_id)
+    # 如果没有指定 collections，使用默认的公开库
+    if not collections:
+        collections = ['public_kb']
 
-    # 保存用户消息
-    session_manager.add_message(session_id, "user", message)
+    # ==================== 会话历史加载 ====================
+    # 如果没有传 history，尝试从 SessionManager 加载
+    session_manager = current_app.config.get('SESSION_MANAGER')
+    user_id = request.current_user.get("user_id")
 
-    # 获取历史上下文
-    history = session_manager.get_history(session_id, limit=10)
+    if not history and session_id and session_manager:
+        try:
+            # 验证会话归属
+            sessions = session_manager.get_user_sessions(user_id)
+            session_ids = [s["session_id"] for s in sessions]
+            if session_id in session_ids:
+                history = session_manager.get_history(session_id, limit=10)
+        except Exception:
+            pass  # 加载失败不影响主流程
 
-    # 获取用户权限
-    user_role = request.current_user["role"]
-    user_department = request.current_user.get("department", "")
-    allowed_levels = auth_manager.get_user_permissions(user_role)
-
-    # 创建消息队列用于 SSE
-    log_queue = queue.Queue()
-
-    def log_callback(event):
-        """日志回调，将事件放入队列"""
-        log_queue.put(event)
+    # 如果没有 session_id，创建新会话
+    if not session_id and session_manager:
+        try:
+            session_id = session_manager.create_session(user_id)
+        except Exception:
+            pass  # 创建失败不影响主流程
 
     def generate():
         """生成 SSE 流"""
+        start_time = _time.time()
+        full_answer = []
+
         try:
-            result_holder = {'result': None}
+            # 1. 发送开始事件
+            yield f"data: {json.dumps({'type': 'start', 'message': '正在检索知识库...'}, ensure_ascii=False)}\n\n"
 
-            # 先发送一个开始事件，确认连接正常
-            yield f"data: {json.dumps({'type': 'connected', 'message': '开始处理...'}, ensure_ascii=False)}\n\n"
+            # 2. 执行混合检索
+            search_result = search_hybrid(
+                message,
+                top_k=5,
+                candidates=15,
+                allowed_collections=collections
+            )
 
-            def process():
+            # 提取上下文
+            contexts = []
+            sources = []
+
+            if search_result.get('documents') and search_result['documents'][0]:
+                docs = search_result['documents'][0]
+                metas = search_result.get('metadatas', [[]])[0]
+                scores = search_result.get('scores', [[]])[0]
+
+                # 按 source 去重，保留最高分
+                seen_sources = {}
+                for doc, meta, score in zip(docs, metas, scores):
+                    source_name = meta.get('source', '未知')
+                    if source_name not in seen_sources or score > seen_sources[source_name]['score']:
+                        page = meta.get('page', 0)
+                        page_end = meta.get('page_end')
+                        # 构建页码范围显示
+                        if page_end and page_end > page:
+                            page_range = f"{page}-{page_end}"
+                        else:
+                            page_range = str(page)
+
+                        seen_sources[source_name] = {
+                            'source': source_name,
+                            'page': page,
+                            'page_end': page_end,
+                            'page_range': page_range,
+                            'section': meta.get('section', '') or meta.get('section_path', ''),
+                            'chunk_type': meta.get('chunk_type', 'text'),
+                            'score': round(score, 3) if isinstance(score, float) else score
+                        }
+                    # contexts 仍然保留所有结果用于生成答案
+                    contexts.append({'doc': doc, 'meta': meta})
+
+                sources = list(seen_sources.values())
+
+            # 发送来源事件
+            yield f"data: {json.dumps({'type': 'sources', 'sources': sources[:5]}, ensure_ascii=False)}\n\n"
+
+            # 2.5. 懒加载增强（Phase 4）
+            # 对检索命中的图片/表格按需调用 VLM/LLM
+            try:
+                import asyncio
+                from knowledge.lazy_enhance import enhance_retrieved_chunks
+
+                # 获取知识库名称（取第一个）
+                kb_name = collections[0] if collections else 'public_kb'
+
+                # 异步增强检索结果
+                asyncio.run(enhance_retrieved_chunks(contexts, message, kb_name))
+            except Exception as e:
+                import logging
+                logging.warning(f"懒加载增强失败: {e}")
+
+            # 3. 选择要展示的图片（Phase 5）
+            selected_images = select_images(contexts, message)
+
+            # 4. 构建 prompt（Phase 6：LLM 图片感知）
+            context_text = "\n\n".join([ctx.get('doc', '') for ctx in contexts[:5]])
+
+            # 添加图片信息到 prompt
+            image_info = ""
+            if selected_images:
+                image_info = "\n\n【可用图片】\n你可以使用以下图片辅助回答：\n"
+                for i, img in enumerate(selected_images, 1):
+                    image_info += f"[图片{i}] {img['description']}\n"
+                image_info += "\n如果图片有助于理解，请在回答中提及（如：如下图所示）。\n"
+
+            enhanced_context = context_text + image_info
+
+            # 5. 流式生成回答
+            from core.engine import get_engine
+            engine = get_engine()
+
+            for token in engine.generate_answer_stream(message, enhanced_context, history):
+                full_answer.append(token)
+                yield f"data: {json.dumps({'type': 'chunk', 'content': token}, ensure_ascii=False)}\n\n"
+
+            # 6. 提取富媒体信息（使用精选图片）
+            rich_media = _extract_rich_media(contexts)
+            # 替换为精选图片
+            if selected_images:
+                rich_media['images'] = selected_images
+
+            # 7. 保存消息到会话
+            full_answer_text = "".join(full_answer)
+            if session_id and session_manager:
                 try:
-                    result = agentic_rag.process(
-                        message,
-                        verbose=False,
-                        history=history,
-                        log_callback=log_callback,
-                        allowed_levels=allowed_levels,
-                        role=user_role,
-                        department=user_department
-                    )
-                    result_holder['result'] = result
-                except Exception as e:
-                    import traceback
-                    result_holder['error'] = str(e)
-                    result_holder['traceback'] = traceback.format_exc()
+                    # 保存用户消息
+                    session_manager.add_message(session_id, 'user', message)
+                    
+                    # 保存 AI 回答并附带元数据
+                    ai_meta = {
+                        "is_rag": True,
+                        "sources": sources,
+                        "images": rich_media.get("images", [])
+                    }
+                    session_manager.add_message(session_id, 'assistant', full_answer_text, metadata=ai_meta)
+                except Exception:
+                    pass  # 保存失败不影响主流程
 
-            thread = threading.Thread(target=process)
-            thread.start()
+            # 8. 发送完成事件
+            duration_ms = int((_time.time() - start_time) * 1000)
+            finish_event = {
+                "type": "finish",
+                "answer": full_answer_text,
+                "mode": "rag",
+                "session_id": session_id,
+                "sources": sources,
+                "images": rich_media["images"],
+                "tables": rich_media["tables"],
+                "sections": rich_media["sections"],
+                "duration_ms": duration_ms
+            }
+            yield f"data: {json.dumps(finish_event, ensure_ascii=False)}\n\n"
 
-            # 实时发送日志事件
-            while thread.is_alive() or not log_queue.empty():
-                try:
-                    event = log_queue.get(timeout=0.1)
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                except queue.Empty:
-                    continue
-
-            thread.join()
-            result = result_holder.get('result')
-
-            # 检查是否有错误
-            if 'error' in result_holder:
-                error_event = {"type": "error", "message": result_holder['error'], "traceback": result_holder.get('traceback', '')}
-                yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
-                return
-
-            # 保存助手回复
-            if result:
-                session_manager.add_message(session_id, "assistant", result["answer"])
-
-                # 提取富媒体信息
-                rich_media = _extract_rich_media(result.get("contexts", []))
-
-                # 发送最终结果
-                final_event = {
-                    "type": "result",
-                    "session_id": session_id,
-                    "answer": result["answer"],
-                    "mode": "rag",
-                    "sources": result.get("sources", []),
-                    "log_trace": result.get("log_trace", []),
-                    # 富媒体字段
-                    "images": rich_media["images"],
-                    "tables": rich_media["tables"],
-                    "sections": rich_media["sections"],
-                    # 分类信息
-                    "classified": result.get("classified")
-                }
-                yield f"data: {json.dumps(final_event, ensure_ascii=False)}\n\n"
-            else:
-                yield f"data: {json.dumps({'type': 'error', 'message': '处理返回空结果'}, ensure_ascii=False)}\n\n"
         except Exception as e:
             import traceback
-            error_event = {"type": "error", "message": str(e), "traceback": traceback.format_exc()}
+            error_event = {
+                "type": "error",
+                "message": str(e),
+                "traceback": traceback.format_exc()
+            }
             yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
 
     return Response(
@@ -393,114 +602,32 @@ def rag_stream():
     )
 
 
-@chat_bp.route('/rag', methods=['POST'])
-@require_gateway_auth
-def rag():
-    """
-    知识库问答模式 - 使用Agentic RAG检索回复
-    """
-    data = request.json
-    session_manager = _get_session_manager()
-    agentic_rag = _get_agentic_rag()
-    audit_logger = _get_audit_logger()
-    auth_manager = get_auth_manager()
-
-    user_id = request.current_user["user_id"]
-    session_id = data.get('session_id')
-    message = data.get('message')
-
-    if not message:
-        return jsonify({"error": "缺少 message"}), 400
-
-    # 输入安全验证
-    is_valid, reason = validate_query(message)
-    if not is_valid:
-        return jsonify({"error": reason}), 400
-
-    # 获取或创建会话
-    session_id = session_manager.get_or_create_session(user_id, session_id)
-
-    # 保存用户消息
-    session_manager.add_message(session_id, "user", message)
-
-    # 获取历史上下文
-    history = session_manager.get_history(session_id, limit=10)
-
-    # 获取用户权限
-    allowed_levels = auth_manager.get_user_permissions(request.current_user["role"])
-
-    # 使用 Agentic RAG 处理
-    import time as _time
-    _start = _time.time()
-    result = agentic_rag.process(message, verbose=False, history=history,
-                                 allowed_levels=allowed_levels,
-                                 role=request.current_user["role"],
-                                 department=request.current_user.get("department", ""))
-    _duration = int((_time.time() - _start) * 1000)
-
-    # 保存助手回复
-    session_manager.add_message(session_id, "assistant", result["answer"])
-
-    # 记录审计日志
-    audit_logger.log_query(
-        user_id=user_id,
-        query=message,
-        result_summary=result["answer"][:200],
-        sources=result.get("sources", []),
-        username=request.current_user.get("username", ""),
-        role=request.current_user["role"],
-        department=request.current_user.get("department", ""),
-        action="rag_query",
-        ip_address=request.remote_addr,
-        duration_ms=_duration
-    )
-
-    # 提取富媒体信息
-    rich_media = _extract_rich_media(result.get("contexts", []))
-
-    return jsonify({
-        "session_id": session_id,
-        "answer": result["answer"],
-        "mode": "rag",
-        "sources": result.get("sources", []),
-        # 富媒体字段
-        "images": rich_media["images"],
-        "tables": rich_media["tables"],
-        "sections": rich_media["sections"],
-        # 分类信息（调试用）
-        "classified": result.get("classified")
-    })
-
-
 @chat_bp.route('/search', methods=['POST'])
 @require_gateway_auth
 def search():
     """
     混合检索接口 - 供 Dify 工作流调用
-    """
-    auth_manager = get_auth_manager()
 
-    data = request.json
+    请求体:
+    {
+        "query": "查询文本",
+        "top_k": 5,
+        "collections": ["public_kb"]  // 可选
+    }
+    """
+    data = request.json or {}
     query = data.get('query', '')
     top_k = data.get('top_k', 5)
+    collections = data.get('collections')  # 后端传入的知识库列表
 
     if not query:
         return jsonify({'error': 'query is required'}), 400
 
-    # 获取用户权限用于过滤
-    allowed_levels = auth_manager.get_user_permissions(request.current_user["role"])
+    # 如果没有指定 collections，使用默认的公开库
+    if not collections:
+        collections = ['public_kb']
 
-    # 获取允许访问的 collection 列表
-    try:
-        from auth.gateway import get_accessible_collections
-        role = request.current_user["role"]
-        department = request.current_user.get("department", "")
-        allowed_collections = get_accessible_collections(role, department, "read")
-    except ImportError:
-        allowed_collections = None
-
-    results = search_hybrid(query, top_k=top_k, allowed_levels=allowed_levels,
-                            allowed_collections=allowed_collections)
+    results = search_hybrid(query, top_k=top_k, allowed_collections=collections)
 
     return jsonify({
         'contexts': results['documents'][0],

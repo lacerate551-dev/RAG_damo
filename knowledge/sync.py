@@ -6,8 +6,6 @@
 2. 哈希比对 - 识别文件具体变更类型（新增/修改/删除）
 3. 增量向量化 - 仅处理变更文件
 4. 变更日志 - 记录变更历史
-5. 用户订阅 - 支持订阅特定文档
-6. 推送通知 - 变更时通知订阅用户
 
 使用方式：
     from knowledge.sync import KnowledgeSyncService
@@ -18,9 +16,6 @@
 
     # 手动触发同步
     result = sync_service.sync_now()
-
-    # 订阅文档
-    sync_service.subscribe(user_id="user1", document_id="xxx")
 """
 
 import os
@@ -253,88 +248,6 @@ class SyncDatabase:
                 WHERE id = ?
             ''', (error_message, change_id))
 
-    def subscribe(self, user_id: str, document_id: str = None, document_name: str = None):
-        """用户订阅文档"""
-        with get_connection("knowledge") as conn:
-            cursor = conn.cursor()
-            try:
-                cursor.execute('''
-                    INSERT OR IGNORE INTO subscriptions (user_id, document_id, document_name)
-                    VALUES (?, ?, ?)
-                ''', (user_id, document_id, document_name))
-            except Exception:
-                pass  # 已存在
-
-    def unsubscribe(self, user_id: str, document_id: str = None):
-        """取消订阅"""
-        with get_connection("knowledge") as conn:
-            cursor = conn.cursor()
-            if document_id:
-                cursor.execute('''
-                    DELETE FROM subscriptions WHERE user_id = ? AND document_id = ?
-                ''', (user_id, document_id))
-            else:
-                cursor.execute('DELETE FROM subscriptions WHERE user_id = ?', (user_id,))
-
-    def get_subscribers(self, document_id: str) -> List[str]:
-        """获取订阅某文档的用户"""
-        with get_connection("knowledge") as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT user_id FROM subscriptions
-                WHERE document_id = ? OR document_id IS NULL
-            ''', (document_id,))
-            rows = cursor.fetchall()
-            return [row[0] for row in rows]
-
-    def add_notification(self, user_id: str, document_id: str, document_name: str,
-                         change_type: str, message: str):
-        """添加通知"""
-        with get_connection("knowledge") as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO notifications (user_id, document_id, document_name, change_type, message)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (user_id, document_id, document_name, change_type, message))
-
-    def get_notifications(self, user_id: str, unread_only: bool = False) -> List[Dict]:
-        """获取用户通知"""
-        with get_connection("knowledge") as conn:
-            cursor = conn.cursor()
-
-            sql = '''
-                SELECT id, document_id, document_name, change_type, message, read, created_at
-                FROM notifications WHERE user_id = ?
-            '''
-            params = [user_id]
-
-            if unread_only:
-                sql += ' AND read = 0'
-
-            sql += ' ORDER BY created_at DESC LIMIT 50'
-
-            cursor.execute(sql, params)
-            rows = cursor.fetchall()
-
-            return [
-                {
-                    "id": row[0],
-                    "document_id": row[1],
-                    "document_name": row[2],
-                    "change_type": row[3],
-                    "message": row[4],
-                    "read": bool(row[5]),
-                    "created_at": row[6]
-                }
-                for row in rows
-            ]
-
-    def mark_notification_read(self, notification_id: int):
-        """标记通知已读"""
-        with get_connection("knowledge") as conn:
-            cursor = conn.cursor()
-            cursor.execute('UPDATE notifications SET read = 1 WHERE id = ?', (notification_id,))
-
     def log_sync_status(self, result: SyncResult) -> int:
         """记录同步状态"""
         with get_connection("knowledge") as conn:
@@ -394,7 +307,8 @@ class FileChangeHandler(FileSystemEventHandler if HAS_WATCHDOG else object):
         if HAS_WATCHDOG:
             super().__init__()
         self.sync_service = sync_service
-        self.supported_extensions = {'.pdf', '.docx', '.doc', '.xlsx', '.txt'}
+        # v5 统一解析支持的所有格式
+        self.supported_extensions = {'.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.txt', '.png', '.jpg', '.jpeg', '.bmp', '.tiff'}
         self._pending_changes = {}  # 防抖：短时间内多次修改只记录一次
         self._debounce_seconds = 2
 
@@ -529,7 +443,8 @@ class KnowledgeSyncService:
     def scan_documents(self) -> Dict[str, Dict]:
         """扫描文档目录，返回所有文档信息"""
         documents = {}
-        supported_extensions = {'.pdf', '.docx', '.doc', '.xlsx', '.txt'}
+        # v5 统一解析支持的所有格式
+        supported_extensions = {'.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.txt', '.png', '.jpg', '.jpeg', '.bmp', '.tiff'}
 
         for root, dirs, files in os.walk(self.documents_path):
             for filename in files:
@@ -660,9 +575,6 @@ class KnowledgeSyncService:
                 self.db.delete_document_hash(change.document_id)
                 logger.info(f"已删除文档: {change.document_id}, 删除 {deleted} 片段")
 
-            # 发送通知
-            self._send_notifications(change)
-
             return True
 
         except Exception as e:
@@ -693,31 +605,6 @@ class KnowledgeSyncService:
             return 'public_kb'
         else:
             return f'dept_{subdir}'
-
-    def _send_notifications(self, change: DocumentChange):
-        """发送变更通知"""
-        # 获取订阅用户
-        subscribers = self.db.get_subscribers(change.document_id)
-
-        # 构建通知消息
-        change_type_names = {
-            ChangeType.ADDED: "新增",
-            ChangeType.MODIFIED: "更新",
-            ChangeType.DELETED: "删除"
-        }
-
-        message = f"文档「{change.document_name}」已{change_type_names[change.change_type]}"
-
-        # 添加通知
-        for user_id in subscribers:
-            self.db.add_notification(
-                user_id=user_id,
-                document_id=change.document_id,
-                document_name=change.document_name,
-                change_type=change.change_type.value,
-                message=message
-            )
-            logger.info(f"已通知用户 {user_id}: {message}")
 
     def sync_now(self) -> SyncResult:
         """立即执行同步"""
@@ -853,19 +740,6 @@ if __name__ == "__main__":
     print(f"同步状态: {result.status.value}")
     print(f"处理文档: {result.documents_processed}")
     print(f"新增: {result.documents_added}, 修改: {result.documents_modified}, 删除: {result.documents_deleted}")
-
-    # 测试订阅
-    print("\n[4] 测试订阅...")
-    if docs:
-        first_doc = list(docs.keys())[0]
-        sync_service.db.subscribe("test_user", first_doc, docs[first_doc]["document_name"])
-        subscribers = sync_service.db.get_subscribers(first_doc)
-        print(f"订阅 '{first_doc}' 的用户: {subscribers}")
-
-    # 测试通知
-    print("\n[5] 测试通知...")
-    notifications = sync_service.db.get_notifications("test_user", unread_only=True)
-    print(f"用户 test_user 的未读通知: {len(notifications)}")
 
     print("\n" + "=" * 60)
     print("测试完成")

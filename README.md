@@ -2,11 +2,18 @@
 
 基于本地向量模型 + Chroma向量数据库 + Neo4j知识图谱 + Qwen API 的智能知识库问答系统，支持双模式对话、Agentic RAG 和 Graph RAG。
 
-> **最新版本**: v6.0.0 (模块化重构：代码架构全面优化，模块职责清晰分离)
+> **最新版本**: v6.1.0 (部署准备版：优化表格摘要性能，统一解析器架构)
 
 ## 功能特性
 
-### 最新特性 (v6.0.0)
+### 最新特性 (v6.1.0)
+- **表格摘要优化**：引入懒加载机制，仅在查询时生成表格摘要，大幅提升向量库构建速度
+- **解析器统一**：全面采用 MinerU 解析器，删除旧解析器（docx_parser, pdf_plumber, pdf_odl）
+- **出题系统增强**：新增题目生成器（generator.py）和自动批改器（grader.py）
+- **知识库增强**：新增懒加载增强模块（lazy_enhance.py），支持按需生成表格摘要
+- **文档完善**：新增后端对接规范和架构部署方案文档
+
+### v6.0.0 特性
 - **模块化架构重构**：代码从单文件拆分为清晰的模块结构，提升可维护性
   - `core/` 核心引擎：查询分类、质量评估、置信度门控、推理反思、循环防护
   - `api/` 路由模块：11 个独立路由文件，职责单一
@@ -66,12 +73,10 @@ rag-agent/
 │   └── loop_guard.py        #   循环防护器
 │
 ├── parsers/                 # 文档解析器
-│   ├── pdf_odl.py           #   OpenDataLoader PDF 解析
-│   ├── pdf_plumber.py       #   PDF Plumber 解析
-│   ├── docx_docling.py      #   Docling 文档解析
-│   ├── docx_parser.py       #   Word 文档解析
-│   ├── excel_parser.py      #   增强版 Excel 解析
-│   ├── txt_parser.py        #   TXT 文本解析
+│   ├── mineru_parser.py      #   MinerU 统一解析（PDF/DOCX/PPTX/图片）
+│   ├── pdf_mineru.py         #   MinerU PDF 兼容别名
+│   ├── excel_parser.py       #   Excel 解析（Pandas 管道）
+│   ├── txt_parser.py         #   TXT 文本解析
 │   └── image_extractor.py   #   图片提取器
 │
 ├── knowledge/               # 知识库管理
@@ -483,7 +488,8 @@ USE_GRAPH_RAG = True
 
 | 版本 | 更新内容 |
 |------|----------|
-| **v6.0.0** | 模块化架构重构：代码拆分为 core/api/parsers/knowledge/services/auth/exam_pkg 模块；新增图片提取功能；前端优化；统一入口 main.py |
+| **v6.1.0** | 部署准备版：表格摘要懒加载优化、MinerU解析器统一、出题系统增强、新增后端对接规范文档 |
+| v6.0.0 | 模块化架构重构：代码拆分为 core/api/parsers/knowledge/services/auth/exam_pkg 模块；新增图片提取功能；前端优化；统一入口 main.py |
 | v5.0.0 | 多向量库权限控制、文档生命周期、本地出卷系统、ODL解析、Semantic Chunker |
 | v4.2.0 | 出题系统完善：试卷审核流程优化、前端界面修复 |
 | v4.1.0 | 前端日志面板：实时显示 Agent 思考过程，日志持久化 |

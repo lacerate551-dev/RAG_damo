@@ -96,3 +96,40 @@ class BM25Index:
         self.documents = []
         self.metadatas = []
         self.ids = []
+
+
+# ==================== 全局 BM25 索引管理器 ====================
+
+_bm25_indexer: BM25Index = None
+
+
+def get_bm25_indexer() -> BM25Index:
+    """
+    获取全局 BM25 索引器实例
+
+    Returns:
+        BM25Index 实例
+    """
+    global _bm25_indexer
+    if _bm25_indexer is None:
+        _bm25_indexer = BM25Index()
+    return _bm25_indexer
+
+
+def init_bm25_indexer(ids=None, documents=None, metadatas=None) -> BM25Index:
+    """
+    初始化 BM25 索引器并添加文档
+
+    Args:
+        ids: 文档 ID 列表
+        documents: 文档内容列表
+        metadatas: 元数据列表
+
+    Returns:
+        初始化后的 BM25Index 实例
+    """
+    global _bm25_indexer
+    _bm25_indexer = BM25Index()
+    if ids and documents:
+        _bm25_indexer.add_documents(ids, documents, metadatas or [])
+    return _bm25_indexer

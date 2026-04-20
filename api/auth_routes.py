@@ -98,11 +98,7 @@ def get_current_user():
     """
     获取当前用户信息
 
-    用户信息由网关注入到请求 Header 中：
-    - X-User-ID: 用户唯一标识
-    - X-User-Name: 用户名
-    - X-User-Role: 用户角色
-    - X-User-Department: 部门
+    开发模式下支持模拟用户，生产模式下用户信息由后端控制。
     """
     user = request.current_user
     return jsonify({

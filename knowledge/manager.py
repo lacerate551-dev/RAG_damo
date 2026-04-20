@@ -695,16 +695,25 @@ class KnowledgeBaseManager:
         kb_name: str,
         filepath: str,
         embedding_model=None,
-        extra_metadata: dict = None
+        extra_metadata: dict = None,
+        enable_table_summary: bool = True,
+        enable_image_description: bool = False
     ) -> int:
         """
-        添加文件到指定向量库
+        添加文件到指定向量库（v5 统一解析版）
+
+        使用统一的 parse_document() 入口，支持：
+        - PDF/DOCX/PPTX/图片 → MinerU 解析
+        - XLSX/XLS → Pandas 解析
+        - TXT → 文本解析
 
         Args:
             kb_name: 向量库名称
             filepath: 文件绝对路径
-            embedding_model: 向量模型（可选，默认使用 rag_demo 的）
+            embedding_model: 向量模型（可选，默认使用 engine 的）
             extra_metadata: 额外的元数据（如 status, version 等）
+            enable_table_summary: 是否启用表格摘要管道（LLM 生成摘要）
+            enable_image_description: 是否启用图片描述管道（VLM 生成描述）
 
         Returns:
             添加的片段数量
@@ -717,262 +726,511 @@ class KnowledgeBaseManager:
         # 获取向量模型
         if embedding_model is None:
             try:
-                from rag_demo import embedding_model as emb
-                embedding_model = emb
-            except ImportError:
-                logger.error("无法加载向量模型")
+                from core.engine import get_engine
+                engine = get_engine()
+                if not engine._initialized:
+                    engine.initialize()
+                embedding_model = engine.embedding_model
+            except Exception as e:
+                logger.error(f"无法加载向量模型: {e}")
                 return 0
 
-        ext = os.path.splitext(filepath)[1].lower()
-        supported_extensions = {'.txt', '.pdf', '.docx', '.xlsx'}
-
-        if ext not in supported_extensions:
-            logger.warning(f"不支持的文件格式: {ext}")
-            return 0
-
-        # 获取文件相对路径（作为 source）
         filename = os.path.basename(filepath)
         extra_metadata = extra_metadata or {}
-
-        total_chunks = 0
+        total_chunks = 0  # 在 try 块外初始化，确保异常时也可访问
 
         try:
-            if ext == '.pdf':
-                total_chunks = self._add_pdf_to_collection(
-                    collection, filepath, filename, embedding_model, extra_metadata
+            # 使用统一解析入口
+            from parsers import parse_document, convert_to_rag_format, SUPPORTED_FORMATS
+
+            ext = os.path.splitext(filepath)[1].lower()
+            if ext not in SUPPORTED_FORMATS:
+                logger.warning(f"不支持的文件格式: {ext}")
+                return 0
+
+            # 解析文档
+            logger.info(f"解析文档: {filename}")
+            parse_result = parse_document(
+                filepath,
+                output_base=".data/mineru_temp",
+                images_output=".data/images",
+                cleanup_after_image_move=True  # 解析后自动清理临时输出
+            )
+
+            # 转换为 RAG 格式
+            pages_content = convert_to_rag_format(parse_result)
+            chunks = parse_result.get('chunks', [])
+
+            if not pages_content:
+                logger.warning(f"文档解析结果为空: {filename}")
+                return 0
+
+            # 按 chunk_type 分类处理
+            text_chunks = []
+            table_chunks = []
+            image_chunks = []
+
+            for i, (page_info, chunk) in enumerate(zip(pages_content, chunks)):
+                chunk_type = page_info.get('chunk_type', 'text')
+                if chunk_type == 'table':
+                    table_chunks.append((i, page_info, chunk))
+                elif chunk_type in ('image', 'chart'):
+                    # 图片和图表统一处理
+                    image_chunks.append((i, page_info, chunk))
+                else:
+                    text_chunks.append((i, page_info, chunk))
+
+            # 1. 处理文本块 - 直接向量化入库
+            for idx, page_info, chunk in text_chunks:
+                text = page_info.get('text', '')
+                if not text.strip():
+                    continue
+
+                # 使用 chunk.content（已包含 Markdown 格式）
+                content = chunk.content if hasattr(chunk, 'content') else text
+
+                # 确保 content 是字符串类型，防止解析器产出 list 导致 Chroma 报错
+                if isinstance(content, list):
+                    content = '\n'.join(str(item) for item in content)
+                elif not isinstance(content, str):
+                    content = str(content)
+
+                vector = embedding_model.encode(content).tolist()
+                # 确保是 1D 列表（单个文档的向量）
+                if isinstance(vector[0], list):
+                    vector = vector[0]
+                chunk_id = f"{filename}_text_{idx}"
+
+                metadata = {
+                    'source': filename,
+                    'page': page_info.get('page', 0),
+                    'chunk_index': idx,
+                    'chunk_type': 'text',
+                    'section': page_info.get('section_path', '') or page_info.get('section', ''),
+                    'has_table': False,
+                    'collection': collection.name,
+                    **extra_metadata
+                }
+
+                collection.add(
+                    ids=[chunk_id],
+                    embeddings=[vector],
+                    documents=[content],
+                    metadatas=[metadata]
                 )
-            elif ext == '.docx':
-                total_chunks = self._add_docx_to_collection(
-                    collection, filepath, filename, embedding_model, extra_metadata
+                total_chunks += 1
+
+            # 2. 处理表格块 - 原始 Markdown 入库（Phase 3：不用 LLM）
+            for idx, page_info, chunk in table_chunks:
+                # 优先使用 page_info['text']（包含转换后的表格 Markdown），
+                # 而非 chunk.content（可能仅是 caption 如 "表格"）
+                table_md = page_info.get('text', '') or (chunk.content if hasattr(chunk, 'content') else '')
+
+                # 确保 table_md 是字符串类型
+                if isinstance(table_md, list):
+                    table_md = '\n'.join(str(item) for item in table_md)
+                elif not isinstance(table_md, str):
+                    table_md = str(table_md)
+
+                if not table_md.strip():
+                    continue
+
+                chunk_id = f"{filename}_table_{idx}"
+
+                # 表格元数据
+                table_meta = {
+                    'source': filename,
+                    'page': page_info.get('page', 0),
+                    'chunk_index': idx,
+                    'chunk_type': 'table',
+                    'has_table': True,
+                    'collection': collection.name,
+                    'has_summary': False,  # 标记：未调用 LLM
+                    **extra_metadata
+                }
+
+                # 如果表格有图片，添加 image_path
+                table_image_path = chunk.image_path if hasattr(chunk, 'image_path') and chunk.image_path else None
+                if table_image_path:
+                    table_meta['image_path'] = table_image_path
+
+                # 如果表格有关联图片列表（嵌入表格的图片），添加 images 字段
+                if hasattr(chunk, 'images') and chunk.images:
+                    table_meta['images'] = chunk.images
+
+                # 直接向量化原始表格（不调用 LLM）
+                vector = embedding_model.encode(table_md).tolist()
+                if isinstance(vector[0], list):
+                    vector = vector[0]
+
+                collection.add(
+                    ids=[chunk_id],
+                    embeddings=[vector],
+                    documents=[table_md],
+                    metadatas=[table_meta]
                 )
-            elif ext == '.xlsx':
-                total_chunks = self._add_xlsx_to_collection(
-                    collection, filepath, filename, embedding_model, extra_metadata
+
+                # 存储原始表格到 DocStore（用于后续展示）
+                self._store_original_table(chunk_id, table_md, table_meta)
+
+                total_chunks += 1
+
+            # 3. 处理图片块 - 轻量描述管道（Phase 2：不用 VLM）
+            for idx, page_info, chunk in image_chunks:
+                image_path = chunk.image_path if hasattr(chunk, 'image_path') else page_info.get('image_path')
+                if not image_path:
+                    continue
+
+                # 构建完整图片路径（图片已移动到 .data/images）
+                if not os.path.isabs(image_path):
+                    full_image_path = os.path.join('.data/images', image_path)
+                else:
+                    full_image_path = image_path
+
+                # 图片过滤（Phase 1）
+                context_text = chunk.content if hasattr(chunk, 'content') else ""
+                caption = page_info.get('caption', '')
+                if not self.should_process_image(full_image_path, context_text, caption):
+                    continue
+
+                chunk_id = f"{filename}_image_{idx}"
+
+                # 保留原始 chunk_type（image 或 chart）
+                original_chunk_type = page_info.get('chunk_type', 'image')
+
+                image_meta = {
+                    'source': filename,
+                    'page': page_info.get('page', 0),
+                    'chunk_index': idx,
+                    'chunk_type': original_chunk_type,
+                    'has_table': False,
+                    'collection': collection.name,
+                    'image_path': image_path,  # 存储相对路径（文件名）
+                    'has_vlm_desc': False,  # 标记：未调用 VLM
+                    **extra_metadata
+                }
+
+                # 生成轻量描述（不用 VLM）
+                description = self.generate_lightweight_image_description(full_image_path, chunk, page_info)
+
+                # 向量化入库
+                vector = embedding_model.encode(description).tolist()
+                if isinstance(vector[0], list):
+                    vector = vector[0]
+
+                collection.add(
+                    ids=[chunk_id],
+                    embeddings=[vector],
+                    documents=[description],
+                    metadatas=[image_meta]
                 )
-            elif ext == '.txt':
-                total_chunks = self._add_txt_to_collection(
-                    collection, filepath, filename, embedding_model, extra_metadata
-                )
+
+                # 图片路径存入 DocStore
+                self._store_image_reference(chunk_id, image_path, image_meta)
+
+                total_chunks += 1
 
             # 重建 BM25 索引
             if total_chunks > 0:
                 self._rebuild_bm25_index(kb_name)
 
-            logger.info(f"添加文件到 {kb_name}: {filename}, 片段数: {total_chunks}")
+            logger.info(f"添加文件到 {kb_name}: {filename}, 片段数: {total_chunks} "
+                       f"(文本:{len(text_chunks)}, 表格:{len(table_chunks)}, 图片:{len(image_chunks)})")
 
         except Exception as e:
-            logger.error(f"添加文件失败: {filepath}, 错误: {e}")
+            import traceback
+            logger.error(f"添加文件失败: {filepath}, 错误: {e}\n{traceback.format_exc()}")
 
         return total_chunks
 
-    def _add_pdf_to_collection(self, collection, filepath, filename, embedding_model, extra_metadata):
-        """添加 PDF 文件"""
+    def _generate_table_summary(self, table_md: str, chunk) -> str:
+        """
+        生成表格摘要（带容错）
+
+        Args:
+            table_md: 表格 Markdown 内容（应包含实际表格数据）
+            chunk: 原始 chunk 对象（用于提取元数据）
+
+        Returns:
+            表格摘要文本
+        """
+        import re
+
+        # 从 Markdown 内容计算实际行数（匹配 | 开头的行，排除分隔行）
+        md_lines = [line for line in table_md.split('\n') if line.strip().startswith('|')]
+        separator_lines = [line for line in md_lines if re.match(r'^[\|\s\-:]+$', line.strip())]
+        row_count = len(md_lines) - len(separator_lines)
+
+        # 智能提取标题：chunk.title → 表格首行列名 → 降级
+        title = getattr(chunk, 'title', '') if hasattr(chunk, 'title') else ''
+        if not title or title == '表格':
+            title = self._extract_table_title(table_md)
+
+        # 小表格跳过 LLM（仅限 < 3 数据行且 < 200 字符的微型表格）
+        if row_count < 3 and len(table_md) < 200:
+            return f"小型表格（{row_count}行）：{title}"
+
         try:
-            from parsers import extract_text_from_pdf, IMAGE_EXTRACTOR_AVAILABLE, get_images_base_path
-            from core.chunker import split_text
+            from config import get_llm_client, DASHSCOPE_MODEL
+            client = get_llm_client()
+
+            prompt = f"""请用简洁的语言总结以下表格的内容，包括：
+1. 表格主题
+2. 主要列名
+3. 关键数据趋势或结论
+
+表格内容：
+{table_md[:2000]}
+
+请直接输出摘要（不超过100字）："""
+
+            response = client.chat.completions.create(
+                model=DASHSCOPE_MODEL,  # 使用配置文件中的模型
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200
+            )
+
+            return response.choices[0].message.content.strip()
+
+        except Exception as e:
+            logger.warning(f"表格摘要生成失败: {e}，使用降级摘要")
+            return f"表格（{row_count}行）：{title}"
+
+    @staticmethod
+    def _extract_table_title(table_md: str) -> str:
+        """
+        从表格 Markdown 内容提取标题（列名摘要）
+
+        优先从 Markdown 表格首行提取列名，
+        如无法提取，使用【表格】前缀后的文本。
+
+        Args:
+            table_md: 表格 Markdown 内容
+
+        Returns:
+            提取的标题字符串
+        """
+        import re
+
+        # 尝试从【表格】标记后提取标题
+        title_match = re.search(r'【表格】(.+?)\n', table_md)
+        if title_match:
+            extracted = title_match.group(1).strip()
+            if extracted and extracted != '表格':
+                return extracted
+
+        # 尝试从 Markdown 表头行提取列名
+        for line in table_md.split('\n'):
+            line = line.strip()
+            if line.startswith('|') and not re.match(r'^[\|\s\-:]+$', line):
+                cols = [c.strip() for c in line.split('|') if c.strip()]
+                if cols:
+                    display = '、'.join(cols[:4])
+                    if len(cols) > 4:
+                        display += '等'
+                    return display
+
+        # 尝试从 HTML 标签提取（如 <strong>xxx</strong>）
+        strong_match = re.findall(r'<strong>(.*?)</strong>', table_md[:300])
+        if strong_match:
+            cols = [s.strip() for s in strong_match if s.strip() and s.strip() not in ('', ':', '：')]
+            if cols:
+                display = '、'.join(cols[:4])
+                if len(cols) > 4:
+                    display += '等'
+                return display
+
+        return "数据表格"
+
+    def should_process_image(self, image_path: str, context_text: str, caption: str = "") -> bool:
+        """
+        判断图片是否值得处理（Phase 1：图片过滤）
+
+        Args:
+            image_path: 图片路径
+            context_text: 上下文文本
+            caption: 图片标题
+
+        Returns:
+            是否处理该图片
+        """
+        filename = os.path.basename(image_path).lower()
+
+        # 规则 1：文件名过滤
+        junk_keywords = ["logo", "icon", "qr", "watermark", "banner", "button", "avatar"]
+        if any(kw in filename for kw in junk_keywords):
+            logger.debug(f"图片过滤：文件名包含垃圾关键词 - {filename}")
+            return False
+
+        # 规则 2：尺寸过滤
+        try:
+            from PIL import Image
+            with Image.open(image_path) as img:
+                width, height = img.size
+                if width < 100 or height < 100:
+                    logger.debug(f"图片过滤：尺寸过小 ({width}x{height}) - {filename}")
+                    return False
+        except Exception as e:
+            logger.warning(f"图片尺寸检查失败: {e}")
+            # 尺寸检查失败不影响处理
+            pass
+
+        # 规则 3：上下文相关性（放宽要求）
+        # 只要有 caption 或者有一定上下文就保留
+        if len(caption) >= 3:
+            return True
+        if len(context_text) >= 10:
+            return True
+
+        # 如果完全没有上下文信息，也保留（可能是独立图片）
+        logger.debug(f"图片保留：{filename}")
+        return True
+
+    def generate_lightweight_image_description(self, image_path: str, chunk, page_info: dict) -> str:
+        """
+        生成轻量级图片描述（Phase 2：不用 VLM）
+
+        信息来源：文件名 + 标题/caption + 章节路径 + 页码
+
+        Args:
+            image_path: 图片路径
+            chunk: 原始 chunk 对象
+            page_info: 页面信息字典
+
+        Returns:
+            轻量级描述文本
+        """
+        parts = []
+
+        # 1. 图片类型
+        chunk_type = page_info.get('chunk_type', 'image')
+        type_label = "图表" if chunk_type == 'chart' else "图片"
+
+        # 2. 标题或 caption
+        title = chunk.title if hasattr(chunk, 'title') and chunk.title else ""
+        caption = page_info.get('caption', '')
+
+        # 3. 章节路径
+        section = page_info.get('section_path', '') or page_info.get('section', '')
+
+        # 4. 页码
+        page = page_info.get('page', 0)
+
+        # 组装描述
+        if caption:
+            parts.append(caption)
+        elif title and title not in ("图片", "图表"):
+            parts.append(title)
+
+        if section:
+            parts.append(f"位于「{section}」")
+
+        parts.append(f"第{page}页")
+
+        return f"{type_label}：{'，'.join(parts)}"
+
+    def _generate_image_description(self, image_path: str) -> str:
+        """
+        生成图片描述（VLM）
+
+        Args:
+            image_path: 图片路径
+
+        Returns:
+            图片描述文本
+        """
+        try:
+            import base64
+            from config import get_llm_client, DASHSCOPE_BASE_URL, DASHSCOPE_API_KEY, DASHSCOPE_VL_MODEL
+
+            # 读取图片并编码
+            with open(image_path, 'rb') as f:
+                image_data = base64.b64encode(f.read()).decode('utf-8')
+
+            # 获取图片格式
+            ext = os.path.splitext(image_path)[1].lower()
+            image_format = 'png' if ext in ['.png', '.jpg', '.jpeg'] else 'png'
+
+            client = get_llm_client()
+
+            # 使用视觉模型
+            response = client.chat.completions.create(
+                model=DASHSCOPE_VL_MODEL,  # 使用配置文件中的视觉模型
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "请简要描述这张图片的内容，不超过100字。"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/{image_format};base64,{image_data}"}}
+                    ]
+                }],
+                max_tokens=200
+            )
+
+            return response.choices[0].message.content.strip()
+
+        except Exception as e:
+            logger.warning(f"图片描述生成失败: {e}")
+            return f"图片：{os.path.basename(image_path)}"
+
+    def _store_original_table(self, doc_id: str, table_md: str, metadata: dict):
+        """
+        存储原始表格到 DocStore
+
+        Args:
+            doc_id: 文档 ID
+            table_md: 表格 Markdown 内容
+            metadata: 元数据
+        """
+        try:
             import json
-        except ImportError:
-            logger.error("无法导入 PDF 处理函数")
-            return 0
+            from pathlib import Path
 
-        total_chunks = 0
+            # 使用文件系统作为 DocStore
+            docstore_dir = Path(".data/docstore")
+            docstore_dir.mkdir(parents=True, exist_ok=True)
 
-        # 提取图片（启用图片提取）
-        images_output_dir = None
-        if IMAGE_EXTRACTOR_AVAILABLE:
-            try:
-                images_output_dir = get_images_base_path()
-            except:
-                pass
+            record = {
+                "content_type": "table",
+                "markdown": table_md,
+                "meta": metadata
+            }
 
-        result = extract_text_from_pdf(filepath, extract_images=True, images_output_dir=images_output_dir)
+            doc_path = docstore_dir / f"{doc_id}.json"
+            with open(doc_path, 'w', encoding='utf-8') as f:
+                json.dump(record, f, ensure_ascii=False, indent=2)
 
-        # 处理返回值（可能是 tuple 或 list）
-        if isinstance(result, tuple):
-            pages, images_info = result
-        else:
-            pages = result
-            images_info = []
+        except Exception as e:
+            logger.warning(f"存储原始表格失败: {e}")
 
-        if pages:
-            for page_info in pages:
-                page_text = page_info.get('text', '')
-                if not page_text.strip():
-                    continue
+    def _store_image_reference(self, doc_id: str, image_path: str, metadata: dict):
+        """
+        存储图片引用到 DocStore
 
-                page_num = page_info.get('page', 0)
-                has_table = page_info.get('has_table', False) or page_info.get('chunk_type') == 'table'
-                section = page_info.get('section', '')
-                images = page_info.get('images', [])
-
-                chunks = split_text(page_text)
-
-                for i, chunk in enumerate(chunks):
-                    vector = embedding_model.encode(chunk).tolist()
-                    chunk_id = f"{filename}_p{page_num}_{i}_{total_chunks}"
-
-                    metadata = {
-                        'source': filename,
-                        'page': page_num,
-                        'chunk_index': i,
-                        'has_table': has_table,
-                        'section': section,
-                        'collection': collection.name,
-                        **extra_metadata
-                    }
-
-                    # 序列化图片信息
-                    if images:
-                        metadata['images_json'] = json.dumps(images, ensure_ascii=False)
-
-                    collection.add(
-                        ids=[chunk_id],
-                        embeddings=[vector],
-                        documents=[chunk],
-                        metadatas=[metadata]
-                    )
-                    total_chunks += 1
-
-            logger.info(f"添加 {filename}: {total_chunks} 个片段 (PDF, {len(pages)}页)")
-
-        return total_chunks
-
-    def _add_docx_to_collection(self, collection, filepath, filename, embedding_model, extra_metadata):
-        """添加 DOCX 文件"""
+        Args:
+            doc_id: 文档 ID
+            image_path: 图片路径
+            metadata: 元数据
+        """
         try:
-            from parsers import extract_text_from_docx
-            from core.chunker import split_text
-        except ImportError:
-            logger.error("无法导入 DOCX 处理函数")
-            return 0
+            import json
+            from pathlib import Path
 
-        total_chunks = 0
-        blocks = extract_text_from_docx(filepath)
+            docstore_dir = Path(".data/docstore")
+            docstore_dir.mkdir(parents=True, exist_ok=True)
 
-        if blocks:
-            for block in blocks:
-                text = block['text']
-                if len(text.strip()) < 10:
-                    continue
+            record = {
+                "content_type": "image",
+                "storage_type": "file",
+                "file_path": image_path,
+                "meta": metadata
+            }
 
-                is_table = block.get('is_table', False)
-                section = block.get('section', '')
+            doc_path = docstore_dir / f"{doc_id}.json"
+            with open(doc_path, 'w', encoding='utf-8') as f:
+                json.dump(record, f, ensure_ascii=False, indent=2)
 
-                chunks = [text] if is_table else split_text(text)
-
-                for i, chunk in enumerate(chunks):
-                    vector = embedding_model.encode(chunk).tolist()
-                    chunk_id = f"{filename}_{total_chunks}_{i}"
-
-                    metadata = {
-                        'source': filename,
-                        'chunk_index': total_chunks,
-                        'is_table': is_table,
-                        'section': section,
-                        'collection': collection.name,
-                        **extra_metadata
-                    }
-
-                    collection.add(
-                        ids=[chunk_id],
-                        embeddings=[vector],
-                        documents=[chunk],
-                        metadatas=[metadata]
-                    )
-                    total_chunks += 1
-
-            tables_count = sum(1 for b in blocks if b.get('is_table'))
-            logger.info(f"添加 {filename}: {total_chunks} 个片段 (Word, {len(blocks)}段落)")
-
-        return total_chunks
-
-    def _add_xlsx_to_collection(self, collection, filepath, filename, embedding_model, extra_metadata):
-        """添加 XLSX 文件"""
-        try:
-            from parsers import extract_text_from_xlsx
-        except ImportError:
-            logger.error("无法导入 XLSX 处理函数")
-            return 0
-
-        total_chunks = 0
-        rows = extract_text_from_xlsx(filepath)
-
-        if rows:
-            for row_info in rows:
-                text = row_info['text']
-                if len(text.strip()) < 5:
-                    continue
-
-                sheet = row_info['sheet']
-                row_num = row_info['row']
-                is_header = row_info.get('is_header', False)
-                header = row_info.get('header', '')
-
-                full_text = text
-                if header and not is_header:
-                    full_text = f"【表头: {header}】\n{text}"
-
-                vector = embedding_model.encode(full_text).tolist()
-                chunk_id = f"{filename}_{sheet}_{row_num}"
-
-                metadata = {
-                    'source': filename,
-                    'sheet': sheet,
-                    'row': row_num,
-                    'is_header': is_header,
-                    'collection': collection.name,
-                    **extra_metadata
-                }
-
-                collection.add(
-                    ids=[chunk_id],
-                    embeddings=[vector],
-                    documents=[full_text],
-                    metadatas=[metadata]
-                )
-                total_chunks += 1
-
-            sheets = set(r['sheet'] for r in rows)
-            logger.info(f"添加 {filename}: {total_chunks} 个片段 (Excel, {len(sheets)}工作表)")
-
-        return total_chunks
-
-    def _add_txt_to_collection(self, collection, filepath, filename, embedding_model, extra_metadata):
-        """添加 TXT 文件"""
-        try:
-            from parsers import extract_text_from_txt
-            from core.chunker import split_text
-        except ImportError:
-            logger.error("无法导入 TXT 处理函数")
-            return 0
-
-        total_chunks = 0
-        content = extract_text_from_txt(filepath)
-
-        if content.strip():
-            chunks = split_text(content)
-            for i, chunk in enumerate(chunks):
-                vector = embedding_model.encode(chunk).tolist()
-                chunk_id = f"{filename}_{i}"
-
-                metadata = {
-                    'source': filename,
-                    'chunk_index': i,
-                    'collection': collection.name,
-                    **extra_metadata
-                }
-
-                collection.add(
-                    ids=[chunk_id],
-                    embeddings=[vector],
-                    documents=[chunk],
-                    metadatas=[metadata]
-                )
-                total_chunks += 1
-
-            logger.info(f"添加 {filename}: {total_chunks} 个片段 (TXT)")
-
-        return total_chunks
+        except Exception as e:
+            logger.warning(f"存储图片引用失败: {e}")
 
     def _rebuild_bm25_index(self, kb_name: str):
         """重建指定向量库的 BM25 索引"""

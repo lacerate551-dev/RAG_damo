@@ -5,15 +5,30 @@
 - POST   /feedback                          - 提交反馈
 - GET    /feedback/stats                    - 反馈统计
 - GET    /feedback/list                     - 反馈列表
+- GET    /feedback/bad-cases                - Bad Case 分析（管理员）
+- GET    /feedback/blacklist                - Chunk 黑名单（管理员）
 - GET    /reports/weekly                    - 周报告
 - GET    /reports/monthly                   - 月报告
 - GET    /faq                               - FAQ列表
-- POST   /faq                               - 新增FAQ (管理员)
+- POST   /faq                               - 新增FAQ (管理员，需二次确认)
 - PUT    /faq/<faq_id>                      - 更新FAQ (管理员)
 - DELETE /faq/<faq_id>                      - 删除FAQ (管理员)
+- POST   /faq/<faq_id>/approve              - 批准FAQ并同步知识库 (管理员)
 - GET    /faq/suggestions                   - FAQ建议列表 (管理员)
-- POST   /faq/suggestions/<id>/approve      - 批准建议 (管理员)
+- POST   /faq/suggestions/<id>/approve      - 批准建议并同步知识库 (管理员)
 - POST   /faq/suggestions/<id>/reject       - 拒绝建议 (管理员)
+
+安全设计（二次确认机制）：
+所有 FAQ 入库都需要管理员二次确认，防止错误数据污染知识库：
+1. 用户反馈 → FAQ 建议 (pending)
+2. 管理员创建 → FAQ 草稿 (draft)
+3. 二次确认 → 同步 ChromaDB (approved)
+
+反馈飞轮机制：
+1. 用户反馈 → 自动沉淀为 FAQ 建议（复合分数 > 0.5）
+2. 管理员批准 → FAQ 同步到 ChromaDB（问题扩写 + 向量化）
+3. 检索时 → FAQ 分数加权 + 时间衰减 + 黑名单过滤
+4. LLM 生成 → FAQ 作为 Golden Context 融合回答
 """
 
 from flask import Blueprint, request, jsonify
@@ -30,7 +45,7 @@ def _get_feedback_db():
     global _feedback_db
     if _feedback_db is None:
         from services.feedback import FeedbackDB
-        _feedback_db = FeedbackDB("./data/feedback.db")
+        _feedback_db = FeedbackDB()
     return _feedback_db
 
 
@@ -182,7 +197,14 @@ def get_faq_list():
 @require_gateway_auth
 @require_role('admin')
 def create_faq():
-    """新增FAQ（管理员）"""
+    """
+    新增FAQ（管理员）- 创建后需二次确认同步
+
+    安全设计：
+    1. 管理员创建的 FAQ 默认状态为 'draft'
+    2. 需要通过 /faq/<id>/approve 接口二次确认
+    3. 确认后才同步到 ChromaDB
+    """
     data = request.get_json()
 
     question = data.get('question')
@@ -194,17 +216,64 @@ def create_faq():
     try:
         from services.feedback import FAQ
         feedback_db = _get_feedback_db()
+
+        # 管理员创建也进入 draft 状态，需要二次确认
         faq = FAQ(
             question=question,
             answer=answer,
             source_documents=data.get('source_documents', []),
-            status=data.get('status', 'approved')
+            status='draft'  # 强制为 draft，需要二次确认
         )
         faq_id = feedback_db.add_faq(faq)
+
         return jsonify({
             "success": True,
             "faq_id": faq_id,
-            "message": "FAQ创建成功"
+            "status": "draft",
+            "message": "FAQ已创建，请通过 /faq/<id>/approve 接口确认后生效"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@feedback_bp.route('/faq/<int:faq_id>/approve', methods=['POST'])
+@require_gateway_auth
+@require_role('admin')
+def approve_faq(faq_id):
+    """
+    批准FAQ并同步到知识库（管理员二次确认）
+
+    适用于：
+    1. 管理员手动创建的 FAQ
+    2. 从 FAQ 建议转为正式的 FAQ
+    """
+    try:
+        feedback_db = _get_feedback_db()
+
+        # 检查 FAQ 状态
+        faq = feedback_db.get_faq(faq_id)
+        if not faq:
+            return jsonify({"error": "FAQ不存在"}), 404
+
+        if faq.get('status') == 'approved':
+            return jsonify({"success": True, "message": "FAQ已经是批准状态"})
+
+        # 更新状态为 approved
+        feedback_db.update_faq(faq_id, {"status": "approved"})
+
+        # 同步到知识库
+        feedback_service = _get_feedback_service()
+        sync_success = feedback_service._sync_faq_to_knowledge_base(
+            faq_id=faq_id,
+            question=faq['question'],
+            answer=faq['answer']
+        )
+
+        return jsonify({
+            "success": True,
+            "faq_id": faq_id,
+            "sync_status": "synced" if sync_success else "sync_failed",
+            "message": "FAQ已批准并同步到知识库"
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -232,10 +301,26 @@ def update_faq(faq_id):
 @require_gateway_auth
 @require_role('admin')
 def delete_faq(faq_id):
-    """删除FAQ（管理员）"""
+    """
+    删除FAQ（管理员）- 同步删除向量库数据
+
+    由于 FAQ 存储在独立的集合中，删除时可以精确清理，
+    不会影响普通文档向量库。
+    """
     try:
         feedback_db = _get_feedback_db()
+
+        # 先获取 FAQ 信息（用于删除向量）
+        faq = feedback_db.get_faq(faq_id)
+
+        # 删除数据库记录
         deleted = feedback_db.delete_faq(faq_id)
+
+        if deleted and faq:
+            # 同步删除向量库中的 FAQ 向量
+            feedback_service = _get_feedback_service()
+            feedback_service._delete_faq_vectors(faq_id)
+
         return jsonify({
             "success": deleted,
             "message": "FAQ删除成功" if deleted else "FAQ不存在"
@@ -268,18 +353,20 @@ def get_faq_suggestions():
 @require_gateway_auth
 @require_role('admin')
 def approve_faq_suggestion(suggestion_id):
-    """批准FAQ建议（管理员）"""
+    """批准FAQ建议并同步到知识库（管理员）"""
     try:
-        feedback_db = _get_feedback_db()
-        faq_id = feedback_db.approve_faq_suggestion(suggestion_id)
-        if faq_id > 0:
+        feedback_service = _get_feedback_service()
+        result = feedback_service.approve_and_sync_faq(suggestion_id)
+
+        if result.get('success'):
             return jsonify({
                 "success": True,
-                "faq_id": faq_id,
-                "message": "FAQ建议已批准"
+                "faq_id": result['faq_id'],
+                "sync_status": result.get('sync_status'),
+                "message": "FAQ建议已批准并同步到知识库"
             })
         else:
-            return jsonify({"error": "建议不存在"}), 404
+            return jsonify({"error": result.get('error', '批准失败')}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -295,6 +382,74 @@ def reject_faq_suggestion(suggestion_id):
         return jsonify({
             "success": rejected,
             "message": "FAQ建议已拒绝" if rejected else "建议不存在"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ==================== Bad Case 分析接口 ====================
+
+@feedback_bp.route('/feedback/bad-cases', methods=['GET'])
+@require_gateway_auth
+@require_role('admin')
+def get_bad_cases():
+    """
+    获取负反馈 Bad Case 列表（管理员）
+
+    用于分析和改进 RAG 系统：
+    - 识别高频失败查询
+    - 发现知识库盲区
+    - 优化检索策略
+    """
+    limit = request.args.get('limit', 20, type=int)
+
+    try:
+        feedback_service = _get_feedback_service()
+
+        # 获取低分问题
+        bad_cases = feedback_service.get_low_rating_queries(limit=limit)
+
+        # 获取黑名单来源
+        blacklisted_sources = feedback_service.get_low_rated_sources(min_count=3)
+
+        # 标记处理状态
+        for case in bad_cases:
+            case['status'] = 'pending'  # pending/resolved/ignored
+
+        return jsonify({
+            "success": True,
+            "bad_cases": bad_cases,
+            "blacklisted_sources": blacklisted_sources,
+            "suggestions": [
+                "补充到知识库（针对知识盲区）",
+                "添加到 Query Rewrite 规则（针对表达歧义）",
+                "标记为知识库盲区（暂不处理）"
+            ]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@feedback_bp.route('/feedback/blacklist', methods=['GET'])
+@require_gateway_auth
+@require_role('admin')
+def get_chunk_blacklist():
+    """
+    获取 Chunk 黑名单（管理员）
+
+    返回被多次点踩的来源，用于在检索时降权或过滤
+    """
+    min_dislikes = request.args.get('min_dislikes', 3, type=int)
+
+    try:
+        feedback_service = _get_feedback_service()
+        blacklist = feedback_service.get_chunk_blacklist(min_dislikes=min_dislikes)
+
+        return jsonify({
+            "success": True,
+            "blacklist": list(blacklist),
+            "count": len(blacklist),
+            "usage": "在检索时过滤这些来源以提升回答质量"
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500

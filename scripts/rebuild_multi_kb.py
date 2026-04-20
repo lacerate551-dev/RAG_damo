@@ -1,7 +1,8 @@
 """
-重建多向量知识库脚本
+重建多向量知识库脚本（v5 统一解析版）
 
 将现有文档按部门/类别分配到不同的向量库中
+使用统一的 parse_document() 入口
 """
 
 import os
@@ -19,15 +20,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from sentence_transformers import SentenceTransformer
 
 from config import DOCUMENTS_PATH, EMBEDDING_MODEL_PATH
-from parsers import (
-    extract_text_from_pdf,
-    extract_text_from_docx,
-    extract_text_from_xlsx,
-    extract_text_from_txt,
-    IMAGE_EXTRACTOR_AVAILABLE,
-    get_images_base_path
-)
-from core.chunker import split_text
+from parsers import parse_document, convert_to_rag_format, SUPPORTED_FORMATS
 from knowledge.manager import KnowledgeBaseManager, PUBLIC_KB_NAME
 
 
@@ -60,12 +53,11 @@ def get_target_kb(filepath: str) -> str:
 def scan_documents(documents_path: str) -> list:
     """扫描文档目录"""
     documents = []
-    supported_extensions = {'.pdf', '.docx', '.xlsx', '.txt'}
 
     for root, dirs, files in os.walk(documents_path):
         for filename in files:
             ext = os.path.splitext(filename)[1].lower()
-            if ext in supported_extensions:
+            if ext in SUPPORTED_FORMATS:
                 filepath = os.path.join(root, filename)
                 relpath = os.path.relpath(filepath, documents_path)
                 documents.append({
@@ -78,150 +70,72 @@ def scan_documents(documents_path: str) -> list:
     return documents
 
 
-def process_document(doc_info: dict, embedding_model, images_output_dir: str = None) -> tuple:
+def process_document(doc_info: dict, embedding_model) -> tuple:
     """
-    处理单个文档，返回 (target_kb, chunks, images_count)
+    处理单个文档，返回 (target_kb, chunks)
+
+    使用统一的 parse_document() 入口
 
     Returns:
-        (目标向量库名, [(text, metadata), ...], 提取的图片数量)
+        (目标向量库名, [(text, metadata), ...])
     """
     filepath = doc_info['filepath']
     filename = doc_info['filename']
-    ext = doc_info['ext']
     relpath = doc_info['relpath']
 
     # 确定目标向量库
     target_kb = get_target_kb(relpath)
 
     chunks = []
-    images_count = 0
 
     try:
-        if ext == '.pdf':
-            # 提取文本和图片
-            extract_img = IMAGE_EXTRACTOR_AVAILABLE and images_output_dir is not None
-            result = extract_text_from_pdf(
-                filepath,
-                extract_images=extract_img,
-                images_output_dir=images_output_dir
-            )
+        # 使用统一解析入口
+        parse_result = parse_document(
+            filepath,
+            output_base=".data/mineru_temp",
+            images_output=".data/images",
+            cleanup_after_image_move=True
+        )
 
-            # 处理返回值（可能是 tuple 或 list）
-            if isinstance(result, tuple):
-                pages, doc_images = result
-                images_count = len(doc_images) if doc_images else 0
-            else:
-                pages = result
-                images_count = 0
+        # 转换为 RAG 格式
+        pages_content = convert_to_rag_format(parse_result)
+        raw_chunks = parse_result.get('chunks', [])
 
-            for i, page in enumerate(pages):
-                text = page.get('text', '')
-                if not text.strip():
-                    continue
+        for i, (page_info, chunk) in enumerate(zip(pages_content, raw_chunks)):
+            text = chunk.content if hasattr(chunk, 'content') else page_info.get('text', '')
+            if not text.strip():
+                continue
 
-                # 检查是否已经是智能分块
-                if page.get('is_odl_chunk'):
-                    # 过滤空的 metadata 字段（ChromaDB 不允许空列表）
-                    metadata = {
-                        'source': filename,
-                        'page': page.get('page', 0),
-                        'page_end': page.get('page_end', 0),
-                        'has_table': page.get('has_table', False),
-                        'section': page.get('section', ''),
-                        'section_path': page.get('section_path', ''),
-                        'is_odl_chunk': True,
-                        'collection': target_kb,
-                        'status': 'active'
-                    }
-                    # 图片信息序列化为 JSON 字符串（ChromaDB metadata 只支持基本类型）
-                    if page.get('images'):
-                        import json
-                        metadata['images_json'] = json.dumps(page.get('images'), ensure_ascii=False)
+            # 构建元数据
+            metadata = {
+                'source': filename,
+                'page': page_info.get('page', 0),
+                'chunk_index': i,
+                'chunk_type': page_info.get('chunk_type', 'text'),
+                'has_table': page_info.get('chunk_type') == 'table',
+                'section': page_info.get('section_path', '') or page_info.get('section', ''),
+                'collection': target_kb,
+                'status': 'active'
+            }
 
-                    chunks.append((text, metadata))
-                else:
-                    # 传统分块
-                    for j, chunk in enumerate(split_text(text)):
-                        chunks.append((chunk, {
-                            'source': filename,
-                            'page': page.get('page', 0),
-                            'chunk_index': j,
-                            'has_table': page.get('has_table', False),
-                            'section': page.get('section', ''),
-                            'collection': target_kb,
-                            'status': 'active'
-                        }))
+            # 图片信息
+            if hasattr(chunk, 'image_path') and chunk.image_path:
+                import json
+                metadata['images_json'] = json.dumps([{'id': chunk.image_path}], ensure_ascii=False)
 
-        elif ext == '.docx':
-            blocks = extract_text_from_docx(filepath)
-            for i, block in enumerate(blocks):
-                text = block.get('text', '')
-                if not text.strip() or len(text.strip()) < 10:
-                    continue
-
-                if block.get('is_docling_chunk'):
-                    chunks.append((text, {
-                        'source': filename,
-                        'section': block.get('section', ''),
-                        'is_table': block.get('is_table', False),
-                        'is_docling_chunk': True,
-                        'collection': target_kb,
-                        'status': 'active'
-                    }))
-                else:
-                    # 检查是否是表格，表格不分割
-                    if block.get('is_table'):
-                        chunks.append((text, {
-                            'source': filename,
-                            'is_table': True,
-                            'collection': target_kb,
-                            'status': 'active'
-                        }))
-                    else:
-                        for j, chunk in enumerate(split_text(text)):
-                            chunks.append((chunk, {
-                                'source': filename,
-                                'chunk_index': len(chunks),
-                                'is_table': False,
-                                'collection': target_kb,
-                                'status': 'active'
-                            }))
-
-        elif ext == '.xlsx':
-            rows = extract_text_from_xlsx(filepath)
-            for row in rows:
-                text = row.get('text', '')
-                if not text.strip() or len(text.strip()) < 5:
-                    continue
-                chunks.append((text, {
-                    'source': filename,
-                    'sheet': row.get('sheet', ''),
-                    'row': row.get('row', 0),
-                    'is_header': row.get('is_header', False),
-                    'collection': target_kb,
-                    'status': 'active'
-                }))
-
-        elif ext == '.txt':
-            content = extract_text_from_txt(filepath)
-            if content.strip():
-                for i, chunk in enumerate(split_text(content)):
-                    chunks.append((chunk, {
-                        'source': filename,
-                        'chunk_index': i,
-                        'collection': target_kb,
-                        'status': 'active'
-                    }))
+            chunks.append((text, metadata))
 
     except Exception as e:
         print(f"    解析错误 {filename}: {e}")
+        import traceback
+        traceback.print_exc()
 
-    return target_kb, chunks, images_count
+    return target_kb, chunks
 
 
 def main():
     print("=" * 60)
-    print("重建多向量知识库")
+    print("重建多向量知识库（v5 统一解析版）")
     print("=" * 60)
 
     # 0. 清理现有向量库（避免重复数据）
@@ -243,13 +157,6 @@ def main():
     print("\n[2/6] 初始化知识库管理器...")
     kb_manager = KnowledgeBaseManager()
     print("  [OK] 知识库管理器初始化完成")
-
-    # 3. 创建图片输出目录
-    images_output_dir = None
-    if IMAGE_EXTRACTOR_AVAILABLE:
-        images_output_dir = get_images_base_path()
-        os.makedirs(images_output_dir, exist_ok=True)
-        print(f"\n[2.5/5] 图片输出目录: {images_output_dir}")
 
     # 3. 创建向量库
     print("\n[3/6] 创建向量库...")
@@ -276,17 +183,16 @@ def main():
     print("\n[4/6] 扫描文档...")
     documents = scan_documents(DOCUMENTS_PATH)
     print(f"  共发现 {len(documents)} 个文档")
+    print(f"  支持的格式: {', '.join(SUPPORTED_FORMATS.keys())}")
 
     # 5. 向量化并写入
     print("\n[5/6] 向量化并写入向量库...")
     stats = {}
     total_chunks = 0
-    total_images = 0
     BATCH_SIZE = 100  # 每批写入数量
 
     for i, doc in enumerate(documents):
-        target_kb, chunks, images_count = process_document(doc, embedding_model, images_output_dir)
-        total_images += images_count
+        target_kb, chunks = process_document(doc, embedding_model)
 
         if not chunks:
             continue
@@ -324,7 +230,7 @@ def main():
     print("\n重建 BM25 索引...")
     for kb_name in stats.keys():
         try:
-            kb_manager.rebuild_bm25_index(kb_name)
+            kb_manager._rebuild_bm25_index(kb_name)
             print(f"  [OK] {kb_name} BM25 索引完成")
         except Exception as e:
             print(f"  [!] {kb_name} BM25 索引失败: {e}")
@@ -335,7 +241,6 @@ def main():
     print("=" * 60)
     print(f"总文档数: {len(documents)}")
     print(f"总 chunks: {total_chunks}")
-    print(f"提取图片: {total_images} 张")
     print("\n各向量库统计:")
     for kb, count in sorted(stats.items()):
         print(f"  {kb}: {count} chunks")

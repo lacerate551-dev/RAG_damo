@@ -571,6 +571,194 @@ class FeedbackService:
             logger.warning("未找到LLM配置，改进建议功能受限")
             self.llm_client = None
 
+    # ==================== FAQ 问题扩写（Multi-Query Indexing）====================
+
+    def _expand_faq_questions(self, question: str) -> List[str]:
+        """
+        用 LLM 扩写 FAQ 问题为 3 种不同问法
+
+        Args:
+            question: 原问题
+
+        Returns:
+            扩写后的问题列表（最多3个）
+        """
+        if not self.llm_client:
+            logger.warning("LLM客户端未初始化，跳过问题扩写")
+            return []
+
+        try:
+            prompt = f"""请将以下问题改写为3种不同的表达方式，保持语义不变：
+原问题：{question}
+
+要求：
+1. 使用不同的词汇和句式
+2. 保持简洁（不超过20字）
+3. 覆盖用户可能的不同问法
+
+直接输出3个改写，每行一个。"""
+
+            response = self.llm_client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=200
+            )
+
+            variants = response.choices[0].message.content.strip().split('\n')
+            # 清理并过滤空行
+            variants = [v.strip().lstrip('0123456789.-、') for v in variants if v.strip()]
+
+            logger.info(f"问题扩写成功: {question[:30]}... -> {len(variants)} 个变体")
+            return variants[:3]  # 最多返回3个
+
+        except Exception as e:
+            logger.error(f"问题扩写失败: {e}")
+            return []
+
+    # ==================== FAQ 同步到知识库 ====================
+
+    def _sync_faq_to_knowledge_base(self, faq_id: int, question: str, answer: str) -> bool:
+        """
+        将 FAQ 同步到知识库（问题分离存储）
+
+        核心策略：
+        1. 扩写问题为多个变体
+        2. 每个问题单独向量化
+        3. 答案存在 metadata 中
+
+        Args:
+            faq_id: FAQ ID
+            question: 问题
+            answer: 答案
+
+        Returns:
+            是否同步成功
+        """
+        try:
+            from core.engine import RAGEngine
+
+            # 获取引擎
+            engine = RAGEngine.get_instance()
+            if not engine._initialized:
+                engine.initialize()
+
+            # 获取或创建独立的 FAQ 集合（与普通文档分离）
+            if engine.kb_manager:
+                # 多向量库模式：使用专门的 faq_kb 集合
+                # get_collection 内部已实现 get_or_create 逻辑
+                faq_collection = engine.kb_manager.get_collection('faq_kb')
+            else:
+                # 单向量库模式：创建独立的 faq 集合
+                faq_collection = engine.chroma_client.get_or_create_collection(
+                    name="faq_collection",
+                    metadata={"description": "FAQ 专属向量库，独立于普通文档"}
+                )
+
+            if not faq_collection:
+                logger.error("无法获取 FAQ 向量库")
+                return False
+
+            # 1. 扩写问题
+            variants = self._expand_faq_questions(question)
+            all_questions = [question] + variants  # 原问题 + 变体
+
+            # 2. 为每个问题生成向量
+            embeddings = engine.embedding_model.encode(all_questions).tolist()
+
+            # 3. 准备元数据
+            now = datetime.now().isoformat()
+            ids = []
+            metas = []
+
+            for i, q in enumerate(all_questions):
+                chunk_id = f"faq_{faq_id}_v{i}"
+                ids.append(chunk_id)
+                metas.append({
+                    "source": f"faq_{faq_id}",
+                    "chunk_type": "faq",
+                    "faq_answer": answer,
+                    "is_variant": i > 0,
+                    "created_at": now
+                })
+
+            # 4. 写入独立的 FAQ 向量库
+            faq_collection.add(
+                ids=ids,
+                embeddings=embeddings,
+                documents=all_questions,
+                metadatas=metas
+            )
+
+            # 5. 记录变体到数据库
+            with get_connection("core") as conn:
+                cursor = conn.cursor()
+                for i, variant in enumerate(variants):
+                    cursor.execute("""
+                        INSERT INTO faq_variants (faq_id, variant_question, created_at)
+                        VALUES (?, ?, ?)
+                    """, (faq_id, variant, now))
+
+            logger.info(f"FAQ同步成功: ID={faq_id}, 向量数={len(ids)}, 存储位置: faq_collection")
+            return True
+
+        except Exception as e:
+            logger.error(f"FAQ同步失败: {e}")
+            return False
+
+    def _delete_faq_vectors(self, faq_id: int) -> bool:
+        """
+        删除 FAQ 在向量库中的所有向量
+
+        由于 FAQ 存储在独立的集合中，可以精确删除而不影响其他数据
+
+        Args:
+            faq_id: FAQ ID
+
+        Returns:
+            是否删除成功
+        """
+        try:
+            from core.engine import RAGEngine
+
+            # 获取引擎
+            engine = RAGEngine.get_instance()
+            if not engine._initialized:
+                engine.initialize()
+
+            # 获取 FAQ 集合
+            if engine.kb_manager:
+                faq_collection = engine.kb_manager.get_collection('faq_kb')
+            else:
+                faq_collection = engine.chroma_client.get_or_create_collection(
+                    name="faq_collection",
+                    metadata={"description": "FAQ 专属向量库"}
+                )
+
+            if not faq_collection:
+                logger.warning(f"FAQ 集合不存在，无需删除")
+                return True
+
+            # 获取该 FAQ 的所有向量 ID
+            # 格式：faq_{faq_id}_v{i}
+            all_ids = faq_collection.get()['ids']
+            faq_ids = [id for id in all_ids if id.startswith(f"faq_{faq_id}_")]
+
+            if faq_ids:
+                faq_collection.delete(ids=faq_ids)
+                logger.info(f"删除 FAQ 向量: ID={faq_id}, 向量数={len(faq_ids)}")
+
+            # 同时删除数据库中的变体记录
+            with get_connection("core") as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM faq_variants WHERE faq_id = ?", (faq_id,))
+
+            return True
+
+        except Exception as e:
+            logger.error(f"删除 FAQ 向量失败: {e}")
+            return False
+
     def submit_feedback(self, session_id: str, query: str, answer: str,
                         rating: int, sources: List[str] = None,
                         reason: str = None, user_id: str = None) -> Dict:
@@ -621,7 +809,12 @@ class FeedbackService:
             else:
                 # 检查是否高频问题
                 query_count = self._count_similar_queries(query)
-                if query_count >= self.faq_threshold:
+
+                # 计算复合分数（频率 + 评分）
+                faq_score = self._calculate_faq_score(query_count, 1.0)
+
+                # 使用复合分数判断（> 0.5 才推荐）
+                if faq_score > 0.5:
                     # 自动推荐为FAQ
                     suggestion_id = self.db.add_faq_suggestion(
                         query=query,
@@ -631,9 +824,53 @@ class FeedbackService:
                     )
                     result['faq_suggested'] = True
                     result['suggestion_id'] = suggestion_id
-                    logger.info(f"高频问题推荐FAQ: {query[:50]}... (出现{query_count}次)")
+                    result['faq_score'] = round(faq_score, 2)
+                    logger.info(f"推荐FAQ: {query[:50]}... (频率={query_count}, 分数={faq_score:.2f})")
 
         return result
+
+    def approve_and_sync_faq(self, suggestion_id: int) -> Dict:
+        """
+        批准FAQ建议并同步到知识库
+
+        Args:
+            suggestion_id: FAQ建议ID
+
+        Returns:
+            处理结果，包含faq_id和sync_status
+        """
+        # 1. 批准FAQ建议（数据库操作）
+        faq_id = self.db.approve_faq_suggestion(suggestion_id)
+
+        if faq_id <= 0:
+            return {
+                "success": False,
+                "error": "FAQ建议不存在或已处理",
+                "faq_id": -1
+            }
+
+        # 2. 获取FAQ详情
+        faq = self.db.get_faq(faq_id)
+        if not faq:
+            return {
+                "success": False,
+                "error": "FAQ创建失败",
+                "faq_id": faq_id
+            }
+
+        # 3. 同步到知识库
+        sync_success = self._sync_faq_to_knowledge_base(
+            faq_id=faq_id,
+            question=faq['question'],
+            answer=faq['answer']
+        )
+
+        return {
+            "success": True,
+            "faq_id": faq_id,
+            "question": faq['question'],
+            "sync_status": "synced" if sync_success else "sync_failed"
+        }
 
     def _find_similar_faqs(self, query: str) -> List[Dict]:
         """查找相似FAQ"""
@@ -667,6 +904,28 @@ class FeedbackService:
                 count += 1
 
         return count
+
+    def _calculate_faq_score(self, frequency: int, avg_rating: float) -> float:
+        """
+        计算 FAQ 推荐复合分数
+
+        复合分数 = 频率分(40%) + 评分分(60%)
+
+        Args:
+            frequency: 问题出现频率
+            avg_rating: 平均评分 (-1 到 1)
+
+        Returns:
+            复合分数 (0 到 1)
+        """
+        # 频率归一化（0-1），上限 20 次
+        freq_score = min(1.0, frequency / 20)
+
+        # 评分归一化（-1 到 1 映射到 0 到 1）
+        rating_score = (avg_rating + 1) / 2
+
+        # 复合分数
+        return freq_score * 0.4 + rating_score * 0.6
 
     def get_high_freq_queries(self, start_date: str = None, end_date: str = None,
                                top_n: int = 20) -> List[Dict]:
@@ -710,6 +969,62 @@ class FeedbackService:
             }
             for f in feedbacks
         ]
+
+    # ==================== 负反馈降权机制 ====================
+
+    def get_low_rated_sources(self, min_count: int = 3) -> List[Dict]:
+        """
+        获取高频点踩的来源黑名单
+
+        Args:
+            min_count: 最小点踩次数阈值
+
+        Returns:
+            黑名单来源列表，包含 source 和点踩次数
+        """
+        with get_connection("core") as conn:
+            cursor = conn.cursor()
+
+            # 统计每个来源的负反馈次数
+            cursor.execute("""
+                SELECT sources, COUNT(*) as cnt
+                FROM feedbacks
+                WHERE rating = -1 AND sources IS NOT NULL
+                GROUP BY sources
+                HAVING cnt >= ?
+                ORDER BY cnt DESC
+            """, (min_count,))
+
+            rows = cursor.fetchall()
+
+        results = []
+        for row in rows:
+            sources_json = row['sources']
+            if sources_json:
+                try:
+                    sources_list = json.loads(sources_json)
+                    for source in sources_list:
+                        results.append({
+                            "source": source,
+                            "dislike_count": row['cnt']
+                        })
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        return results
+
+    def get_chunk_blacklist(self, min_dislikes: int = 3) -> set:
+        """
+        获取 Chunk 黑名单（用于检索时过滤）
+
+        Args:
+            min_dislikes: 最小点踩次数阈值
+
+        Returns:
+            黑名单 source 集合
+        """
+        blacklisted = self.get_low_rated_sources(min_dislikes)
+        return {item['source'] for item in blacklisted}
 
     def generate_report(self, report_type: str = "weekly",
                         start_date: str = None, end_date: str = None) -> QualityReport:

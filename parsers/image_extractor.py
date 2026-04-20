@@ -35,6 +35,8 @@ def extract_images_from_pdf(
     output_dir: str,
     min_width: int = 100,
     min_height: int = 100,
+    max_width: int = 2000,   # 新增：最大宽度阈值（过滤跨页底纹）
+    max_height: int = 2000,  # 新增：最大高度阈值
     max_images: int = 50
 ) -> List[ImageInfo]:
     """
@@ -45,6 +47,8 @@ def extract_images_from_pdf(
         output_dir: 图片输出目录
         min_width: 最小宽度阈值（过滤小图标）
         min_height: 最小高度阈值
+        max_width: 最大宽度阈值（过滤跨页底纹、背景横幅）
+        max_height: 最大高度阈值
         max_images: 最大提取图片数量
 
     Returns:
@@ -99,6 +103,10 @@ def extract_images_from_pdf(
 
                     # 过滤太小的图片（通常是图标）
                     if width < min_width or height < min_height:
+                        continue
+
+                    # 过滤太大的图片（跨页底纹、背景横幅）
+                    if width > max_width or height > max_height:
                         continue
 
                     # 生成唯一 ID
@@ -204,6 +212,145 @@ def get_images_base_path() -> str:
 
 # ==================== 集成到现有解析器 ====================
 
+def filter_noise_images(
+    images: List[Any],
+    min_size: int = 100,
+    max_size: int = 2000,
+    enable_hash_dedup: bool = True,
+    enable_content_check: bool = True,
+    max_aspect_ratio: float = 10.0
+) -> List[Any]:
+    """
+    三级噪音图片过滤管道
+
+    Level 1: 尺寸过滤（过滤图标、跨页底纹）
+    Level 2: Hash 去重（过滤重复图片）
+    Level 3: 内容检测（过滤纯色背景、装饰横幅）
+
+    Args:
+        images: 图片列表（ImageInfo 或 dict）
+        min_size: 最小尺寸阈值（像素），过滤图标
+        max_size: 最大尺寸阈值（像素），过滤跨页底纹
+        enable_hash_dedup: 启用 Hash 去重
+        enable_content_check: 启用内容相关性检测
+        max_aspect_ratio: 最大宽高比阈值，过滤装饰横幅
+
+    Returns:
+        过滤后的图片列表
+    """
+    if not images:
+        return images
+
+    filtered = []
+    seen_hashes = set()
+
+    for img in images:
+        # 支持 dataclass 和 dict 两种格式
+        if hasattr(img, 'width'):
+            width, height = img.width, img.height
+            storage_path = getattr(img, 'storage_path', '')
+        else:
+            width = img.get('width', 0)
+            height = img.get('height', 0)
+            storage_path = img.get('storage_path', '')
+
+        # Level 1: 尺寸过滤
+        if width < min_size or height < min_size:
+            continue  # 图标、装饰线条
+        if width > max_size or height > max_size:
+            continue  # 跨页底纹、背景横幅
+
+        # Level 2: Hash 去重
+        if enable_hash_dedup and storage_path:
+            try:
+                img_hash = _compute_image_hash(storage_path)
+                if img_hash in seen_hashes:
+                    continue  # 重复图片
+                seen_hashes.add(img_hash)
+            except Exception:
+                pass  # Hash 计算失败时跳过去重
+
+        # Level 3: 内容相关性检测
+        if enable_content_check:
+            aspect_ratio = max(width, height) / max(min(width, height), 1)
+
+            # 过滤极端宽高比（装饰横幅）
+            if aspect_ratio > max_aspect_ratio:
+                continue
+
+            # 过滤纯色/渐变背景
+            if storage_path and _is_solid_color_image(storage_path):
+                continue
+
+        filtered.append(img)
+
+    return filtered
+
+
+def _compute_image_hash(image_path: str) -> str:
+    """
+    计算图片文件的 Hash 值
+
+    Args:
+        image_path: 图片文件路径
+
+    Returns:
+        MD5 Hash 字符串
+    """
+    hash_md5 = hashlib.md5()
+    with open(image_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(4096), b''):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+
+def _is_solid_color_image(image_path: str, threshold: float = 0.95) -> bool:
+    """
+    检测图片是否为纯色/渐变背景（装饰性横幅）
+
+    使用简单的颜色分布检测：
+    - 如果图片 95% 以上像素属于同一颜色范围，判定为纯色背景
+
+    Args:
+        image_path: 图片文件路径
+        threshold: 纯色判定阈值
+
+    Returns:
+        True 表示是纯色背景图片
+    """
+    try:
+        from PIL import Image
+        import numpy as np
+    except ImportError:
+        # PIL/numpy 未安装，跳过检测
+        return False
+
+    try:
+        img = Image.open(image_path)
+        # 缩小图片加速处理
+        img.thumbnail((100, 100))
+        img_array = np.array(img)
+
+        if img_array.ndim == 2:
+            # 灰度图
+            unique, counts = np.unique(img_array, return_counts=True)
+        elif img_array.ndim == 3:
+            # 彩色图，计算颜色直方图
+            pixels = img_array.reshape(-1, img_array.shape[-1])
+            # 量化颜色（减少颜色数量）
+            quantized = (pixels // 32) * 32
+            unique, counts = np.unique(quantized, axis=0, return_counts=True)
+        else:
+            return False
+
+        # 如果主颜色占比超过阈值，判定为纯色背景
+        max_color_ratio = max(counts) / sum(counts)
+        return max_color_ratio > threshold
+
+    except Exception:
+        return False
+
+
 def enrich_chunks_with_images(
     chunks: List[Any],
     images: List[ImageInfo],
@@ -249,11 +396,16 @@ def enrich_chunks_with_images(
             page_start = chunk.get('page_start', 1)
             page_end = chunk.get('page_end', page_start)
 
-        # 收集该分块页码范围内的所有图片
+        # 单页绑定：仅在切片不跨页时绑定图片
         chunk_images = []
-        for page in range(page_start, page_end + 1):
-            if page in page_to_images:
-                chunk_images.extend(page_to_images[page])
+        if page_start == page_end and page_start in page_to_images:
+            chunk_images = page_to_images[page_start]
+
+        # 应用噪音过滤
+        chunk_images = filter_noise_images(chunk_images)
+
+        # 限制每切片最多 3 张图片
+        chunk_images = chunk_images[:3]
 
         # 添加到分块
         if chunk_images:

@@ -112,7 +112,7 @@ class SessionManager:
                 WHERE session_id = ?
             ''', (session_id,))
 
-    def add_message(self, session_id: str, role: str, content: str):
+    def add_message(self, session_id: str, role: str, content: str, metadata: dict = None):
         """
         添加消息到会话历史
 
@@ -120,14 +120,18 @@ class SessionManager:
             session_id: 会话ID
             role: 角色 (user/assistant)
             content: 消息内容
+            metadata: 可选的扩展数据（如sources, images, is_rag）
         """
+        import json
+        meta_str = json.dumps(metadata) if metadata else None
+
         with get_connection("core") as conn:
             cursor = conn.cursor()
 
             cursor.execute('''
-                INSERT INTO messages (session_id, role, content)
-                VALUES (?, ?, ?)
-            ''', (session_id, role, content))
+                INSERT INTO messages (session_id, role, content, metadata)
+                VALUES (?, ?, ?, ?)
+            ''', (session_id, role, content, meta_str))
 
             # 更新会话活跃时间
             cursor.execute('''
@@ -145,13 +149,14 @@ class SessionManager:
             limit: 最大消息数
 
         Returns:
-            [{"role": "user/assistant", "content": "..."}, ...]
+            [{"id": 1, "role": "user/assistant", "content": "...", "metadata": {...}}, ...]
         """
+        import json
         with get_connection("core") as conn:
             cursor = conn.cursor()
 
             cursor.execute('''
-                SELECT role, content, created_at
+                SELECT id, role, content, metadata, created_at
                 FROM messages
                 WHERE session_id = ?
                 ORDER BY created_at DESC
@@ -163,10 +168,20 @@ class SessionManager:
         # 按时间正序排列（旧的在前）
         history = []
         for row in reversed(rows):
+            meta_str = row[3]
+            meta = {}
+            if meta_str:
+                try:
+                    meta = json.loads(meta_str)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
             history.append({
-                "role": row[0],
-                "content": row[1],
-                "created_at": row[2]
+                "id": row[0],
+                "role": row[1],
+                "content": row[2],
+                "metadata": meta,
+                "created_at": row[4]
             })
 
         return history

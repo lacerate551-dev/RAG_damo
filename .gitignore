@@ -62,6 +62,13 @@ documents/
 # 题库数据
 题库/
 
+# 临时输出目录
+analysis_reports/
+exported_chunks/
+exported_chunks_v2/
+exported_chunks_v3/
+test_output/
+
 # 非必要文档
 docs/superpowers/
 
@@ -69,3 +76,23 @@ docs/superpowers/
 data/
 vector_store/
 knowledge/vector_store/
+
+# 测试JSON文件
+exam_questions.json
+exam_stored.json
+grade_result.json
+llm_response.json
+student_answers.json
+test_optimized.json
+test_result.json
+
+# 临时工具目录
+tools/
+
+# 临时文件
+=2.11.7
+docs/安装提示
+docs/题目模板
+
+# 上传清单（仅本地使用）
+UPLOAD_CHECKLIST.md

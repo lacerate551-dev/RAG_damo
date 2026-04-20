@@ -110,6 +110,37 @@
                         </div>
                     </div>
                 </div>
+
+                <!-- 知识库管理面板 -->
+                <div class="kb-panel" id="kbPanel">
+                    <div class="kb-header" onclick="toggleKbPanel()">
+                        <span>📚 知识库管理</span>
+                        <button class="toggle-btn" id="kbToggleBtn">▼</button>
+                    </div>
+                    <div class="kb-content" id="kbContent" style="display:none;">
+                        <!-- 向量库列表 -->
+                        <div class="kb-section">
+                            <h4>向量库</h4>
+                            <ul id="kbList" class="kb-list">
+                                <li class="loading">加载中...</li>
+                            </ul>
+                            <button class="btn btn-sm btn-primary" onclick="showCreateKbModal()" id="createKbBtn">+ 新建</button>
+                        </div>
+                        <!-- 文档列表 -->
+                        <div class="kb-section">
+                            <h4>文档</h4>
+                            <div class="doc-filter">
+                                <select id="docKbFilter" onchange="loadDocuments()">
+                                    <option value="">全部向量库</option>
+                                </select>
+                            </div>
+                            <ul id="docList" class="doc-list">
+                                <li class="loading">加载中...</li>
+                            </ul>
+                            <button class="btn btn-sm btn-secondary" onclick="showUploadModal()">📤 上传文档</button>
+                        </div>
+                    </div>
+                </div>
             </aside>
 
             <!-- 中间聊天区域 -->
@@ -138,6 +169,42 @@
                 <div class="log-panel-content" id="logPanelContent">
                     <div class="log-empty">暂无日志</div>
                 </div>
+
+                <!-- 反馈统计面板（管理员） -->
+                <div class="stats-panel" id="statsPanel" style="display:none;">
+                    <h4>📊 反馈统计</h4>
+                    <div class="stats-content">
+                        <div class="stat-item">
+                            <span class="stat-label">本周查询</span>
+                            <span class="stat-value" id="weeklyQueries">--</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">点赞率</span>
+                            <span class="stat-value" id="weeklyLikeRate">--</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">待审核FAQ</span>
+                            <span class="stat-value" id="pendingFaqs">0</span>
+                        </div>
+                    </div>
+                    <button class="btn btn-sm btn-secondary" onclick="showFeedbackStatsModal()">查看详情</button>
+                </div>
+
+                <!-- 同步状态 -->
+                <div class="sync-panel" id="syncPanel">
+                    <h4>🔄 同步状态</h4>
+                    <div class="sync-content">
+                        <div class="sync-item">
+                            <span class="sync-label">状态</span>
+                            <span class="sync-value" id="syncStatusValue">--</span>
+                        </div>
+                        <div class="sync-item">
+                            <span class="sync-label">上次同步</span>
+                            <span class="sync-value" id="lastSyncTime">--</span>
+                        </div>
+                    </div>
+                    <button class="btn btn-sm" onclick="triggerSync()">立即同步</button>
+                </div>
             </aside>
         </div>
     </div>
@@ -150,6 +217,15 @@
                 <button class="modal-close" id="closeSettingsBtn">&times;</button>
             </div>
             <div class="modal-body">
+                <div class="settings-section">
+                    <h3>系统设置</h3>
+                    <div class="form-group">
+                        <label>API 服务器地址</label>
+                        <input type="text" id="apiBaseUrl" placeholder="如: http://localhost:5001" onchange="window.updateApiBase(this.value)">
+                        <small>默认：http://localhost:5001 (修改后会自动刷新页面)</small>
+                    </div>
+                </div>
+
                 <div class="settings-section">
                     <h3>修改密码</h3>
                     <form id="changePasswordForm">
@@ -237,6 +313,148 @@
             <button class="modal-close image-close" onclick="closeImageModal()">&times;</button>
             <img id="modalImage" src="" alt="">
             <div id="modalCaption" class="image-modal-caption"></div>
+        </div>
+    </div>
+
+    <!-- 反馈弹窗 -->
+    <div id="feedbackModal" class="modal" style="display:none;">
+        <div class="modal-content modal-sm">
+            <div class="modal-header">
+                <h2>📝 提交反馈</h2>
+                <button class="modal-close" onclick="closeFeedbackModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="feedback-form">
+                    <div class="feedback-rating">
+                        <button class="rating-btn upvote active" data-rating="1" onclick="selectFeedbackRating(1)">👍 有帮助</button>
+                        <button class="rating-btn downvote" data-rating="-1" onclick="selectFeedbackRating(-1)">👎 没帮助</button>
+                    </div>
+                    <div id="feedbackReasonSection" class="feedback-reason-section" style="display:none;">
+                        <label>请选择原因：</label>
+                        <div class="reason-options">
+                            <label class="reason-option">
+                                <input type="radio" name="feedbackReason" value="回答不准确"> 回答不准确
+                            </label>
+                            <label class="reason-option">
+                                <input type="radio" name="feedbackReason" value="信息过时"> 信息过时
+                            </label>
+                            <label class="reason-option">
+                                <input type="radio" name="feedbackReason" value="缺少关键信息"> 缺少关键信息
+                            </label>
+                            <label class="reason-option">
+                                <input type="radio" name="feedbackReason" value="格式混乱"> 格式混乱
+                            </label>
+                            <label class="reason-option">
+                                <input type="radio" name="feedbackReason" value="other"> 其他
+                            </label>
+                        </div>
+                        <div id="otherReasonInput" style="display:none; margin-top:8px;">
+                            <input type="text" id="otherReasonText" placeholder="请输入具体原因">
+                        </div>
+                    </div>
+                    <textarea id="feedbackComment" placeholder="其他建议或意见（可选）" rows="3"></textarea>
+                    <button class="btn btn-primary" onclick="submitFeedbackForm()">提交反馈</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 创建向量库弹窗 -->
+    <div id="createKbModal" class="modal" style="display:none;">
+        <div class="modal-content modal-sm">
+            <div class="modal-header">
+                <h2>📚 创建向量库</h2>
+                <button class="modal-close" onclick="closeCreateKbModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="createKbForm" onsubmit="createKb(event)">
+                    <div class="form-group">
+                        <label>名称 *</label>
+                        <input type="text" id="newKbName" placeholder="如: dept_finance" required>
+                        <small>只能包含字母、数字、下划线和连字符</small>
+                    </div>
+                    <div class="form-group">
+                        <label>显示名称</label>
+                        <input type="text" id="newKbDisplayName" placeholder="如: 财务部知识库">
+                    </div>
+                    <div class="form-group">
+                        <label>部门</label>
+                        <input type="text" id="newKbDepartment" placeholder="如: 财务部">
+                    </div>
+                    <div class="form-group">
+                        <label>描述</label>
+                        <textarea id="newKbDescription" rows="2" placeholder="知识库描述"></textarea>
+                    </div>
+                    <button type="submit" class="btn btn-primary">创建</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- 上传文档弹窗 -->
+    <div id="uploadModal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>📤 上传文档</h2>
+                <button class="modal-close" onclick="closeUploadModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="uploadForm" onsubmit="uploadDocument(event)">
+                    <div class="form-group">
+                        <label>目标向量库 *</label>
+                        <select id="uploadKbSelect" required>
+                            <option value="">请选择向量库</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>选择文件 *</label>
+                        <div class="file-upload-area" id="fileUploadArea">
+                            <input type="file" id="uploadFileInput" multiple accept=".pdf,.docx,.doc,.xlsx,.txt">
+                            <div class="upload-hint">
+                                <span>📁 点击或拖拽文件到此处</span>
+                                <small>支持 PDF、Word、Excel、TXT（最大 10MB）</small>
+                            </div>
+                        </div>
+                        <div id="selectedFiles" class="selected-files"></div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">上传</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- 反馈统计详情弹窗 -->
+    <div id="feedbackStatsModal" class="modal" style="display:none;">
+        <div class="modal-content modal-lg">
+            <div class="modal-header">
+                <h2>📊 反馈统计详情</h2>
+                <button class="modal-close" onclick="closeFeedbackStatsModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="stats-tabs">
+                    <button class="tab-btn active" onclick="showStatsTab('overview')">概览</button>
+                    <button class="tab-btn" onclick="showStatsTab('feedbacks')">反馈列表</button>
+                    <button class="tab-btn" onclick="showStatsTab('faq')">FAQ管理</button>
+                </div>
+                <div id="statsTabContent">
+                    <!-- 动态加载 -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 文档切片详情弹窗 -->
+    <div id="chunksModal" class="modal" style="display:none;">
+        <div class="modal-content modal-lg">
+            <div class="modal-header">
+                <h2>📄 文档切片</h2>
+                <button class="modal-close" onclick="closeChunksModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="chunksContent">
+                    <!-- 动态加载 -->
+                </div>
+            </div>
         </div>
     </div>
 

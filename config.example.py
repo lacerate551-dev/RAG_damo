@@ -36,13 +36,38 @@ GRAPH_EXTRACTION_MODEL = "qwen3.5-plus"
 import os
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# 数据存储根目录（扁平化结构）
+DATA_ROOT = os.path.join(PROJECT_ROOT, ".data")
+
+# 模型路径
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 EMBEDDING_MODEL_PATH = os.path.join(MODELS_DIR, "bge-base-zh-v1.5")
 RERANK_MODEL_PATH = os.path.join(MODELS_DIR, "bge-reranker-base")
+
+# 向量库路径
 VECTOR_STORE_PATH = os.path.join(PROJECT_ROOT, "knowledge", "vector_store")
 CHROMA_DB_PATH = os.path.join(VECTOR_STORE_PATH, "chroma")
+
+# 文档路径
 DOCUMENTS_PATH = os.path.join(PROJECT_ROOT, "documents")
+
+# BM25 索引路径
 BM25_INDEXES_PATH = os.path.join(VECTOR_STORE_PATH, "bm25")
+
+# 图片存储（扁平化）
+IMAGES_DIR = os.path.join(DATA_ROOT, "images")
+
+# 文档元数据存储
+DOCSTORE_DIR = os.path.join(DATA_ROOT, "docstore")
+
+# 缓存目录（扁平化）
+CACHE_DIR = os.path.join(DATA_ROOT, "cache")
+VLM_CACHE_DIR = os.path.join(CACHE_DIR, "vlm")
+LLM_CACHE_DIR = os.path.join(CACHE_DIR, "llm")
+
+# MinerU 临时输出（解析后自动清理）
+MINERU_OUTPUT_DIR = os.path.join(DATA_ROOT, "mineru_temp")
 
 # ==================== RAG 功能开关 ====================
 USE_MULTI_KB = True           # 多向量库模式
@@ -53,21 +78,29 @@ USE_RERANK = True             # 重排序
 RERANK_CANDIDATES = 20        # 重排序候选数量
 RERANK_TOP_K = 5              # 重排序返回数量
 
-# PDF 解析配置
-USE_ODL_PARSER = True         # 使用 OpenDataLoader PDF 解析器
-ODL_USE_STRUCT_TREE = True    # 使用 PDF 结构树
-ODL_USE_HYBRID = False        # 混合模式（需后端服务）
+# MinerU 解析配置（v5 统一解析器）
+MINERU_BACKEND = "pipeline"   # 解析后端: pipeline, vlm-auto-engine, hybrid-auto-engine
+MINERU_LANG = "ch"            # 语言代码
+MINERU_TIMEOUT = 600          # 超时时间（秒）
 
-# Docling 配置
-USE_DOCLING_PARSER = True     # 使用 Docling 解析 Word
-
-# Excel 解析配置
-USE_EXCEL_ENHANCED = True     # 增强版 Excel 解析器
-EXCEL_MAX_ROWS_PER_CHUNK = 50
-EXCEL_MIN_ROWS_PER_CHUNK = 2
+# Excel 解析配置（Pandas 管道）
+EXCEL_MAX_ROWS_PER_CHUNK = 200  # 大表切片阈值
 
 # 分块配置
-USE_SEMANTIC_CHUNK = True     # 语义分块
-SEMANTIC_BREAKPOINT_THRESHOLD = 0.5
-SEMANTIC_MIN_CHUNK_SIZE = 50
-SEMANTIC_MAX_CHUNK_SIZE = 800
+CHUNK_SIZE = 1000             # 基础分块大小
+CHUNK_OVERLAP = 100           # 分块重叠
+
+# ==================== 懒加载配置（Phase 4）====================
+# 使用扁平化路径
+VLM_CACHE_DIR = ".data/cache/vlm"  # VLM 描述缓存目录
+LLM_CACHE_DIR = ".data/cache/llm"  # LLM 摘要缓存目录
+
+# ==================== 富媒体展示配置（Phase 5）====================
+MAX_IMAGES_PER_RESPONSE = 2   # 每次回答最多展示图片数
+MIN_IMAGE_SCORE = 3.0         # 图片展示最低分数阈值
+
+# ==================== 懒加载触发阈值 ====================
+TABLE_SUMMARY_SCORE_THRESHOLD = 0.7  # 表格相关性 > 0.7 才生成摘要
+
+# ==================== VLM 模型配置 ====================
+DASHSCOPE_VL_MODEL = "qwen-vl-plus"  # 视觉模型（图片描述）

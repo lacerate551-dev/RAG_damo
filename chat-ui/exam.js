@@ -1,5 +1,6 @@
 // 出题系统测试页面 JS
-const API_BASE = 'http://localhost:5001';
+const DEFAULT_API_BASE = 'http://localhost:5001';
+let API_BASE = localStorage.getItem('rag_api_base') || DEFAULT_API_BASE;
 const TOKEN_KEY = 'rag_auth_token';
 const USER_KEY = 'rag_auth_user';
 

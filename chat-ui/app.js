@@ -1,5 +1,6 @@
 // ===== 配置 =====
-const API_BASE = 'http://localhost:5001';
+const DEFAULT_API_BASE = 'http://localhost:5001';
+let API_BASE = localStorage.getItem('rag_api_base') || DEFAULT_API_BASE;
 const TOKEN_KEY = 'rag_auth_token';
 const USER_KEY = 'rag_auth_user';
 const LOG_KEY = 'rag_chat_logs';
@@ -17,7 +18,12 @@ const state = {
         knowledgeBase: null,
         bm25Index: null,
         graph: null
-    }
+    },
+    // 新增状态
+    collections: [],
+    currentMessage: null,  // 当前消息（用于反馈）
+    feedbackRating: 1,     // 反馈评分
+    selectedFiles: []      // 上传文件列表
 };
 
 // ===== DOM =====
@@ -25,10 +31,21 @@ const $ = id => document.getElementById(id);
 
 // ===== 初始化 =====
 document.addEventListener('DOMContentLoaded', () => {
+    // 恢复配置
+    const apiInput = $('apiBaseUrl');
+    if (apiInput) apiInput.value = API_BASE;
     checkAuth();
     initEvents();
     renderLogs();
 });
+
+window.updateApiBase = function(url) {
+    if (!url) url = DEFAULT_API_BASE;
+    if (url.endsWith('/')) url = url.slice(0, -1);
+    localStorage.setItem('rag_api_base', url);
+    alert('API 地址已更新，将刷新页面。');
+    location.reload();
+};
 
 function checkAuth() {
     if (state.token && state.user) {
@@ -56,7 +73,15 @@ function showMain() {
     // 显示管理员功能
     if (state.user.role === 'admin') {
         $('adminSection').style.display = 'block';
+        $('statsPanel').style.display = 'block';
+        $('createKbBtn').style.display = 'inline-block';
     }
+
+    // 加载知识库面板数据
+    loadCollections();
+    loadDocuments();
+    loadFeedbackStats();
+    loadSyncStatus();
 }
 
 function getRoleLabel(role) {
@@ -109,6 +134,33 @@ function initEvents() {
     document.querySelectorAll('.modal').forEach(modal => {
         modal.addEventListener('click', (e) => {
             if (e.target === modal) modal.style.display = 'none';
+        });
+    });
+
+    // 文件上传拖拽
+    const uploadArea = $('fileUploadArea');
+    if (uploadArea) {
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            handleFileSelect(e.dataTransfer.files);
+        });
+        $('uploadFileInput').addEventListener('change', (e) => {
+            handleFileSelect(e.target.files);
+        });
+    }
+
+    // 反馈原因选择
+    document.querySelectorAll('input[name="feedbackReason"]').forEach(radio => {
+        radio.addEventListener('change', (e) => {
+            $('otherReasonInput').style.display = e.target.value === 'other' ? 'block' : 'none';
         });
     });
 }
@@ -276,7 +328,7 @@ async function sendMessage() {
                 body: JSON.stringify({ session_id: state.sessionId, message: msg })
             });
             state.sessionId = data.session_id;
-            $('currentSessionId').textContent = state.sessionId.substring(0, 8);
+            $('currentSessionId').textContent = state.sessionId ? state.sessionId.substring(0, 8) : '新会话';
             addMessage('assistant', data.answer, data.sources, data.web_searched, false, data.images);
             loadSessions();
         } else {
@@ -292,13 +344,18 @@ async function sendMessage() {
 }
 
 async function sendRagMessage(msg) {
-    const res = await fetch(`${API_BASE}/rag/stream`, {
+    // 使用合并后的 /rag 端点（SSE 流式返回）
+    const res = await fetch(`${API_BASE}/rag`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${state.token}`
         },
-        body: JSON.stringify({ session_id: state.sessionId, message: msg })
+        body: JSON.stringify({
+            message: msg,
+            collections: ['public_kb'],
+            session_id: state.sessionId
+        })
     });
 
     if (!res.ok) {
@@ -324,7 +381,8 @@ async function sendRagMessage(msg) {
                 try {
                     const event = JSON.parse(line.slice(6));
                     handleStreamEvent(event);
-                    if (event.type === 'result') {
+                    // 新规范使用 'finish' 事件类型
+                    if (event.type === 'finish') {
                         result = event;
                     }
                 } catch (e) {}
@@ -332,19 +390,38 @@ async function sendRagMessage(msg) {
         }
     }
 
+    // 流式输出完成后，替换占位符为最终消息
     if (result) {
         state.sessionId = result.session_id;
-        $('currentSessionId').textContent = state.sessionId.substring(0, 8);
-        addMessage('assistant', result.answer, result.sources, false, true, result.images);
+        $('currentSessionId').textContent = state.sessionId ? state.sessionId.substring(0, 8) : '新会话';
+        // 替换流式占位符为最终消息
+        finalizeStreamMessage(result.answer, result.sources, result.images);
         loadSessions();
     }
 }
+
+// 流式输出相关变量
+let streamingMessageEl = null;
+let streamingContent = '';
 
 function handleStreamEvent(event) {
     const type = event.type;
     let msg = '';
     switch (type) {
-        case 'start': msg = '开始处理...'; break;
+        case 'start':
+            msg = event.message || '开始处理...';
+            // 创建流式消息占位符
+            createStreamingPlaceholder();
+            break;
+        case 'sources':
+            msg = `检索到 ${event.sources?.length || 0} 个来源`;
+            break;
+        case 'chunk':
+            // 追加内容到流式消息
+            if (event.content) {
+                appendStreamingContent(event.content);
+            }
+            break;
         case 'decision': msg = `决策: ${event.action}`; break;
         case 'rewrite': msg = `重写: ${event.new_query || event.rewritten_query || ''}`; break;
         case 'decompose': msg = `分解查询: ${event.sub_queries?.join(', ') || ''}`; break;
@@ -352,10 +429,85 @@ function handleStreamEvent(event) {
         case 'answer': msg = '生成回答...'; break;
         case 'warning': msg = `警告: ${event.message || ''}`; break;
         case 'max_iterations': msg = '达到最大迭代次数'; break;
+        case 'finish': msg = '处理完成'; break;
         case 'complete': msg = '处理完成'; break;
+        case 'error':
+            msg = `错误: ${event.message || ''}`;
+            // 错误时清理占位符
+            clearStreamingPlaceholder();
+            break;
         default: msg = type;
     }
-    addLog(type, msg, event);
+    if (msg) addLog(type, msg, event);
+}
+
+function createStreamingPlaceholder() {
+    const container = $('chatMessages');
+    // 移除空状态
+    const empty = container.querySelector('.empty-state');
+    if (empty) empty.remove();
+
+    // 创建流式消息占位符
+    const div = document.createElement('div');
+    div.className = 'message assistant streaming';
+    div.id = 'streaming-message';
+    div.innerHTML = `
+        <div class="message-header">
+            <span class="role-icon">🤖</span>
+            <span class="role-name">AI 助手</span>
+            <span class="streaming-indicator">
+                <span class="dot"></span>
+                <span class="dot"></span>
+                <span class="dot"></span>
+            </span>
+        </div>
+        <div class="message-content" id="streaming-content">
+            <span class="typing-cursor">▌</span>
+        </div>
+    `;
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+
+    streamingMessageEl = div;
+    streamingContent = '';
+}
+
+function appendStreamingContent(content) {
+    if (!streamingMessageEl) return;
+
+    streamingContent += content;
+    const contentEl = $('streaming-content');
+    if (contentEl) {
+        // 解析 Markdown 并显示
+        contentEl.innerHTML = renderMarkdown(streamingContent) + '<span class="typing-cursor">▌</span>';
+
+        // 滚动到底部
+        const container = $('chatMessages');
+        container.scrollTop = container.scrollHeight;
+    }
+}
+
+function finalizeStreamMessage(answer, sources, images) {
+    if (streamingMessageEl) {
+        // 移除流式指示器
+        streamingMessageEl.classList.remove('streaming');
+        streamingMessageEl.removeAttribute('id');
+
+        // 使用完整的消息格式
+        const formatted = formatMessage(answer, sources, false, true, images);
+        streamingMessageEl.innerHTML = formatted;
+
+        streamingMessageEl = null;
+        streamingContent = '';
+    }
+}
+
+function clearStreamingPlaceholder() {
+    if (streamingMessageEl) {
+        streamingMessageEl.remove();
+        streamingMessageEl = null;
+        streamingContent = '';
+    }
 }
 
 function addMessage(role, content, sources, webSearched, isRag, images) {
@@ -366,6 +518,8 @@ function addMessage(role, content, sources, webSearched, isRag, images) {
 
     const div = document.createElement('div');
     div.className = `message ${role}`;
+    const messageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    div.dataset.messageId = messageId;
 
     let html = '';
 
@@ -381,7 +535,11 @@ function addMessage(role, content, sources, webSearched, isRag, images) {
         html += '</div>';
     }
 
-    html += `<div class="message-content">${escapeHtml(content)}</div>`;
+    if (role === 'assistant') {
+        html += `<div class="message-content">${renderMarkdown(content)}</div>`;
+    } else {
+        html += `<div class="message-content">${escapeHtml(content)}</div>`;
+    }
 
     // 显示图片
     if (images && images.length > 0) {
@@ -389,6 +547,125 @@ function addMessage(role, content, sources, webSearched, isRag, images) {
         images.forEach(img => {
             const caption = img.caption ? `<div class="image-caption">${escapeHtml(img.caption)}</div>` : '';
             const pageLabel = img.page ? `<span class="image-page">第${img.page}页</span>` : '';
+            html += `
+                <div class="image-card">
+                    <img src="${typeof API_BASE !== 'undefined' ? API_BASE : ''}${img.url}" alt="${img.id}" loading="lazy" onclick="window.showImageModal('${typeof API_BASE !== 'undefined' ? API_BASE : ''}${img.url}', '${escapeHtml(img.id)}')">
+                    <div class="image-info">
+                        ${pageLabel}
+                        ${caption}
+                    </div>
+                </div>
+            `;
+        });
+        html += '</div></div>';
+    }
+
+    // 显示来源
+    if (sources && sources.length > 0) {
+        html += '<div class="message-sources"><strong>来源:</strong> ';
+        sources.forEach((s, i) => {
+            const level = s.security_level || s.level || '';
+            const levelTag = level ? `<span class="security-tag ${level}">${level}</span>` : '';
+            html += `<span class="source-item">${levelTag}${escapeHtml(s.source || s)}</span>`;
+            if (i < sources.length - 1) html += ', ';
+        });
+        html += '</div>';
+    }
+
+    // 添加消息操作栏（仅 AI 回复）
+    if (role === 'assistant') {
+        html += `
+            <div class="message-actions">
+                <button class="action-btn upvote" onclick="openFeedbackModal('${messageId}', 1)" title="有帮助">👍</button>
+                <button class="action-btn downvote" onclick="openFeedbackModal('${messageId}', -1)" title="没帮助">👎</button>
+                <button class="action-btn exam-btn" onclick="createExamFromChat('${messageId}')" title="基于此对话出题">📝 出题</button>
+            </div>
+        `;
+    }
+
+    div.innerHTML = html;
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+
+    // 保存消息数据（用于反馈）
+    if (role === 'assistant') {
+        div.dataset.content = content;
+        div.dataset.sources = JSON.stringify(sources || []);
+    }
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// 简单的 Markdown 渲染（用于流式输出）
+function renderMarkdown(text) {
+    if (!text) return '';
+    let html = escapeHtml(text);
+
+    // 图片
+    html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, url) => {
+        const fullUrl = url.startsWith('http') ? url : `${typeof API_BASE !== 'undefined' ? API_BASE : ''}/${url.replace(/^\//, '')}`;
+        return `<img src="${fullUrl}" alt="${alt}" loading="lazy" onclick="window.showImageModal('${fullUrl}', '${alt}')" style="max-width: 100%; max-height: 400px; border-radius: 4px; margin: 8px 0; cursor: zoom-in;">`;
+    });
+
+    // 链接
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+
+    // 代码块
+    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="language-$1">$2</code></pre>');
+
+    // 行内代码
+    html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+    // 标题
+    html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+    html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+    html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+
+    // 粗体和斜体
+    html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+
+    // 列表
+    html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+    html = html.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
+
+    // 段落
+    html = html.replace(/\n\n/g, '</p><p>');
+    html = html.replace(/\n/g, '<br>');
+
+    return html;
+}
+
+// 格式化消息（用于流式输出完成后的最终显示）
+function formatMessage(content, sources, webSearched, isRag, images) {
+    const messageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    let html = '';
+
+    // 消息头部标签
+    html += '<div class="message-header">';
+    html += '<span class="role-icon">🤖</span>';
+    html += '<span class="role-name">AI 助手</span>';
+    if (isRag) {
+        html += '<span class="mode-tag">知识库</span>';
+    }
+    if (webSearched) {
+        html += '<span class="web-tag">网络搜索</span>';
+    }
+    html += '</div>';
+
+    html += `<div class="message-content">${renderMarkdown(content)}</div>`;
+
+    // 显示图片
+    if (images && images.length > 0) {
+        html += '<div class="message-images"><strong>相关图片:</strong><div class="images-grid">';
+        images.forEach(img => {
+            const caption = img.caption ? `<div class="image-caption">${escapeHtml(img.caption)}</div>` : '';
+            const pageLabel = img.page ? `<span class="image-page">第${img.page}页</span>' : '';
             html += `
                 <div class="image-card">
                     <img src="${API_BASE}${img.url}" alt="${img.id}" loading="lazy" onclick="showImageModal('${API_BASE}${img.url}', '${escapeHtml(img.id)}')">
@@ -414,15 +691,16 @@ function addMessage(role, content, sources, webSearched, isRag, images) {
         html += '</div>';
     }
 
-    div.innerHTML = html;
-    container.appendChild(div);
-    container.scrollTop = container.scrollHeight;
-}
+    // 添加消息操作栏
+    html += `
+        <div class="message-actions">
+            <button class="action-btn upvote" onclick="openFeedbackModal('${messageId}', 1)" title="有帮助">👍</button>
+            <button class="action-btn downvote" onclick="openFeedbackModal('${messageId}', -1)" title="没帮助">👎</button>
+            <button class="action-btn exam-btn" onclick="createExamFromChat('${messageId}')" title="基于此对话出题">📝 出题</button>
+        </div>
+    `;
 
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    return html;
 }
 
 // ===== 会话管理 =====
@@ -467,13 +745,15 @@ function renderSessions() {
     container.querySelectorAll('.delete-btn').forEach(btn => {
         btn.addEventListener('click', async (e) => {
             e.stopPropagation();
-            if (!confirm('确定删除此会话？')) return;
+            const id = e.target.dataset.id;
+            if (!confirm('确定删除此会话吗？')) return;
+
             try {
-                await api(`/session/${btn.dataset.id}`, { method: 'DELETE' });
-                loadSessions();
-                if (state.sessionId === btn.dataset.id) {
+                await api(`/session/${id}`, { method: 'DELETE' });
+                if (state.sessionId === id) {
                     newSession();
                 }
+                loadSessions();
                 showToast('会话已删除', 'success');
             } catch (err) {
                 showToast('删除失败: ' + err.message, 'error');
@@ -507,12 +787,19 @@ function renderMessages(sessionId) {
         return;
     }
 
-    container.innerHTML = messages.map(m => `
-        <div class="message ${m.role}">
-            <div class="message-content">${escapeHtml(m.content)}</div>
-        </div>
-    `).join('');
-    container.scrollTop = container.scrollHeight;
+    container.innerHTML = '';
+    
+    messages.forEach(m => {
+        const meta = m.metadata || {};
+        addMessage(
+            m.role,
+            m.content,
+            meta.sources || [],
+            meta.web_searched || false,
+            meta.is_rag || false,
+            meta.images || []
+        );
+    });
 }
 
 function formatTime(timestamp) {
@@ -693,3 +980,570 @@ document.addEventListener('keydown', (e) => {
 window.toggleUserStatus = toggleUserStatus;
 window.showImageModal = showImageModal;
 window.closeImageModal = closeImageModal;
+
+// ===== 反馈系统 =====
+
+// 打开反馈弹窗
+function openFeedbackModal(messageId, rating) {
+    const messageEl = document.querySelector(`[data-message-id="${messageId}"]`);
+    if (!messageEl) return;
+
+    state.currentMessage = {
+        id: messageId,
+        content: messageEl.dataset.content || messageEl.querySelector('.message-content')?.textContent || '',
+        sources: JSON.parse(messageEl.dataset.sources || '[]')
+    };
+    state.feedbackRating = rating;
+
+    // 找到对应的用户问题
+    const prevMessage = messageEl.previousElementSibling;
+    const userQuery = prevMessage?.querySelector('.message-content')?.textContent || '';
+
+    state.currentMessage.query = userQuery;
+
+    $('feedbackModal').style.display = 'flex';
+    selectFeedbackRating(rating);
+}
+
+function closeFeedbackModal() {
+    $('feedbackModal').style.display = 'none';
+    // 重置表单
+    document.querySelectorAll('input[name="feedbackReason"]').forEach(r => r.checked = false);
+    $('otherReasonInput').style.display = 'none';
+    $('feedbackComment').value = '';
+    $('otherReasonText').value = '';
+}
+
+function selectFeedbackRating(rating) {
+    state.feedbackRating = rating;
+    document.querySelectorAll('.rating-btn').forEach(btn => {
+        btn.classList.remove('active');
+        if (parseInt(btn.dataset.rating) === rating) {
+            btn.classList.add('active');
+        }
+    });
+
+    // 点踩时显示原因选择
+    $('feedbackReasonSection').style.display = rating === -1 ? 'block' : 'none';
+}
+
+async function submitFeedbackForm() {
+    if (!state.currentMessage) return;
+
+    const rating = state.feedbackRating;
+    let reason = '';
+
+    if (rating === -1) {
+        const selectedReason = document.querySelector('input[name="feedbackReason"]:checked');
+        if (selectedReason) {
+            reason = selectedReason.value === 'other' ? $('otherReasonText').value : selectedReason.value;
+        }
+    }
+
+    const comment = $('feedbackComment').value;
+
+    try {
+        await api('/feedback', {
+            method: 'POST',
+            body: JSON.stringify({
+                session_id: state.sessionId || 'anonymous',
+                query: state.currentMessage.query,
+                answer: state.currentMessage.content,
+                rating: rating,
+                reason: reason || comment,
+                sources: state.currentMessage.sources,
+                user_id: state.user?.user_id || ''
+            })
+        });
+
+        closeFeedbackModal();
+        showToast('感谢您的反馈！', 'success');
+
+        // 更新按钮状态
+        const messageEl = document.querySelector(`[data-message-id="${state.currentMessage.id}"]`);
+        if (messageEl) {
+            const btn = messageEl.querySelector(rating === 1 ? '.upvote' : '.downvote');
+            if (btn) {
+                btn.classList.add('voted');
+                btn.disabled = true;
+            }
+        }
+
+        // 刷新统计
+        loadFeedbackStats();
+    } catch (err) {
+        showToast('提交失败: ' + err.message, 'error');
+    }
+}
+
+// 反馈统计
+async function loadFeedbackStats() {
+    if (state.user?.role !== 'admin') return;
+
+    try {
+        const stats = await api('/feedback/stats');
+        const statsData = stats.stats || {};
+
+        $('weeklyQueries').textContent = statsData.total_queries || 0;
+
+        const likeRate = statsData.total_queries > 0
+            ? Math.round((statsData.positive_count || 0) / statsData.total_queries * 100)
+            : 0;
+        $('weeklyLikeRate').textContent = `${likeRate}%`;
+
+        // 获取待审核FAQ数
+        try {
+            const faqSuggestions = await api('/faq/suggestions?status=pending');
+            $('pendingFaqs').textContent = faqSuggestions.total || 0;
+        } catch {
+            $('pendingFaqs').textContent = '0';
+        }
+    } catch (err) {
+        console.error('加载反馈统计失败:', err);
+    }
+}
+
+function showFeedbackStatsModal() {
+    $('feedbackStatsModal').style.display = 'flex';
+    showStatsTab('overview');
+}
+
+function closeFeedbackStatsModal() {
+    $('feedbackStatsModal').style.display = 'none';
+}
+
+async function showStatsTab(tab) {
+    document.querySelectorAll('.stats-tabs .tab-btn').forEach(btn => {
+        btn.classList.remove('active');
+    });
+    event.target.classList.add('active');
+
+    const content = $('statsTabContent');
+    content.innerHTML = '<div class="loading">加载中...</div>';
+
+    try {
+        if (tab === 'overview') {
+            const stats = await api('/feedback/stats');
+            const weekly = await api('/reports/weekly');
+            content.innerHTML = `
+                <div class="stats-overview">
+                    <div class="stat-card">
+                        <h4>本周统计</h4>
+                        <p>总查询: ${stats.stats?.total_queries || 0}</p>
+                        <p>好评: ${stats.stats?.positive_count || 0}</p>
+                        <p>差评: ${stats.stats?.negative_count || 0}</p>
+                    </div>
+                    <div class="stat-card">
+                        <h4>周报摘要</h4>
+                        <pre>${JSON.stringify(weekly.report || {}, null, 2)}</pre>
+                    </div>
+                </div>
+            `;
+        } else if (tab === 'feedbacks') {
+            const feedbacks = await api('/feedback/list?limit=50');
+            content.innerHTML = `
+                <div class="feedback-list">
+                    ${(feedbacks.feedbacks || []).map(f => `
+                        <div class="feedback-item ${f.rating === 1 ? 'positive' : 'negative'}">
+                            <div class="feedback-header">
+                                <span class="feedback-rating">${f.rating === 1 ? '👍' : '👎'}</span>
+                                <span class="feedback-time">${f.created_at || ''}</span>
+                            </div>
+                            <div class="feedback-query">${escapeHtml(f.query || '')}</div>
+                            ${f.reason ? `<div class="feedback-reason">原因: ${escapeHtml(f.reason)}</div>` : ''}
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+        } else if (tab === 'faq') {
+            const faqs = await api('/faq');
+            const suggestions = await api('/faq/suggestions');
+            content.innerHTML = `
+                <div class="faq-management">
+                    <h4>已批准的 FAQ</h4>
+                    <ul class="faq-list">
+                        ${(faqs.faqs || []).map(f => `
+                            <li class="faq-item">
+                                <div class="faq-question">${escapeHtml(f.question)}</div>
+                                <div class="faq-answer">${escapeHtml(f.answer)}</div>
+                            </li>
+                        `).join('')}
+                    </ul>
+                    <h4>待审核建议</h4>
+                    <ul class="suggestion-list">
+                        ${(suggestions.suggestions || []).map(s => `
+                            <li class="suggestion-item">
+                                <div class="suggestion-question">${escapeHtml(s.question)}</div>
+                                <div class="suggestion-actions">
+                                    <button class="btn btn-sm btn-primary" onclick="approveFaqSuggestion(${s.id})">批准</button>
+                                    <button class="btn btn-sm btn-danger" onclick="rejectFaqSuggestion(${s.id})">拒绝</button>
+                                </div>
+                            </li>
+                        `).join('')}
+                    </ul>
+                </div>
+            `;
+        }
+    } catch (err) {
+        content.innerHTML = `<div class="error">加载失败: ${err.message}</div>`;
+    }
+}
+
+async function approveFaqSuggestion(id) {
+    try {
+        await api(`/faq/suggestions/${id}/approve`, { method: 'POST' });
+        showToast('FAQ 已批准', 'success');
+        showStatsTab('faq');
+    } catch (err) {
+        showToast('操作失败', 'error');
+    }
+}
+
+async function rejectFaqSuggestion(id) {
+    try {
+        await api(`/faq/suggestions/${id}/reject`, { method: 'POST' });
+        showToast('FAQ 已拒绝', 'success');
+        showStatsTab('faq');
+    } catch (err) {
+        showToast('操作失败', 'error');
+    }
+}
+
+// ===== 知识库管理 =====
+
+function toggleKbPanel() {
+    const content = $('kbContent');
+    const btn = $('kbToggleBtn');
+    if (content.style.display === 'none') {
+        content.style.display = 'block';
+        btn.textContent = '▲';
+        loadCollections();
+        loadDocuments();
+    } else {
+        content.style.display = 'none';
+        btn.textContent = '▼';
+    }
+}
+
+async function loadCollections() {
+    try {
+        const data = await api('/collections');
+        state.collections = data.collections || [];
+        renderCollections();
+        updateKbFilters();
+    } catch (err) {
+        $('kbList').innerHTML = `<li class="error">加载失败: ${err.message}</li>`;
+    }
+}
+
+function renderCollections() {
+    const list = $('kbList');
+    if (!state.collections.length) {
+        list.innerHTML = '<li class="empty">暂无向量库</li>';
+        return;
+    }
+
+    list.innerHTML = state.collections.map(c => `
+        <li class="kb-item" data-name="${c.name}">
+            <div class="kb-item-info">
+                <span class="kb-name">${escapeHtml(c.display_name || c.name)}</span>
+                <span class="kb-count">${c.document_count || 0} 文档</span>
+            </div>
+            <div class="kb-item-actions">
+                <button class="btn-icon-sm" onclick="viewKbDocuments('${c.name}')" title="查看文档">📄</button>
+                ${state.user?.role === 'admin' ? `<button class="btn-icon-sm danger" onclick="deleteKb('${c.name}')" title="删除">×</button>` : ''}
+            </div>
+        </li>
+    `).join('');
+}
+
+function updateKbFilters() {
+    const options = state.collections.map(c => `<option value="${c.name}">${c.display_name || c.name}</option>`).join('');
+    $('docKbFilter').innerHTML = `<option value="">全部向量库</option>${options}`;
+    $('uploadKbSelect').innerHTML = `<option value="">请选择向量库</option>${options}`;
+}
+
+function showCreateKbModal() {
+    $('createKbModal').style.display = 'flex';
+}
+
+function closeCreateKbModal() {
+    $('createKbModal').style.display = 'none';
+    $('createKbForm').reset();
+}
+
+async function createKb(e) {
+    e.preventDefault();
+
+    const name = $('newKbName').value.trim();
+    const displayName = $('newKbDisplayName').value.trim();
+    const department = $('newKbDepartment').value.trim();
+    const description = $('newKbDescription').value.trim();
+
+    try {
+        await api('/collections', {
+            method: 'POST',
+            body: JSON.stringify({ name, display_name: displayName, department, description })
+        });
+        closeCreateKbModal();
+        showToast('向量库创建成功', 'success');
+        loadCollections();
+    } catch (err) {
+        showToast('创建失败: ' + err.message, 'error');
+    }
+}
+
+async function deleteKb(name) {
+    if (!confirm(`确定删除向量库 "${name}" 吗？此操作不可恢复！`)) return;
+
+    try {
+        await api(`/collections/${name}`, { method: 'DELETE' });
+        showToast('向量库已删除', 'success');
+        loadCollections();
+    } catch (err) {
+        showToast('删除失败: ' + err.message, 'error');
+    }
+}
+
+async function viewKbDocuments(kbName) {
+    $('docKbFilter').value = kbName;
+    loadDocuments();
+}
+
+// ===== 文档管理 =====
+
+async function loadDocuments() {
+    const kbFilter = $('docKbFilter').value;
+    const list = $('docList');
+
+    try {
+        const params = kbFilter ? `?collection=${kbFilter}` : '';
+        const data = await api(`/documents/list${params}`);
+        const docs = data.documents || [];
+
+        if (!docs.length) {
+            list.innerHTML = '<li class="empty">暂无文档</li>';
+            return;
+        }
+
+        list.innerHTML = docs.map(d => `
+            <li class="doc-item">
+                <div class="doc-info">
+                    <span class="doc-name">${escapeHtml(d.filename)}</span>
+                    <span class="doc-meta">${formatFileSize(d.size)} · ${d.collection}</span>
+                </div>
+                <div class="doc-actions">
+                    <button class="btn-icon-sm" onclick="viewDocChunks('${d.path}')" title="查看切片">📄</button>
+                    ${state.user?.role === 'admin' ? `<button class="btn-icon-sm danger" onclick="deleteDocument('${d.path}')" title="删除">×</button>` : ''}
+                </div>
+            </li>
+        `).join('');
+    } catch (err) {
+        list.innerHTML = `<li class="error">加载失败: ${err.message}</li>`;
+    }
+}
+
+function formatFileSize(bytes) {
+    if (!bytes) return '-';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+async function viewDocChunks(docPath) {
+    $('chunksModal').style.display = 'flex';
+    const content = $('chunksContent');
+    content.innerHTML = '<div class="loading">加载中...</div>';
+
+    try {
+        const data = await api(`/documents/${encodeURIComponent(docPath)}/chunks`);
+        const chunks = data.chunks || [];
+
+        content.innerHTML = `
+            <div class="chunks-header">
+                <h4>${docPath} - 共 ${chunks.length} 个切片</h4>
+            </div>
+            <div class="chunks-list">
+                ${chunks.map((c, i) => `
+                    <div class="chunk-item">
+                        <div class="chunk-header">
+                            <span class="chunk-id">#${i + 1}</span>
+                            <span class="chunk-meta">${c.metadata?.page ? '第' + c.metadata.page + '页' : ''}</span>
+                        </div>
+                        <div class="chunk-content">${escapeHtml((c.document || c.content || '').substring(0, 200))}${(c.document || c.content || '').length > 200 ? '...' : ''}</div>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+    } catch (err) {
+        content.innerHTML = `<div class="error">加载失败: ${err.message}</div>`;
+    }
+}
+
+function closeChunksModal() {
+    $('chunksModal').style.display = 'none';
+}
+
+async function deleteDocument(docPath) {
+    if (!confirm('确定删除此文档吗？')) return;
+
+    try {
+        await api(`/documents/${encodeURIComponent(docPath)}`, { method: 'DELETE' });
+        showToast('文档已删除', 'success');
+        loadDocuments();
+        loadCollections();
+    } catch (err) {
+        showToast('删除失败: ' + err.message, 'error');
+    }
+}
+
+// ===== 文档上传 =====
+
+function showUploadModal() {
+    $('uploadModal').style.display = 'flex';
+    state.selectedFiles = [];
+    $('selectedFiles').innerHTML = '';
+}
+
+function closeUploadModal() {
+    $('uploadModal').style.display = 'none';
+    state.selectedFiles = [];
+    $('selectedFiles').innerHTML = '';
+    $('uploadFileInput').value = '';
+}
+
+function handleFileSelect(files) {
+    const validFiles = Array.from(files).filter(f => {
+        const ext = f.name.split('.').pop().toLowerCase();
+        return ['pdf', 'docx', 'doc', 'xlsx', 'txt'].includes(ext) && f.size <= 10 * 1024 * 1024;
+    });
+
+    state.selectedFiles = validFiles;
+    $('selectedFiles').innerHTML = validFiles.map(f => `
+        <div class="selected-file">
+            <span>${escapeHtml(f.name)}</span>
+            <span class="file-size">${formatFileSize(f.size)}</span>
+        </div>
+    `).join('');
+}
+
+async function uploadDocument(e) {
+    e.preventDefault();
+
+    const kbName = $('uploadKbSelect').value;
+    if (!kbName) {
+        showToast('请选择目标向量库', 'error');
+        return;
+    }
+
+    if (!state.selectedFiles.length) {
+        showToast('请选择要上传的文件', 'error');
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append('collection', kbName);
+
+    if (state.selectedFiles.length === 1) {
+        formData.append('file', state.selectedFiles[0]);
+    } else {
+        state.selectedFiles.forEach(f => formData.append('files', f));
+    }
+
+    try {
+        const endpoint = state.selectedFiles.length === 1 ? '/documents/upload' : '/documents/batch-upload';
+        const res = await fetch(`${API_BASE}${endpoint}`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${state.token}` },
+            body: formData
+        });
+
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || '上传失败');
+
+        closeUploadModal();
+        showToast(`成功上传 ${state.selectedFiles.length} 个文件`, 'success');
+        loadDocuments();
+        loadCollections();
+    } catch (err) {
+        showToast('上传失败: ' + err.message, 'error');
+    }
+}
+
+// ===== 同步状态 =====
+
+async function loadSyncStatus() {
+    try {
+        const data = await api('/sync/status');
+
+        $('syncStatusValue').textContent = data.enabled ? '正常' : '未启用';
+        $('syncStatusValue').className = `sync-value ${data.enabled ? 'success' : 'error'}`;
+
+        if (data.last_sync) {
+            $('lastSyncTime').textContent = formatTime(data.last_sync.time) || '--';
+        }
+    } catch (err) {
+        $('syncStatusValue').textContent = '错误';
+        $('syncStatusValue').className = 'sync-value error';
+    }
+}
+
+async function triggerSync() {
+    showToast('正在同步...', 'info');
+    try {
+        await api('/sync', { method: 'POST' });
+        showToast('同步完成', 'success');
+        loadSyncStatus();
+        loadCollections();
+        loadDocuments();
+    } catch (err) {
+        showToast('同步失败: ' + err.message, 'error');
+    }
+}
+
+// ===== 出题联动 =====
+
+function createExamFromChat(messageId) {
+    const messageEl = document.querySelector(`[data-message-id="${messageId}"]`);
+    if (!messageEl) return;
+
+    // 获取对话上下文作为出题主题
+    const content = messageEl.querySelector('.message-content')?.textContent || '';
+    const sources = JSON.parse(messageEl.dataset.sources || '[]');
+
+    // 提取主题（取前50字符或来源文档名）
+    let topic = content.substring(0, 50);
+    if (sources.length > 0) {
+        topic = sources[0].source || sources[0] || topic;
+    }
+
+    // 跳转到出题页面
+    window.location.href = `exam.html?mode=chat&topic=${encodeURIComponent(topic)}`;
+}
+
+// 暴露更多全局函数
+window.toggleKbPanel = toggleKbPanel;
+window.openFeedbackModal = openFeedbackModal;
+window.closeFeedbackModal = closeFeedbackModal;
+window.selectFeedbackRating = selectFeedbackRating;
+window.submitFeedbackForm = submitFeedbackForm;
+window.showFeedbackStatsModal = showFeedbackStatsModal;
+window.closeFeedbackStatsModal = closeFeedbackStatsModal;
+window.showStatsTab = showStatsTab;
+window.approveFaqSuggestion = approveFaqSuggestion;
+window.rejectFaqSuggestion = rejectFaqSuggestion;
+window.showCreateKbModal = showCreateKbModal;
+window.closeCreateKbModal = closeCreateKbModal;
+window.createKb = createKb;
+window.deleteKb = deleteKb;
+window.viewKbDocuments = viewKbDocuments;
+window.loadDocuments = loadDocuments;
+window.viewDocChunks = viewDocChunks;
+window.closeChunksModal = closeChunksModal;
+window.deleteDocument = deleteDocument;
+window.showUploadModal = showUploadModal;
+window.closeUploadModal = closeUploadModal;
+window.handleFileSelect = handleFileSelect;
+window.uploadDocument = uploadDocument;
+window.triggerSync = triggerSync;
+window.createExamFromChat = createExamFromChat;

@@ -3,11 +3,15 @@
 
 路由:
 - GET    /collections                         - 获取向量库列表
-- POST   /collections                         - 创建向量库 (管理员)
-- DELETE /collections/<kb_name>               - 删除向量库 (管理员)
-- GET    /collections/<kb_name>/documents      - 获取向量库文档列表
+- POST   /collections                         - 创建向量库
+- PUT    /collections/<kb_name>               - 修改向量库
+- DELETE /collections/<kb_name>               - 删除向量库
+- GET    /collections/<kb_name>/documents     - 获取向量库文档列表
+- GET    /collections/<kb_name>/chunks        - 获取向量库切片列表
 - POST   /documents/sync                      - 触发文档同步
 - POST   /kb/route                            - 测试知识库路由 (调试)
+
+注意：权限验证由后端网关完成，RAG 服务不做权限判断
 """
 
 import os
@@ -49,39 +53,26 @@ def _require_multi_kb():
 @kb_bp.route('/collections', methods=['GET'])
 @require_gateway_auth
 def list_collections():
-    """获取用户可访问的向量库列表"""
+    """获取向量库列表"""
     kb_manager, _, err = _require_multi_kb()
     if err:
         return err
 
-    from auth.gateway import get_accessible_collections
-
     user = request.current_user
-    role = user["role"]
-    department = user.get("department", "")
 
-    # 获取所有向量库
+    # 获取所有向量库（权限由后端网关管理）
     all_collections = kb_manager.list_collections()
-
-    # 获取用户可访问的向量库
-    accessible_read = get_accessible_collections(role, department, "read")
-    accessible_write = get_accessible_collections(role, department, "write")
-    accessible_delete = get_accessible_collections(role, department, "delete")
 
     result = []
     for coll in all_collections:
-        if coll.name in accessible_read:
-            result.append({
-                "name": coll.name,
-                "display_name": coll.display_name,
-                "document_count": coll.document_count,
-                "department": coll.department,
-                "created_at": coll.created_at,
-                "description": coll.description,
-                "can_write": coll.name in accessible_write,
-                "can_delete": coll.name in accessible_delete,
-                "can_sync": coll.name in accessible_write
-            })
+        result.append({
+            "name": coll.name,
+            "display_name": coll.display_name,
+            "document_count": coll.document_count,
+            "department": coll.department,
+            "created_at": coll.created_at,
+            "description": coll.description
+        })
 
     return jsonify({
         "collections": result,
@@ -92,22 +83,12 @@ def list_collections():
 @kb_bp.route('/collections', methods=['POST'])
 @require_gateway_auth
 def create_collection():
-    """创建新向量库（仅管理员）"""
+    """创建新向量库"""
     kb_manager, _, err = _require_multi_kb()
     if err:
         return err
 
-    from auth.gateway import can_create_collection
-
-    user = request.current_user
-
-    if not can_create_collection(user["role"]):
-        return jsonify({
-            "error": "权限不足",
-            "message": "只有管理员可以创建向量库"
-        }), 403
-
-    data = request.json
+    data = request.json or {}
     name = data.get('name', '').strip()
     display_name = data.get('display_name', '')
     department = data.get('department', '')
@@ -116,11 +97,11 @@ def create_collection():
     if not name:
         return jsonify({"error": "向量库名称不能为空"}), 400
 
-    # 验证名称格式
-    if not name.replace('_', '').isalnum():
+    # 验证名称格式（ChromaDB 限制）
+    if not name.replace('_', '').replace('-', '').isalnum():
         return jsonify({
             "error": "名称格式错误",
-            "message": "向量库名称只能包含字母、数字和下划线"
+            "message": "向量库名称只能包含字母、数字、下划线和连字符"
         }), 400
 
     success, message = kb_manager.create_collection(
@@ -132,23 +113,42 @@ def create_collection():
     return jsonify({"error": message}), 400
 
 
-@kb_bp.route('/collections/<kb_name>', methods=['DELETE'])
+@kb_bp.route('/collections/<kb_name>', methods=['PUT'])
 @require_gateway_auth
-def delete_collection(kb_name):
-    """删除向量库（仅管理员）"""
+def update_collection(kb_name):
+    """修改向量库信息"""
     kb_manager, _, err = _require_multi_kb()
     if err:
         return err
 
-    from auth.gateway import can_delete_collection
+    data = request.json or {}
+    display_name = data.get('display_name')
+    description = data.get('description')
 
-    user = request.current_user
+    # 检查向量库是否存在
+    collections = kb_manager.list_collections()
+    if not any(c.name == kb_name for c in collections):
+        return jsonify({"error": f"向量库 '{kb_name}' 不存在"}), 404
 
-    if not can_delete_collection(user["role"]):
-        return jsonify({
-            "error": "权限不足",
-            "message": "只有管理员可以删除向量库"
-        }), 403
+    # 更新元数据
+    success = kb_manager.update_collection_metadata(
+        kb_name,
+        display_name=display_name,
+        description=description
+    )
+
+    if success:
+        return jsonify({"success": True, "message": "向量库信息已更新"})
+    return jsonify({"error": "更新失败"}), 500
+
+
+@kb_bp.route('/collections/<kb_name>', methods=['DELETE'])
+@require_gateway_auth
+def delete_collection(kb_name):
+    """删除向量库"""
+    kb_manager, _, err = _require_multi_kb()
+    if err:
+        return err
 
     success, message = kb_manager.delete_collection(kb_name)
 
@@ -165,22 +165,34 @@ def list_collection_documents(kb_name):
     if err:
         return err
 
-    from auth.gateway import check_collection_permission
-
-    user = request.current_user
-
-    if not check_collection_permission(user["role"], user.get("department", ""), kb_name, "read"):
-        return jsonify({
-            "error": "权限不足",
-            "message": f"您没有权限访问向量库 '{kb_name}'"
-        }), 403
-
     documents = kb_manager.list_documents(kb_name)
 
     return jsonify({
         "collection": kb_name,
         "documents": documents,
         "total": len(documents)
+    })
+
+
+@kb_bp.route('/collections/<kb_name>/chunks', methods=['GET'])
+@require_gateway_auth
+def list_collection_chunks(kb_name):
+    """获取向量库中的切片列表"""
+    kb_manager, _, err = _require_multi_kb()
+    if err:
+        return err
+
+    # 可选过滤参数
+    document_id = request.args.get('document_id')
+    limit = request.args.get('limit', 100, type=int)
+    offset = request.args.get('offset', 0, type=int)
+
+    chunks = kb_manager.list_chunks(kb_name, document_id=document_id, limit=limit, offset=offset)
+
+    return jsonify({
+        "collection": kb_name,
+        "chunks": chunks,
+        "total": len(chunks)
     })
 
 
@@ -192,58 +204,63 @@ def sync_documents():
 
     请求体:
     {
-        "collection": "向量库名称"  // 可选
+        "collection": "向量库名称"  // 可选，不传则同步所有
     }
     """
     kb_manager, _, err = _require_multi_kb()
     if err:
         return err
 
-    from auth.gateway import check_collection_permission, get_accessible_collections
     from config import DOCUMENTS_PATH
 
     user = request.current_user
-    role = user["role"]
-    department = user.get("department", "")
-
     data = request.json or {}
     target_collection = data.get('collection')
 
     # 确定要同步的向量库
     if target_collection:
-        if not check_collection_permission(role, department, target_collection, "sync"):
-            return jsonify({
-                "error": "权限不足",
-                "message": f"您没有权限同步向量库 '{target_collection}'"
-            }), 403
         collections_to_sync = [target_collection]
     else:
-        collections_to_sync = get_accessible_collections(role, department, "sync")
+        # 同步所有向量库
+        all_collections = kb_manager.list_collections()
+        collections_to_sync = [c.name for c in all_collections]
 
     if not collections_to_sync:
         return jsonify({"error": "没有可同步的向量库"}), 400
 
     # 执行同步
     results = []
-    for coll_name in collections_to_sync:
-        try:
-            if coll_name == "public_kb":
-                doc_dir = os.path.join(DOCUMENTS_PATH, "public")
-            else:
-                dept_name = coll_name.replace("dept_", "")
-                doc_dir = os.path.join(DOCUMENTS_PATH, "dept_" + dept_name)
 
+    # 使用 sync_service 执行同步
+    sync_service = current_app.config.get('SYNC_SERVICE')
+
+    if sync_service:
+        try:
+            sync_result = sync_service.sync_now()
             results.append({
-                "collection": coll_name,
+                "collection": "all",
                 "status": "success",
-                "message": f"向量库 '{coll_name}' 同步任务已提交",
-                "document_dir": doc_dir
+                "message": f"同步完成: 处理 {sync_result.documents_processed} 个文档",
+                "details": {
+                    "added": sync_result.documents_added,
+                    "modified": sync_result.documents_modified,
+                    "deleted": sync_result.documents_deleted,
+                    "errors": sync_result.errors
+                }
             })
         except Exception as e:
             results.append({
-                "collection": coll_name,
+                "collection": "all",
                 "status": "error",
                 "message": str(e)
+            })
+    else:
+        # 没有 sync_service，返回提示
+        for coll_name in collections_to_sync:
+            results.append({
+                "collection": coll_name,
+                "status": "warning",
+                "message": "同步服务不可用，请使用 POST /sync 端点"
             })
 
     return jsonify({
@@ -264,7 +281,7 @@ def test_routing():
     from knowledge.router import route_query
 
     user = request.current_user
-    data = request.json
+    data = request.json or {}
     query = data.get('query', '')
 
     if not query:
@@ -273,7 +290,7 @@ def test_routing():
     # 获取路由结果
     target_kbs = route_query(
         query,
-        user["role"],
+        user.get("role", "user"),
         user.get("department", "")
     )
 
@@ -282,7 +299,7 @@ def test_routing():
 
     return jsonify({
         "query": query,
-        "user_role": user["role"],
+        "user_role": user.get("role"),
         "user_department": user.get("department", ""),
         "target_collections": target_kbs,
         "intent": {

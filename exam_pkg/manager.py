@@ -1,25 +1,55 @@
 """
-智能出题系统 - 整合管理器
-整合出题工作流和批阅工作流
+出题与批题系统管理器
 
-支持两种出题模式：
-1. 传统模式：通过 Dify 工作流从向量库检索片段出题
-2. 章节模式：使用 OpenDataLoader 解析完整章节内容出题（更完整）
+核心功能：
+1. 题目生成（调用 generator.py）
+2. 答案批阅（调用 grader.py）
+3. 题库管理（保存/加载/搜索）
+
+职责边界：
+- RAG 服务负责：生成题目 + 批阅答案
+- 后端服务负责：审核入库 + 状态管理
+
+使用方式：
+    from exam_pkg.manager import generate_questions_from_file, grade_answers
 """
 import json
 import os
+import re
 import requests
 import uuid
+import hashlib
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# OpenDataLoader PDF 解析器（可选）
+# 状态常量
+EXAM_STATUS_DRAFT = "draft"
+EXAM_STATUS_APPROVED = "approved"
+
+# 导入新的生成器和批题器
+from exam_pkg.generator import (
+    QuestionGenerator,
+    build_semantic_query,
+    build_source_context,
+    safe_parse_questions,
+    validate_questions_schema
+)
+from exam_pkg.grader import (
+    AnswerGrader,
+    grade_answers as grade_answers_v2,
+    grade_objective,
+    grade_fill_blank
+)
+
+# MinerU 解析器（可选）
 try:
-    from parsers.pdf_odl import parse_pdf_with_odl, get_chapter_content_for_exam
-    ODL_AVAILABLE = True
+    from parsers import parse_document, MINERU_AVAILABLE
+    if MINERU_AVAILABLE:
+        from parsers.mineru_parser import MinerUChunk
+    PARSE_AVAILABLE = MINERU_AVAILABLE
 except ImportError:
-    ODL_AVAILABLE = False
+    PARSE_AVAILABLE = False
 
 # 导入配置
 try:
@@ -33,18 +63,187 @@ except ImportError:
 
 # 题库目录
 QUESTION_BANK_DIR = "./题库"
-DRAFT_DIR = "./题库/草稿"  # 草稿文件夹
+DRAFT_DIR = "./题库/草稿"
 REPORT_DIR = "./批阅报告"
 
-# 试卷状态
-EXAM_STATUS_DRAFT = "draft"           # 草稿
-EXAM_STATUS_PENDING = "pending_review"  # 待审核
-EXAM_STATUS_APPROVED = "approved"      # 已通过
-EXAM_STATUS_REJECTED = "rejected"      # 已驳回
+
+# ==================== 新版出题接口 ====================
+
+def generate_questions_from_file(
+    file_path: str,
+    collection: str,
+    question_types: Dict[str, int],
+    difficulty: int = 3,
+    options: Dict = None,
+    request_id: str = None
+) -> Dict:
+    """
+    从文件生成题目（结构化出题）
+
+    🔥 Structure-aware RAG 出题架构：
+    - 按章节分组 → 提取知识点 → 按知识点出题 → 合并去重
+
+    Args:
+        file_path: 文件路径
+        collection: 向量库名称
+        question_types: 题型及数量 {"single_choice": 3, "fill_blank": 2, ...}
+        difficulty: 难度 1-5
+        options: 可选配置
+            - max_source_chunks: 最大切片数（默认 30）
+        request_id: 请求 ID（幂等性支持）
+
+    Returns:
+        {
+            "success": True,
+            "request_id": "...",
+            "questions": [...],
+            "total": 10,
+            "source_chunks_used": 15
+        }
+    """
+    options = options or {}
+
+    # 1. 检索文件的所有切片
+    chunks = retrieve_file_chunks(
+        file_path=file_path,
+        collection=collection,
+        question_types=question_types,
+        top_k=options.get('max_source_chunks', 30)
+    )
+    print(f"[DEBUG] generate_questions_from_file: chunks 数量 = {len(chunks)}")
+
+    # 2. 结构化出题：按章节提取知识点 → 按知识点出题
+    generator = QuestionGenerator()
+    questions = generator.generate_questions_structured(
+        chunks=chunks,
+        document_name=file_path,
+        question_types=question_types,
+        difficulty=difficulty
+    )
+
+    return {
+        "success": True,
+        "request_id": request_id,
+        "questions": questions,
+        "total": len(questions),
+        "source_chunks_used": len(chunks)
+    }
+
+
+def retrieve_file_chunks(
+    file_path: str,
+    collection,  # 支持字符串或列表
+    question_types: Dict[str, int],
+    top_k: int = None
+) -> List[Dict]:
+    """
+    检索文件相关切片
+
+    Args:
+        file_path: 文件路径
+        collection: 向量库名称（支持字符串或列表，列表时按优先级顺序检索）
+        question_types: 题型及数量
+        top_k: 最大切片数
+
+    Returns:
+        切片列表
+    """
+    # 动态计算 top_k：题型数量 × 3，上限 50
+    if top_k is None:
+        total_questions = sum(question_types.values())
+        top_k = min(50, total_questions * 3)
+
+    # 根据题型构建语义 query
+    query = build_semantic_query(question_types)
+
+    # 提取文件名（向量库存储的是文件名，不含路径前缀）
+    filename = os.path.basename(file_path)
+
+    # 统一处理为列表
+    if isinstance(collection, str):
+        collections = [collection]
+    else:
+        collections = list(collection) if collection else []
+
+    if not collections:
+        print("[ERROR] 未指定向量库")
+        return []
+
+    try:
+        from core.engine import get_engine
+        engine = get_engine()
+
+        # 按优先级遍历 collections，找到文件即停止
+        for coll in collections:
+            # 尝试两种格式：文件名和完整路径
+            for source_filter in [filename, file_path]:
+                results = engine.search_knowledge(
+                    query=query,
+                    collections=[coll],
+                    source_filter=source_filter,
+                    top_k=top_k
+                )
+
+                # 检查是否有结果
+                if results.get('documents') and results['documents'][0]:
+                    print(f"[DEBUG] 在向量库 [{coll}] 中找到文件 [{filename}]")
+                    break
+            else:
+                continue
+            break  # 外层循环跳出
+
+        chunks = []
+        if results.get('documents') and results['documents'][0]:
+            for i, (doc, meta, score) in enumerate(zip(
+                results['documents'][0],
+                results['metadatas'][0],
+                results['distances'][0]
+            )):
+                chunks.append({
+                    "chunk_id": results['ids'][0][i],
+                    "content": doc,
+                    "source": meta.get('source'),
+                    "page": meta.get('page'),
+                    "section": meta.get('section', ''),
+                    "score": score
+                })
+
+        print(f"[DEBUG] retrieve_file_chunks: 检索到 {len(chunks)} 个切片")
+        return chunks
+
+    except Exception as e:
+        print(f"[ERROR] 检索切片失败: {e}")
+        return []
+
+
+# ==================== 新版批题接口 ====================
+
+def grade_answers(answers: List[Dict], request_id: str = None) -> Dict:
+    """
+    批阅答案入口函数
+
+    🔥 改进：
+    - 本地批阅选择题/判断题
+    - 填空题模糊匹配
+    - 主观题 LLM 评分
+    - 并发 + 限流 + 顺序保持
+    """
+    return grade_answers_v2(answers, request_id)
+
+
+# ==================== Dify 工作流接口（保留作为后续迁移参考） ====================
+# 以下函数用于后续将出题/批卷功能迁移到 Dify 工作流时参考
+# 当前使用本地 LLM 实现，这些函数暂未被 API 调用
 
 
 def call_dify_workflow(api_key: str, inputs: dict) -> dict:
-    """调用Dify工作流"""
+    """
+    调用 Dify 工作流
+
+    [保留作为后续迁移参考]
+    后续如需迁移到 Dify 工作流，可参考此函数的实现方式。
+    需要在 config.py 中配置 DIFY_API_URL 和对应的 API_KEY。
+    """
     url = f"{DIFY_API_URL}/workflows/run"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -240,7 +439,6 @@ def generate_exam_by_file(
 
     # 提取文件名作为默认试卷名
     if name is None:
-        import os
         filename = os.path.basename(file_path)
         name = os.path.splitext(filename)[0] + "试卷"
 
@@ -342,11 +540,11 @@ def generate_exam_by_file_with_chapters(
     """
     按文件生成题目（使用完整章节内容，无信息缺失）
 
-    使用 OpenDataLoader 解析 PDF，获取完整章节内容作为出题素材。
+    使用 MinerU 解析文档，获取完整章节内容作为出题素材。
     相比向量片段检索，可以获取完整的上下文，避免信息缺失。
 
     Args:
-        file_path: PDF 文件完整路径
+        file_path: 文档文件完整路径（支持 PDF/DOCX/PPTX）
         keywords: 关键词列表，用于定位相关章节（可选）
         choice_count: 选择题数量
         blank_count: 填空题数量
@@ -368,38 +566,50 @@ def generate_exam_by_file_with_chapters(
             "total_score": 22
         }
     """
-    if not ODL_AVAILABLE:
-        raise ImportError("OpenDataLoader PDF 解析器不可用，请安装 opendataloader-pdf")
+    if not PARSE_AVAILABLE:
+        raise ImportError("MinerU 解析器不可用，请运行: pip install \"mineru[all]\"")
 
-    print(f"正在解析 PDF 文件: {file_path}")
+    print(f"正在解析文档文件: {file_path}")
 
-    # 解析 PDF 获取章节内容
-    result = parse_pdf_with_odl(file_path)
-    chunks = result['chunks']
+    # 使用统一解析入口
+    result = parse_document(
+        file_path,
+        output_base=".data/mineru_temp",
+        images_output=".data/images",
+        cleanup_after_image_move=True
+    )
+    chunks = result.get('chunks', [])
 
-    print(f"解析完成: {len(chunks)} 个章节")
+    print(f"解析完成: {len(chunks)} 个内容块")
+
+    # 构建章节内容列表
+    chapter_contents = []
+    for chunk in chunks:
+        content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+        if not content.strip():
+            continue
+
+        chapter_contents.append({
+            "title": chunk.title if hasattr(chunk, 'title') else '',
+            "content": content.strip(),
+            "section_path": chunk.section_path if hasattr(chunk, 'section_path') else '',
+            "page_range": f"{chunk.page_start}-{chunk.page_end}" if hasattr(chunk, 'page_start') else '',
+            "source_file": chunk.source_file if hasattr(chunk, 'source_file') else os.path.basename(file_path)
+        })
 
     # 如果有关键词，筛选相关章节
     if keywords:
-        chapter_contents = get_chapter_content_for_exam(
-            chunks,
-            keywords=keywords,
-            max_chunks=max_chapters
-        )
+        # 简单的关键词匹配筛选
+        relevant = []
+        for c in chapter_contents:
+            content_lower = c['content'].lower()
+            if any(kw.lower() in content_lower for kw in keywords):
+                relevant.append(c)
+        chapter_contents = relevant[:max_chapters]
         print(f"根据关键词筛选出 {len(chapter_contents)} 个相关章节")
-    else:
-        # 使用所有章节（按内容长度排序，取前N个）
-        sorted_chunks = sorted(chunks, key=lambda x: len(x.content), reverse=True)[:max_chapters]
-        chapter_contents = [
-            {
-                "title": c.title,
-                "content": c.content.strip(),
-                "section_path": c.section_path,
-                "page_range": f"{c.page_start}-{c.page_end}",
-                "source_file": c.source_file
-            }
-            for c in sorted_chunks
-        ]
+
+    # 按内容长度排序，取前N个
+    chapter_contents = sorted(chapter_contents, key=lambda x: len(x['content']), reverse=True)[:max_chapters]
 
     if not chapter_contents:
         raise ValueError("未找到有效的章节内容用于出题")
@@ -499,7 +709,7 @@ def get_source_chapters_for_question(
     获取与问题主题相关的章节内容（用于出题或批阅参考）
 
     Args:
-        file_path: PDF 文件路径
+        file_path: 文档文件路径（支持 PDF/DOCX/PPTX）
         question_topic: 问题主题或关键词
         top_k: 返回的章节数量
 
@@ -513,25 +723,46 @@ def get_source_chapters_for_question(
             }
         ]
     """
-    if not ODL_AVAILABLE:
-        raise ImportError("OpenDataLoader PDF 解析器不可用")
+    if not PARSE_AVAILABLE:
+        raise ImportError("MinerU 解析器不可用")
 
-    result = parse_pdf_with_odl(file_path)
-    chunks = result['chunks']
+    result = parse_document(
+        file_path,
+        output_base=".data/mineru_temp",
+        images_output=".data/images",
+        cleanup_after_image_move=True
+    )
+    chunks = result.get('chunks', [])
+
+    # 构建章节内容列表
+    chapter_contents = []
+    for chunk in chunks:
+        content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+        if not content.strip():
+            continue
+
+        chapter_contents.append({
+            "title": chunk.title if hasattr(chunk, 'title') else '',
+            "content": content.strip(),
+            "section_path": chunk.section_path if hasattr(chunk, 'section_path') else '',
+            "page_range": f"{chunk.page_start}-{chunk.page_end}" if hasattr(chunk, 'page_start') else '',
+            "source_file": chunk.source_file if hasattr(chunk, 'source_file') else os.path.basename(file_path)
+        })
 
     # 使用关键词检索相关章节
     keywords = question_topic.split() if question_topic else []
-    return get_chapter_content_for_exam(chunks, keywords, max_chunks=top_k)
-    """
-    清理文件名，移除非法字符
 
-    Args:
-        name: 原始文件名
+    # 简单的关键词匹配筛选
+    relevant = []
+    for c in chapter_contents:
+        content_lower = c['content'].lower()
+        if any(kw.lower() in content_lower for kw in keywords):
+            relevant.append(c)
 
-    Returns:
-        安全的文件名
-    """
-    import re
+    return relevant[:top_k]
+
+
+def sanitize_filename(name: str) -> str:
     # 移除或替换非法字符
     illegal_chars = r'[<>:"/\\|?*\x00-\x1f]'
     safe_name = re.sub(illegal_chars, '_', name)
@@ -778,157 +1009,6 @@ def delete_exam(exam_id: str) -> bool:
         return True
 
     return False
-
-
-# ==================== 审核函数 ====================
-
-def review_exam(exam_id: str, action: str, questions: List[dict] = None,
-                feedback: str = None) -> dict:
-    """
-    审核试卷
-
-    Args:
-        exam_id: 试卷ID
-        action: 审核动作（approve/reject/partial）
-        questions: 逐题审核时的题目修改（仅partial时使用）
-        feedback: 审核意见
-
-    Returns:
-        审核结果
-    """
-    exam = get_exam_by_id(exam_id)
-    if not exam:
-        return {"success": False, "error": "试卷不存在"}
-
-    if action == "approve":
-        # 整体通过
-        exam["status"] = EXAM_STATUS_APPROVED
-        exam["reviewed_at"] = datetime.now().isoformat()
-        if feedback:
-            exam["review_feedback"] = feedback
-
-        # 将试卷从草稿目录移动到题库目录
-        old_filepath = _find_exam_filepath(exam_id)
-        if old_filepath:
-            # 生成新的文件名（使用试卷名称）
-            exam_name = exam.get("name") or exam.get("topic", "未命名试卷")
-            new_name = sanitize_filename(exam_name)
-
-            # 检查是否已存在同名文件
-            new_filepath = os.path.join(QUESTION_BANK_DIR, f"{new_name}.json")
-            if os.path.exists(new_filepath) and new_filepath != old_filepath:
-                # 添加时间戳避免冲突
-                timestamp = datetime.now().strftime('_%Y%m%d_%H%M%S')
-                new_name = f"{new_name}{timestamp}"
-                new_filepath = os.path.join(QUESTION_BANK_DIR, f"{new_name}.json")
-
-            # 确保题库目录存在
-            os.makedirs(QUESTION_BANK_DIR, exist_ok=True)
-
-            # 移动文件
-            import shutil
-            if old_filepath != new_filepath:
-                shutil.move(old_filepath, new_filepath)
-                print(f"试卷已从草稿目录移动到题库: {new_filepath}")
-
-        # 更新试卷数据
-        update_exam(exam_id, exam)
-        return {"success": True, "status": EXAM_STATUS_APPROVED, "message": "试卷审核通过，已保存到题库"}
-
-    elif action == "reject":
-        # 整体驳回
-        exam["status"] = EXAM_STATUS_REJECTED
-        exam["reviewed_at"] = datetime.now().isoformat()
-        if feedback:
-            exam["review_feedback"] = feedback
-
-        update_exam(exam_id, exam)
-        return {"success": True, "status": EXAM_STATUS_REJECTED}
-
-    elif action == "partial":
-        # 逐题审核
-        if not questions:
-            return {"success": False, "error": "缺少题目审核信息"}
-
-        approved_count = 0
-        edited_count = 0
-        deleted_count = 0
-
-        for q_review in questions:
-            q_type = q_review.get("type")
-            q_id = q_review.get("id")
-
-            # 找到对应题目列表
-            if q_type == "choice":
-                q_list = exam.get("choice_questions", [])
-            elif q_type == "blank":
-                q_list = exam.get("blank_questions", [])
-            elif q_type == "short_answer":
-                q_list = exam.get("short_answer_questions", [])
-            else:
-                continue
-
-            # 找到题目索引
-            q_idx = None
-            for i, q in enumerate(q_list):
-                if q.get("id") == q_id:
-                    q_idx = i
-                    break
-
-            if q_idx is None:
-                continue
-
-            # 处理删除
-            if q_review.get("delete"):
-                q_list.pop(q_idx)
-                deleted_count += 1
-                continue
-
-            # 处理编辑
-            if q_review.get("edit"):
-                q_list[q_idx].update(q_review["edit"])
-                edited_count += 1
-
-            # 处理通过
-            if q_review.get("approved"):
-                q_list[q_idx]["approved"] = True
-                approved_count += 1
-
-        # 更新试卷
-        exam["status"] = EXAM_STATUS_PENDING
-        exam["reviewed_at"] = datetime.now().isoformat()
-        update_exam(exam_id, exam)
-
-        return {
-            "success": True,
-            "status": EXAM_STATUS_PENDING,
-            "approved_count": approved_count,
-            "edited_count": edited_count,
-            "deleted_count": deleted_count
-        }
-
-    return {"success": False, "error": "无效的审核动作"}
-
-
-def submit_for_review(exam_id: str) -> dict:
-    """
-    提交试卷审核
-
-    Args:
-        exam_id: 试卷ID
-
-    Returns:
-        提交结果
-    """
-    exam = get_exam_by_id(exam_id)
-    if not exam:
-        return {"success": False, "error": "试卷不存在"}
-
-    exam["status"] = EXAM_STATUS_PENDING
-    exam["submitted_at"] = datetime.now().isoformat()
-
-    update_exam(exam_id, exam)
-    return {"success": True, "status": EXAM_STATUS_PENDING}
 
 
 # ==================== 题目搜索 ====================

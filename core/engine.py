@@ -13,7 +13,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 import chromadb
 from openai import OpenAI
 
-from parsers import ODL_AVAILABLE, DOCLING_AVAILABLE, EXCEL_ENHANCED_AVAILABLE
+from parsers import MINERU_AVAILABLE, PANDAS_AVAILABLE
 
 # 延迟导入，防止循环依赖
 _engine_instance = None
@@ -25,19 +25,12 @@ try:
         CHROMA_DB_PATH, DOCUMENTS_PATH, BM25_INDEXES_PATH,
         USE_MULTI_KB, USE_HYBRID_SEARCH, VECTOR_WEIGHT, BM25_WEIGHT,
         USE_RERANK, RERANK_CANDIDATES, RERANK_TOP_K,
-        USE_SEMANTIC_CHUNK, SEMANTIC_BREAKPOINT_THRESHOLD,
-        SEMANTIC_MIN_CHUNK_SIZE, SEMANTIC_MAX_CHUNK_SIZE
+        CHUNK_SIZE, CHUNK_OVERLAP
     )
 except ImportError:
     pass
 
 from core.bm25_index import BM25Index
-
-try:
-    from core.chunker import SemanticChunker, HybridChunker
-    SEMANTIC_CHUNKER_AVAILABLE = True
-except ImportError:
-    SEMANTIC_CHUNKER_AVAILABLE = False
 
 
 class RAGEngine:
@@ -54,7 +47,6 @@ class RAGEngine:
         self.embedding_model = None
         self.reranker = None
         self.llm_client = None
-        self.semantic_chunker = None
         self.bm25_index = None
 
         # 单向量库模式
@@ -82,18 +74,9 @@ class RAGEngine:
         # 1. 向量模型
         if os.path.exists(EMBEDDING_MODEL_PATH):
             self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_PATH)
-            print(f"✓ 向量模型加载完成: {EMBEDDING_MODEL_PATH}")
+            print(f"[OK] 向量模型加载完成: {EMBEDDING_MODEL_PATH}")
         else:
             raise RuntimeError(f"向量模型未找到: {EMBEDDING_MODEL_PATH}")
-
-        # 设置语义分块器
-        if USE_SEMANTIC_CHUNK and SEMANTIC_CHUNKER_AVAILABLE:
-            self.semantic_chunker = SemanticChunker(
-                embedding_model=self.embedding_model,
-                breakpoint_threshold=SEMANTIC_BREAKPOINT_THRESHOLD,
-                min_chunk_size=SEMANTIC_MIN_CHUNK_SIZE,
-                max_chunk_size=SEMANTIC_MAX_CHUNK_SIZE
-            )
 
         # 2. 向量数据库
         if USE_MULTI_KB:
@@ -102,31 +85,31 @@ class RAGEngine:
             self.kb_manager = KnowledgeBaseManager(CHROMA_DB_PATH)
             self.kb_router = KnowledgeBaseRouter(use_llm=False)
             self.collection = self.kb_manager.get_collection('public_kb')
-            print(f"✓ 多向量库模式已启用")
+            print(f"[OK] 多向量库模式已启用")
         else:
             self.chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
             self.collection = self.chroma_client.get_or_create_collection(
                 name="knowledge_base",
                 metadata={"description": "RAG Demo 知识库"}
             )
-            print(f"✓ 单向量库模式已启用: {CHROMA_DB_PATH}")
+            print(f"[OK] 单向量库模式已启用: {CHROMA_DB_PATH}")
 
         # 3. BM25 索引
         self.bm25_index = BM25Index()
         if USE_HYBRID_SEARCH and not USE_MULTI_KB:
             bm25_path = os.path.join(BM25_INDEXES_PATH, "default_bm25.pkl")
             self.bm25_index.load(bm25_path)
-            print("✓ BM25索引已加载")
+            print("[OK] BM25索引已加载")
 
         # 4. LLM 客户端
         self.llm_client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-        print(f"✓ LLM 客户端就绪: {MODEL}")
+        print(f"[OK] LLM 客户端就绪: {MODEL}")
 
         # 5. Reranker 模型
         if USE_RERANK:
             if os.path.exists(RERANK_MODEL_PATH):
                 self.reranker = CrossEncoder(RERANK_MODEL_PATH)
-                print(f"✓ Rerank模型加载完成: {RERANK_MODEL_PATH}")
+                print(f"[OK] Rerank模型加载完成: {RERANK_MODEL_PATH}")
             else:
                 try:
                     os.makedirs(RERANK_MODEL_PATH, exist_ok=True)
@@ -136,9 +119,9 @@ class RAGEngine:
                     model.save_pretrained(RERANK_MODEL_PATH)
                     tokenizer.save_pretrained(RERANK_MODEL_PATH)
                     self.reranker = CrossEncoder(RERANK_MODEL_PATH)
-                    print(f"✓ Rerank模型下载完成: {RERANK_MODEL_PATH}")
+                    print(f"[OK] Rerank模型下载完成: {RERANK_MODEL_PATH}")
                 except Exception as e:
-                    print(f"✗ Rerank模型加载失败: {e}")
+                    print(f"[FAIL] Rerank模型加载失败: {e}")
                     USE_RERANK = False
 
         self._initialized = True
@@ -189,6 +172,12 @@ class RAGEngine:
 
         vector_results = self.collection.query(**query_kwargs)
 
+        # ========== 独立查询 FAQ 集合 ==========
+        faq_results = self._search_faq_collection(query_vector, top_k=3)
+        if faq_results and faq_results.get('ids') and faq_results['ids'][0]:
+            # 合并 FAQ 结果到主结果
+            vector_results = self._merge_results([vector_results, faq_results])
+
         results_list = [vector_results]
         weights = [VECTOR_WEIGHT]
 
@@ -211,7 +200,168 @@ class RAGEngine:
         else:
             fused_results = self._truncate_results(fused_results, top_k)
 
+        # FAQ 分数加权（Score Boosting）
+        fused_results = self._boost_faq_chunks(fused_results)
+
+        # 时间衰减（Time Decay）
+        fused_results = self._apply_time_decay(fused_results)
+
         return fused_results
+
+    def _search_faq_collection(self, query_vector: list, top_k: int = 3) -> dict:
+        """
+        独立查询 FAQ 集合
+
+        FAQ 存储在独立的集合中，与普通文档分离，便于独立管理和清理
+
+        Args:
+            query_vector: 查询向量
+            top_k: 返回结果数量
+
+        Returns:
+            FAQ 检索结果
+        """
+        try:
+            # 获取或创建 FAQ 集合
+            if self.kb_manager:
+                faq_collection = self.kb_manager.get_collection('faq_kb')
+            else:
+                faq_collection = self.chroma_client.get_or_create_collection(
+                    name="faq_collection",
+                    metadata={"description": "FAQ 专属向量库"}
+                )
+
+            if not faq_collection or faq_collection.count() == 0:
+                return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+
+            # 查询 FAQ 集合
+            results = faq_collection.query(
+                query_embeddings=[query_vector],
+                n_results=top_k
+            )
+
+            return results
+
+        except Exception as e:
+            print(f"FAQ 集合查询失败: {e}")
+            return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+
+    def _merge_results(self, results_list: list) -> dict:
+        """
+        合并多个检索结果
+
+        Args:
+            results_list: 结果列表
+
+        Returns:
+            合并后的结果
+        """
+        all_ids = []
+        all_docs = []
+        all_metas = []
+        all_dists = []
+
+        for results in results_list:
+            if results and results.get('ids') and results['ids'][0]:
+                all_ids.extend(results['ids'][0])
+                all_docs.extend(results['documents'][0])
+                all_metas.extend(results['metadatas'][0])
+                all_dists.extend(results['distances'][0])
+
+        return {
+            'ids': [all_ids],
+            'documents': [all_docs],
+            'metadatas': [all_metas],
+            'distances': [all_dists]
+        }
+
+    def _boost_faq_chunks(self, results: dict) -> dict:
+        """
+        FAQ Chunk 分数加权
+
+        FAQ 命中时分数提升 0.1，确保 FAQ 排名靠前
+        注意：distances 是距离，越小越好，所以减去 0.1
+        """
+        if not results.get('metadatas') or not results['metadatas'][0]:
+            return results
+
+        for i, meta in enumerate(results['metadatas'][0]):
+            if meta.get('chunk_type') == 'faq':
+                # FAQ 加权：距离减小 = 相似度提升
+                results['distances'][0][i] = max(0, results['distances'][0][i] - 0.1)
+
+        return results
+
+    def _apply_time_decay(self, results: dict, decay_months: int = 6) -> dict:
+        """
+        时间衰减：超过 N 个月的 FAQ 扣分
+
+        防止过期 FAQ 成为"钉子户"，确保新内容有机会排在前面
+        """
+        from datetime import datetime
+
+        if not results.get('metadatas') or not results['metadatas'][0]:
+            return results
+
+        now = datetime.now()
+        for i, meta in enumerate(results['metadatas'][0]):
+            if meta.get('chunk_type') == 'faq':
+                created_at = meta.get('created_at')
+                if created_at:
+                    try:
+                        created = datetime.fromisoformat(created_at)
+                        age_months = (now - created).days / 30
+                        if age_months > decay_months:
+                            # 每超过一个月扣 0.01，最多扣 0.1
+                            decay = min(0.1, (age_months - decay_months) * 0.01)
+                            # 距离增加 = 相似度降低
+                            results['distances'][0][i] += decay
+                    except (ValueError, TypeError):
+                        pass
+
+        return results
+
+    def filter_blacklisted_chunks(self, results: dict, blacklist: set) -> dict:
+        """
+        过滤黑名单 Chunk（负反馈降权机制）
+
+        Args:
+            results: 检索结果
+            blacklist: 黑名单 source 集合
+
+        Returns:
+            过滤后的结果
+        """
+        if not blacklist or not results.get('metadatas') or not results['metadatas'][0]:
+            return results
+
+        f_ids, f_docs, f_metas, f_scores = [], [], [], []
+        filtered_count = 0
+
+        for bid, bdoc, bmeta, bscore in zip(
+            results['ids'][0],
+            results['documents'][0],
+            results['metadatas'][0],
+            results['distances'][0]
+        ):
+            source = bmeta.get('source', '')
+            if source not in blacklist:
+                f_ids.append(bid)
+                f_docs.append(bdoc)
+                f_metas.append(bmeta)
+                f_scores.append(bscore)
+            else:
+                filtered_count += 1
+
+        if filtered_count > 0:
+            print(f"  过滤了 {filtered_count} 个黑名单 Chunk")
+
+        return {
+            'ids': [f_ids],
+            'documents': [f_docs],
+            'metadatas': [f_metas],
+            'distances': [f_scores]
+        }
 
     def _filter_results(self, results, condition_func):
         """通用结果过滤辅助函数"""
@@ -460,6 +610,58 @@ class RAGEngine:
             return resp.choices[0].message.content
         except Exception as e:
             return f"调用大模型失败: {str(e)}"
+
+    def generate_answer_stream(self, query, context, history=None):
+        """
+        流式生成答复
+
+        Args:
+            query: 用户问题
+            context: 检索到的上下文
+            history: 对话历史 [{"role": "user/assistant", "content": "..."}]
+
+        Yields:
+            str: 每个 token
+        """
+        # 构建消息列表
+        messages = []
+
+        # 添加历史对话
+        if history:
+            for h in history:
+                messages.append({
+                    "role": h.get("role", "user"),
+                    "content": h.get("content", "")
+                })
+
+        # 添加当前问题（带上下文）
+        if context:
+            user_message = f"""参考资料：
+{context}
+
+用户问题：{query}
+
+请根据参考资料回答问题："""
+        else:
+            user_message = query
+
+        messages.append({"role": "user", "content": user_message})
+
+        try:
+            stream = self.llm_client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=1500,
+                stream=True  # 启用流式输出
+            )
+
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+
+        except Exception as e:
+            yield f"[错误] 调用大模型失败: {str(e)}"
 
 
 # 快捷访问单例

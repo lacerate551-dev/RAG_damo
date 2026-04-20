@@ -1,5 +1,6 @@
 // ===== 配置选项与认证体系复用 =====
-const API_BASE = 'http://localhost:5001';
+const DEFAULT_API_BASE = 'http://localhost:5001';
+let API_BASE = localStorage.getItem('rag_api_base') || DEFAULT_API_BASE;
 const TOKEN_KEY = 'rag_auth_token';
 const USER_KEY = 'rag_auth_user';
 
@@ -24,8 +25,7 @@ const endpointGroups = [
         group: '多向量库与核心检索 (RAG Base)',
         items: [
             { name: "基础聊天", method: "POST", path: "/chat", desc: "普通对话模式（纯LLM）", pathParams: [], bodyParams: [ {key: "session_id", type: "string"}, {key: "message", type: "string", default: "你好"} ] },
-            { name: "知识库问答", method: "POST", path: "/rag", desc: "调用 Agentic RAG 从多向量库联合检索回复", pathParams: [], bodyParams: [ {key: "session_id", type: "string"}, {key: "message", type: "string", default: "介绍一下公司考勤制度"} ] },
-            { name: "流式知识库问答", method: "POST", path: "/rag/stream", desc: "SSE 流式返回 RAG 问答过程与结果", pathParams: [], bodyParams: [ {key: "session_id", type: "string"}, {key: "message", type: "string", default: "介绍一下公司考勤制度"} ], isStream: true },
+            { name: "知识库问答", method: "POST", path: "/rag", desc: "SSE 流式返回 RAG 问答过程与结果", pathParams: [], bodyParams: [ {key: "session_id", type: "string"}, {key: "message", type: "string", default: "介绍一下公司考勤制度"} ], isStream: true },
             { name: "内部混合检索", method: "POST", path: "/search", desc: "Dify使用的高性能混合检索（RRF融合）", pathParams: [], bodyParams: [ {key: "query", type: "string", default: "请假流程"}, {key: "top_k", type: "number", default: 5} ] },
             { name: "版本感知检索", method: "POST", path: "/search/version-aware", desc: "检索指定知识库中存活的最新条款", pathParams: [], bodyParams: [ {key: "query", type: "string"}, {key: "collection", type: "string", default: "public_kb"}, {key: "top_k", type: "number", default: 5} ] },
             { name: "知识库路由查询", method: "POST", path: "/kb/route", desc: "根据查询内容智能路由到最合适的知识库", pathParams: [], bodyParams: [ {key: "query", type: "string", default: "财务报销流程"} ] }
@@ -83,10 +83,7 @@ const endpointGroups = [
             { name: "发现待同步点", method: "GET", path: "/sync/changes", desc: "演练一次：列出哪些文档脏了但还没写", pathParams: [], bodyParams: [] },
             { name: "开始后台长轮询", method: "POST", path: "/sync/start", desc: "启动后台进程无限刷新同步机制", pathParams: [], bodyParams: [] },
             { name: "挂起后台同异步", method: "POST", path: "/sync/stop", desc: "停止并释放掉系统轮询", pathParams: [], bodyParams: [] },
-            { name: "强行推送至特定库", method: "POST", path: "/documents/sync", desc: "（老接口遗留）单点触发更新", pathParams: [], bodyParams: [] },
-            { name: "SSE 实时订阅", method: "GET", path: "/subscribe", desc: "建立 SSE 连接，实时接收系统事件通知", pathParams: [], bodyParams: [], isSSE: true },
-            { name: "收取站内信", method: "GET", path: "/notifications", desc: "查看文档被废纸/更新时收到的通知", pathParams: [], bodyParams: [] },
-            { name: "一键清除数字红点", method: "POST", path: "/notifications/read-all", desc: "全部标为已读", pathParams: [], bodyParams: [] }
+            { name: "强行推送至特定库", method: "POST", path: "/documents/sync", desc: "（老接口遗留）单点触发更新", pathParams: [], bodyParams: [] }
         ]
     },
     {

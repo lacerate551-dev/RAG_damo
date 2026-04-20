@@ -1,18 +1,17 @@
 """
 API 路由层 — 应用工厂
 
-所有路由已拆分为独立 Blueprint 文件:
+核心路由:
 - chat_routes.py      : /chat, /rag, /rag/stream, /search
-- session_routes.py   : /sessions, /history, /session, /clear
-- auth_routes.py      : /stats, /health, /auth/me
-- audit_routes.py     : /audit/logs
-- kb_routes.py        : /collections, /documents/sync, /kb/route
-- document_routes.py  : /documents/upload, /documents/list, /documents/*, 版本管理
-- sync_routes.py      : /sync, /subscribe, /subscriptions, /notifications
-- graph_routes.py     : /graph/search, /graph/build, /graph/stats
-- question_routes.py  : /questions/*, /knowledge-points, /exam/*/analyze, /analysis/*
-- outline_routes.py   : /outline/*, /recommend/*
-- feedback_routes.py  : /feedback/*, /reports/*, /faq/*
+- kb_routes.py        : /collections, /documents/sync
+- document_routes.py  : /documents/upload, /documents/list, /documents/*, /chunks/*
+- sync_routes.py      : /sync, /sync/status
+- image_routes.py     : /images/*
+- exam_pkg/api.py     : /exam/generate, /exam/grade
+
+注意：
+- 会话管理、审计日志、反馈系统由后端负责
+- 权限验证由后端网关完成
 """
 
 import sys
@@ -36,80 +35,88 @@ def create_app():
     app = Flask(__name__)
     CORS(app)
 
-    # ==================== 共享服务初始化 ====================
+    # ==================== 核心服务初始化 ====================
 
-    from services.session import SessionManager
-    from services.audit import AuditLogger
-    from core.agentic import AgenticRAG
-    from auth.gateway import get_auth_manager
+    # Agentic RAG 引擎
+    try:
+        from core.agentic import AgenticRAG
+        agentic_rag = AgenticRAG(
+            enable_web_search=False,  # 关闭网络搜索
+            enable_graph=False        # 关闭图谱检索
+        )
+        app.config['AGENTIC_RAG'] = agentic_rag
+        print("✓ Agentic RAG 引擎已初始化（仅知识库模式）")
+    except Exception as e:
+        app.config['AGENTIC_RAG'] = None
+        print(f"✗ Agentic RAG 初始化失败: {e}")
 
-    session_manager = SessionManager(session_expire_hours=24)
-    audit_logger = AuditLogger()
-    agentic_rag = AgenticRAG()
-    auth_manager = get_auth_manager()
-
-    app.config['SESSION_MANAGER'] = session_manager
-    app.config['AUDIT_LOGGER'] = audit_logger
-    app.config['AGENTIC_RAG'] = agentic_rag
-
-    # 同步服务（可选）
+    # 同步服务
     try:
         from knowledge.sync import KnowledgeSyncService
         from config import DOCUMENTS_PATH
         sync_service = KnowledgeSyncService(documents_path=DOCUMENTS_PATH)
         app.config['SYNC_SERVICE'] = sync_service
         print("✓ 知识库同步服务已初始化")
-    except (ImportError, Exception) as e:
+    except Exception as e:
         app.config['SYNC_SERVICE'] = None
         print(f"✗ 知识库同步服务未启用: {e}")
 
+    # 会话管理器
+    try:
+        from services.session import SessionManager
+        session_manager = SessionManager()
+        app.config['SESSION_MANAGER'] = session_manager
+        print("✓ 会话管理器已初始化")
+    except Exception as e:
+        app.config['SESSION_MANAGER'] = None
+        print(f"✗ 会话管理器初始化失败: {e}")
+
     # ==================== 注册 Blueprint ====================
 
-    # 核心路由（无条件注册）
-    from api.auth_routes import auth_bp
-    from api.session_routes import session_bp
-    from api.audit_routes import audit_bp
+    # 核心 API
     from api.chat_routes import chat_bp
     from api.kb_routes import kb_bp
     from api.document_routes import document_bp
     from api.sync_routes import sync_bp
-    from api.graph_routes import graph_bp
 
-    app.register_blueprint(auth_bp)
-    app.register_blueprint(session_bp)
-    app.register_blueprint(audit_bp)
     app.register_blueprint(chat_bp)
     app.register_blueprint(kb_bp)
     app.register_blueprint(document_bp)
     app.register_blueprint(sync_bp)
-    app.register_blueprint(graph_bp)
 
     # 图片服务
     from api.image_routes import image_bp
     app.register_blueprint(image_bp)
 
-    # 题库维护（可选模块）
-    try:
-        from api.question_routes import question_bp
-        app.register_blueprint(question_bp)
-    except ImportError as e:
-        print(f"提示: 题库维护 API 未加载: {e}")
+    # 健康检查
+    from api.auth_routes import auth_bp
+    app.register_blueprint(auth_bp)
 
-    # 纲要生成（可选模块）
+    # 会话管理
     try:
-        from api.outline_routes import outline_bp
-        app.register_blueprint(outline_bp)
+        from api.session_routes import session_bp
+        app.register_blueprint(session_bp)
+        print("✓ 会话管理 API 已启用")
     except ImportError as e:
-        print(f"提示: 纲要生成 API 未加载: {e}")
+        print(f"提示: 会话管理 API 未加载: {e}")
 
-    # 问答质量闭环（可选模块）
+    # 反馈系统
     try:
         from api.feedback_routes import feedback_bp
         app.register_blueprint(feedback_bp)
+        print("✓ 反馈系统 API 已启用")
     except ImportError as e:
-        print(f"提示: 问答质量闭环 API 未加载: {e}")
+        print(f"提示: 反馈系统 API 未加载: {e}")
 
-    # 出题系统蓝图
+    # 图谱服务（可选）
+    try:
+        from api.graph_routes import graph_bp
+        app.register_blueprint(graph_bp)
+        print("✓ 知识图谱 API 已启用")
+    except ImportError as e:
+        print(f"提示: 知识图谱 API 未加载: {e}")
+
+    # 出题系统（可选）
     try:
         from exam_pkg.api import exam_bp
         app.register_blueprint(exam_bp, url_prefix='/exam')
@@ -126,15 +133,13 @@ def create_app():
 
 def _print_startup_info(app):
     """打印启动信息摘要"""
-    # 收集已注册的路由数量
     route_count = len([rule for rule in app.url_map.iter_rules() if rule.endpoint != 'static'])
 
     print(f"\n✓ 应用初始化完成，共注册 {route_count} 个路由")
-    print("  核心路由: /chat, /rag, /rag/stream, /search")
-    print("  会话管理: /sessions, /history, /session, /clear")
-    print("  系统状态: /health, /stats, /auth/me")
-    print("  向量库:   /collections, /documents/sync, /kb/route")
+    print("  问答接口: /chat, /rag, /rag/stream, /search")
+    print("  向量库:   /collections, /collections/<name>")
     print("  文档管理: /documents/upload, /documents/list, /documents/*")
-    print("  同步通知: /sync/*, /subscribe, /notifications")
-    print("  图谱:     /graph/search, /graph/build, /graph/stats")
-    print("  图片:     /images/<id>, /images/list, /images/stats")
+    print("  切片管理: /chunks/*")
+    print("  同步服务: /sync, /sync/status")
+    print("  图片服务: /images/*")
+    print("  健康检查: /health")

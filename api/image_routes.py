@@ -15,7 +15,13 @@ image_bp = Blueprint('images', __name__)
 
 
 def get_images_base_path():
-    """获取图片存储路径"""
+    """获取图片存储路径（扁平化）"""
+    # 使用扁平化路径 .data/images
+    data_images_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".data", "images")
+    if os.path.exists(data_images_path):
+        return data_images_path
+
+    # 回退到 documents/images
     try:
         from config import DOCUMENTS_PATH
         return os.path.join(DOCUMENTS_PATH, "images")
@@ -29,11 +35,17 @@ def get_image(image_id: str):
     获取图片
 
     Args:
-        image_id: 图片 ID（如 "制度汇编_p5_img1"）
+        image_id: 图片 ID（支持多种格式：xxx.jpg, images/xxx.jpg, /images/xxx.jpg）
 
     Returns:
         图片文件
     """
+    # 统一提取文件名（处理各种路径格式）
+    image_id = os.path.basename(image_id)
+
+    # 去掉扩展名（后面会重新匹配）
+    image_id = os.path.splitext(image_id)[0]
+
     # 安全检查：防止路径遍历攻击
     if '..' in image_id or '/' in image_id or '\\' in image_id:
         return jsonify({"error": "无效的图片 ID"}), 400
@@ -74,6 +86,10 @@ def get_image_info(image_id: str):
     Returns:
         图片元信息（宽度、高度、格式等）
     """
+    # 统一提取文件名
+    image_id = os.path.basename(image_id)
+    image_id = os.path.splitext(image_id)[0]
+
     # 安全检查
     if '..' in image_id or '/' in image_id or '\\' in image_id:
         return jsonify({"error": "无效的图片 ID"}), 400

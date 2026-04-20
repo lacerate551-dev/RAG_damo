@@ -1,471 +1,420 @@
 # -*- coding: utf-8 -*-
 """
-Excel 增强解析模块
+Excel 解析模块（Pandas 管道）
 
-改进 Excel 文件的智能分块策略：
-- 自动检测表头行
-- 支持合并单元格识别
-- 智能数据块边界检测
-- 数据类型感知（数值、日期、文本）
-- 生成语义化的分块内容
+MinerU 不支持 XLSX 格式，因此使用 Pandas 专属管道处理。
 
-优势：
-- 更准确的数据块识别
-- 保留表格结构信息
-- 支持复杂表格布局
+策略：表级摘要（Chroma）+ 完整 Markdown（DocStore）
+- 每个 sheet 生成 Markdown 表格
+- 大表（>200行）按行切片，每片保留表头
+- 每片包装为 UnifiedChunk(type='table')
+
+检索链路:
+用户提问 → 命中摘要 → 拿 doc_id → 掏 Markdown → 喂 LLM
 """
 
-import os
-import re
+import pandas as pd
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, field
-from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
-from openpyxl.styles import Font, PatternFill, Alignment
 import logging
 
 logger = logging.getLogger(__name__)
 
+# 大表切片阈值
+MAX_ROWS_PER_CHUNK = 200
+
 
 @dataclass
-class ExcelChunk:
-    """Excel 分块数据结构"""
-    content: str                           # 内容文本
-    title: str = ""                        # 块标题
-    sheet: str = ""                        # 工作表名
-    row_range: str = ""                    # 行范围
-    col_range: str = ""                    # 列范围
-    chunk_type: str = "data"               # 类型: header, data, merged, summary
-    headers: List[str] = field(default_factory=list)  # 表头列表
-    source_file: str = ""                  # 源文件名
-    metadata: Dict[str, Any] = field(default_factory=dict)
+class UnifiedChunk:
+    """统一内部 Schema - 与 MinerUChunk 兼容"""
+    content: str                      # 文本内容（Markdown 格式）
+    chunk_type: str                   # 类型: table
+    page_start: int = 1               # 起始行号（Excel 无页码概念）
+    page_end: int = 1                 # 结束行号
+    text_level: int = 0               # 标题级别（Excel 无标题层级）
+    title: str = ""                   # Sheet 名称
+    section_path: str = ""            # 章节路径
+    source_file: str = ""             # 源文件名
+    bbox: Optional[List[float]] = field(default=None)  # 不适用
+    table_html: Optional[str] = field(default=None)    # 表格 HTML（可选）
+    image_path: Optional[str] = field(default=None)    # 不适用
+    # Excel 专用元数据
+    sheet_name: str = ""              # Sheet 名称
+    row_start: int = 0                # 起始行（0-indexed）
+    row_end: int = 0                  # 结束行
+    col_count: int = 0                # 列数
+    headers: List[str] = field(default_factory=list)   # 表头列表
 
 
-class ExcelParserEnhanced:
+def parse_excel(
+    filepath: str,
+    max_rows_per_chunk: int = MAX_ROWS_PER_CHUNK
+) -> Dict[str, Any]:
     """
-    增强版 Excel 解析器
+    解析 Excel 文件，输出 UnifiedChunk 列表
 
-    功能：
-    1. 自动检测表头行
-    2. 识别合并单元格区域
-    3. 智能分块边界检测
-    4. 生成结构化内容
+    Args:
+        filepath: Excel 文件路径
+        max_rows_per_chunk: 大表切片阈值，默认 200 行
+
+    Returns:
+        {
+            'chunks': List[UnifiedChunk],  # 结构化分块
+            'sheets': List[str],           # Sheet 名称列表
+            'total_rows': int,             # 总行数
+            'source_file': str             # 源文件名
+        }
     """
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"文件不存在: {filepath}")
 
-    def __init__(
-        self,
-        max_rows_per_chunk: int = 50,
-        min_rows_per_chunk: int = 2,
-        detect_merged_cells: bool = True
-    ):
-        """
-        初始化解析器
+    logger.info(f"使用 Pandas 解析 Excel: {filepath.name}")
 
-        Args:
-            max_rows_per_chunk: 每个分块的最大行数
-            min_rows_per_chunk: 每个分块的最小行数
-            detect_merged_cells: 是否检测合并单元格
-        """
-        self.max_rows_per_chunk = max_rows_per_chunk
-        self.min_rows_per_chunk = min_rows_per_chunk
-        self.detect_merged_cells = detect_merged_cells
+    chunks = []
+    sheet_names = []
+    total_rows = 0
 
-    def parse(self, filepath: str) -> Dict[str, Any]:
-        """
-        解析 Excel 文件
+    # 读取所有 sheets
+    try:
+        xls = pd.ExcelFile(filepath)
+        sheet_names = xls.sheet_names
+    except Exception as e:
+        raise RuntimeError(f"Excel 文件读取失败: {e}")
 
-        Args:
-            filepath: Excel 文件路径
+    for sheet_name in sheet_names:
+        try:
+            # 先读取原始数据（不指定表头）
+            df_raw = pd.read_excel(filepath, sheet_name=sheet_name, header=None)
+        except Exception as e:
+            logger.warning(f"Sheet '{sheet_name}' 读取失败: {e}")
+            continue
 
-        Returns:
-            {
-                "chunks": [ExcelChunk, ...],
-                "sheets": [{"name": "...", "rows": N, "cols": M}, ...],
-                "metadata": {...}
-            }
-        """
-        filepath = Path(filepath)
-        if not filepath.exists():
-            raise FileNotFoundError(f"文件不存在: {filepath}")
+        if df_raw.empty:
+            logger.debug(f"Sheet '{sheet_name}' 为空，跳过")
+            continue
 
-        wb = load_workbook(filepath, data_only=True)
+        # 清理数据：填充 NaN
+        df_raw = df_raw.fillna('')
 
-        all_chunks = []
-        sheets_info = []
+        # 检测表头行（查找包含"部门"、"负责人"等典型表头关键词的行）
+        header_row_idx = _detect_header_row(df_raw)
 
-        for sheet_name in wb.sheetnames:
-            sheet = wb[sheet_name]
+        # 提取表格标题（表头上方的行）
+        table_title = ""
+        if header_row_idx > 0:
+            # 表头上方的第一行可能是标题
+            first_row = df_raw.iloc[0]
+            first_row_text = ' '.join([str(v) for v in first_row if str(v).strip()])
+            if first_row_text and len(first_row_text) < 50:
+                table_title = first_row_text
 
-            # 获取工作表信息
-            max_row = sheet.max_row
-            max_col = sheet.max_column
-            sheets_info.append({
-                "name": sheet_name,
-                "rows": max_row,
-                "cols": max_col
-            })
+        # 重新读取，使用检测到的表头行
+        if header_row_idx is not None and header_row_idx > 0:
+            df = pd.read_excel(filepath, sheet_name=sheet_name, header=header_row_idx)
+        else:
+            df = pd.read_excel(filepath, sheet_name=sheet_name)
 
-            if max_row == 0 or max_col == 0:
+        df = df.fillna('')
+
+        row_count = len(df)
+        col_count = len(df.columns)
+        total_rows += row_count
+
+        # 获取表头
+        headers = [str(col) for col in df.columns.tolist()]
+
+        # 过滤掉 Unnamed 列名
+        headers = [h if not h.startswith('Unnamed') else f'列{i+1}' for i, h in enumerate(headers)]
+
+        # 大表切片
+        if row_count > max_rows_per_chunk:
+            logger.info(f"Sheet '{sheet_name}' 有 {row_count} 行，按 {max_rows_per_chunk} 行切片")
+
+            num_chunks = (row_count + max_rows_per_chunk - 1) // max_rows_per_chunk
+
+            for i in range(num_chunks):
+                start_row = i * max_rows_per_chunk
+                end_row = min((i + 1) * max_rows_per_chunk, row_count)
+
+                # 切片数据（保留表头）
+                df_slice = df.iloc[start_row:end_row]
+
+                # 转 Markdown
+                md_table = _df_to_markdown(df_slice, headers)
+
+                # 标注切片信息
+                chunk_title = f"{sheet_name} (第{i+1}/{num_chunks}片，行{start_row+1}-{end_row})"
+
+                chunk = UnifiedChunk(
+                    content=md_table,
+                    chunk_type="table",
+                    page_start=start_row + 1,
+                    page_end=end_row,
+                    title=chunk_title,
+                    section_path=sheet_name,
+                    source_file=filepath.name,
+                    sheet_name=sheet_name,
+                    row_start=start_row,
+                    row_end=end_row,
+                    col_count=col_count,
+                    headers=headers
+                )
+                chunks.append(chunk)
+        else:
+            # 小表直接转换
+            md_table = _df_to_markdown(df, headers)
+
+            # 使用表格标题或 sheet 名称
+            chunk_title = table_title if table_title else sheet_name
+
+            chunk = UnifiedChunk(
+                content=md_table,
+                chunk_type="table",
+                page_start=1,
+                page_end=row_count,
+                title=chunk_title,
+                section_path=sheet_name,
+                source_file=filepath.name,
+                sheet_name=sheet_name,
+                row_start=0,
+                row_end=row_count,
+                col_count=col_count,
+                headers=headers
+            )
+            chunks.append(chunk)
+
+    logger.info(f"Excel 解析完成: {len(chunks)} 个表格块，{total_rows} 行数据")
+
+    return {
+        'chunks': chunks,
+        'sheets': sheet_names,
+        'total_rows': total_rows,
+        'source_file': filepath.name
+    }
+
+
+def _detect_header_row(df: pd.DataFrame) -> Optional[int]:
+    """
+    检测表头行位置
+
+    表头特征：
+    1. 包含典型表头关键词（部门、负责人、名称、数量等）
+    2. 不含大量数字（数据行特征）
+    3. 文本较短
+
+    Returns:
+        表头行索引（0-indexed），未找到返回 0
+    """
+    # 典型表头关键词
+    header_keywords = {
+        '部门', '负责人', '名称', '数量', '人数', '金额', '日期', '地址',
+        '电话', '邮箱', '编号', '类型', '状态', '备注', '描述', '职位',
+        '团队', '职责', '地点', '公司', '分', '总', '规模', '职能'
+    }
+
+    best_row = 0
+    best_score = 0
+
+    for idx in range(min(5, len(df))):  # 只检查前 5 行
+        row = df.iloc[idx]
+        score = 0
+
+        for cell in row:
+            cell_str = str(cell).strip()
+            if not cell_str:
                 continue
 
-            # 检测合并单元格
-            merged_ranges = []
-            if self.detect_merged_cells and sheet.merged_cells:
-                merged_ranges = self._get_merged_ranges(sheet)
+            # 检查关键词
+            for kw in header_keywords:
+                if kw in cell_str:
+                    score += 2
 
-            # 检测表头行
-            header_row = self._detect_header_row(sheet, max_row, max_col)
+            # 短文本倾向于表头
+            if len(cell_str) < 20:
+                score += 1
 
-            # 提取数据块
-            chunks = self._extract_chunks(
-                sheet, sheet_name, header_row, merged_ranges, filepath.name
-            )
-            all_chunks.extend(chunks)
+            # 数字倾向于数据行
+            try:
+                float(cell_str)
+                score -= 3
+            except ValueError:
+                pass
 
-        return {
-            "chunks": all_chunks,
-            "sheets": sheets_info,
-            "metadata": {
-                "source_file": filepath.name,
-                "total_chunks": len(all_chunks)
-            }
+        if score > best_score:
+            best_score = score
+            best_row = idx
+
+    return best_row
+
+
+def _df_to_markdown(df: pd.DataFrame, headers: List[str] = None) -> str:
+    """
+    将 DataFrame 转换为 Markdown 表格格式
+
+    Args:
+        df: DataFrame
+        headers: 表头列表（可选，默认使用 df.columns）
+
+    Returns:
+        Markdown 表格字符串
+    """
+    if headers is None:
+        headers = [str(col) for col in df.columns.tolist()]
+
+    lines = []
+
+    # 表头行
+    header_line = "| " + " | ".join(headers) + " |"
+    lines.append(header_line)
+
+    # 分隔行
+    separator = "| " + " | ".join(["---"] * len(headers)) + " |"
+    lines.append(separator)
+
+    # 数据行
+    for _, row in df.iterrows():
+        cells = [str(val).replace('\n', ' ').replace('|', '\\|') for val in row]
+        data_line = "| " + " | ".join(cells) + " |"
+        lines.append(data_line)
+
+    return "\n".join(lines)
+
+
+def get_table_meta(filepath: str, sheet_name: str = None) -> Dict[str, Any]:
+    """
+    获取 Excel 表格元数据（供 LLM 摘要使用）
+
+    Args:
+        filepath: Excel 文件路径
+        sheet_name: Sheet 名称（可选，默认第一个 sheet）
+
+    Returns:
+        {
+            'sheet_name': str,
+            'columns': List[str],
+            'row_count': int,
+            'col_count': int,
+            'sample_rows': List[Dict],  # 前 5 行数据
+        }
+    """
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"文件不存在: {filepath}")
+
+    xls = pd.ExcelFile(filepath)
+
+    if sheet_name is None:
+        sheet_name = xls.sheet_names[0]
+
+    df = pd.read_excel(filepath, sheet_name=sheet_name)
+    df = df.fillna('')
+
+    columns = [str(col) for col in df.columns.tolist()]
+    row_count = len(df)
+    col_count = len(df.columns)
+
+    # 前 5 行样本
+    sample_df = df.head(5)
+    sample_rows = sample_df.to_dict(orient='records')
+
+    return {
+        'sheet_name': sheet_name,
+        'columns': columns,
+        'row_count': row_count,
+        'col_count': col_count,
+        'sample_rows': sample_rows
+    }
+
+
+def convert_to_rag_format(result: Dict[str, Any]) -> List[Dict]:
+    """
+    将 Excel 解析结果转换为 RAG 入库格式
+
+    Args:
+        result: parse_excel() 返回结果
+
+    Returns:
+        [{'text': ..., 'page': ..., 'has_table': True, ...}, ...]
+    """
+    pages_content = []
+
+    for chunk in result['chunks']:
+        # 构建内容文本
+        content = f"【表格】{chunk.title}\n\n{chunk.content}"
+
+        page_info = {
+            'text': content,
+            'page': chunk.page_start,
+            'page_end': chunk.page_end,
+            'has_table': True,
+            'section': chunk.title,
+            'section_path': chunk.section_path,
+            'level': 0,
+            'chunk_type': 'table',
+            'source_file': chunk.source_file,
+            'is_excel_chunk': True,  # 标记为 Excel 输出
+            # Excel 专用元数据
+            'sheet_name': chunk.sheet_name,
+            'row_start': chunk.row_start,
+            'row_end': chunk.row_end,
+            'col_count': chunk.col_count,
         }
 
-    def _get_merged_ranges(self, sheet) -> List[Dict]:
-        """获取合并单元格区域信息"""
-        merged = []
-        for merged_range in sheet.merged_cells.ranges:
-            min_col = merged_range.min_col
-            min_row = merged_range.min_row
-            max_col = merged_range.max_col
-            max_row = merged_range.max_row
+        pages_content.append(page_info)
 
-            # 获取合并单元格的值
-            cell_value = sheet.cell(row=min_row, column=min_col).value
+    return pages_content
 
-            merged.append({
-                "range": merged_range,
-                "min_row": min_row,
-                "max_row": max_row,
-                "min_col": min_col,
-                "max_col": max_col,
-                "value": str(cell_value) if cell_value else ""
-            })
 
-        return merged
-
-    def _detect_header_row(self, sheet, max_row: int, max_col: int) -> Optional[int]:
-        """
-        自动检测表头行
-
-        检测规则：
-        1. 表头行通常有较短的文本
-        2. 表头行通常有特殊格式（加粗、背景色）
-        3. 表头行下方通常是数据行
-        """
-        if max_row < 2:
-            return None
-
-        # 检查前几行
-        for row_idx in range(1, min(6, max_row + 1)):
-            header_score = 0
-            data_score = 0
-
-            for col_idx in range(1, max_col + 1):
-                cell = sheet.cell(row=row_idx, column=col_idx)
-                value = cell.value
-
-                if value is None:
-                    continue
-
-                value_str = str(value).strip()
-
-                # 检查格式
-                if cell.font and cell.font.bold:
-                    header_score += 2
-                if cell.fill and cell.fill.fgColor and cell.fill.fgColor.rgb != '00000000':
-                    header_score += 1
-
-                # 检查内容特征
-                if len(value_str) < 20:  # 短文本倾向于表头
-                    header_score += 1
-                elif len(value_str) > 50:  # 长文本倾向于数据
-                    data_score += 1
-
-                # 数字倾向于数据
-                if isinstance(value, (int, float)):
-                    data_score += 2
-
-            # 如果表头特征明显，返回此行
-            if header_score > data_score + 2:
-                return row_idx
-
-        # 默认第一行为表头
-        return 1
-
-    def _extract_chunks(
-        self,
-        sheet,
-        sheet_name: str,
-        header_row: Optional[int],
-        merged_ranges: List[Dict],
-        source_file: str
-    ) -> List[ExcelChunk]:
-        """提取数据块"""
-        chunks = []
-        max_row = sheet.max_row
-        max_col = sheet.max_column
-
-        if max_row == 0:
-            return chunks
-
-        # 提取表头
-        headers = []
-        if header_row:
-            for col_idx in range(1, max_col + 1):
-                cell_value = sheet.cell(row=header_row, column=col_idx).value
-                headers.append(str(cell_value) if cell_value else f"列{col_idx}")
-
-        # 获取数据起始行
-        data_start_row = (header_row + 1) if header_row else 1
-
-        # 检测数据块边界
-        block_boundaries = self._detect_block_boundaries(
-            sheet, data_start_row, max_row, max_col, merged_ranges
-        )
-
-        # 根据边界创建分块
-        if not block_boundaries:
-            # 没有检测到边界，按最大行数切分
-            block_boundaries = list(range(data_start_row, max_row + 1, self.max_rows_per_chunk))
-            if block_boundaries[-1] <= max_row:
-                block_boundaries.append(max_row + 1)
-
-        # 生成每个分块的内容
-        prev_boundary = data_start_row
-        for boundary in block_boundaries:
-            if boundary <= prev_boundary:
-                continue
-
-            chunk = self._create_chunk(
-                sheet, sheet_name, prev_boundary, boundary - 1,
-                max_col, headers, merged_ranges, source_file
-            )
-            if chunk:
-                chunks.append(chunk)
-
-            prev_boundary = boundary
-
-        # 处理最后一个块
-        if prev_boundary <= max_row:
-            chunk = self._create_chunk(
-                sheet, sheet_name, prev_boundary, max_row,
-                max_col, headers, merged_ranges, source_file
-            )
-            if chunk:
-                chunks.append(chunk)
-
-        return chunks
-
-    def _detect_block_boundaries(
-        self,
-        sheet,
-        start_row: int,
-        max_row: int,
-        max_col: int,
-        merged_ranges: List[Dict]
-    ) -> List[int]:
-        """
-        检测数据块边界
-
-        边界特征：
-        1. 空行
-        2. 合并单元格（跨多行）
-        3. 格式变化（字体、背景色）
-        4. 内容类型变化
-        """
-        boundaries = []
-
-        prev_style = None
-
-        for row_idx in range(start_row, max_row + 1):
-            # 检查是否为空行
-            is_empty = True
-            for col_idx in range(1, max_col + 1):
-                if sheet.cell(row=row_idx, column=col_idx).value is not None:
-                    is_empty = False
-                    break
-
-            if is_empty:
-                boundaries.append(row_idx)
-                continue
-
-            # 检查合并单元格
-            is_merged_title = False
-            for merged in merged_ranges:
-                if merged["min_row"] == row_idx and merged["max_row"] > row_idx:
-                    # 跨行的合并单元格，通常是标题
-                    is_merged_title = True
-                    boundaries.append(row_idx)
-                    break
-
-            # 检查格式变化
-            first_cell = sheet.cell(row=row_idx, column=1)
-            current_style = self._get_cell_style_signature(first_cell)
-
-            if prev_style and current_style != prev_style:
-                # 格式变化，可能是新块的开始
-                if not is_merged_title:
-                    boundaries.append(row_idx)
-
-            prev_style = current_style
-
-            # 检查行数限制
-            if boundaries and row_idx - boundaries[-1] >= self.max_rows_per_chunk:
-                boundaries.append(row_idx)
-
-        return boundaries
-
-    def _get_cell_style_signature(self, cell) -> str:
-        """获取单元格样式签名"""
-        parts = []
-
-        if cell.font:
-            parts.append(f"bold:{cell.font.bold}")
-            parts.append(f"size:{cell.font.size}")
-
-        if cell.fill and cell.fill.fgColor:
-            parts.append(f"fill:{cell.fill.fgColor.rgb}")
-
-        if cell.alignment:
-            parts.append(f"align:{cell.alignment.horizontal}")
-
-        return "|".join(parts)
-
-    def _create_chunk(
-        self,
-        sheet,
-        sheet_name: str,
-        start_row: int,
-        end_row: int,
-        max_col: int,
-        headers: List[str],
-        merged_ranges: List[Dict],
-        source_file: str
-    ) -> Optional[ExcelChunk]:
-        """创建数据块"""
-        if start_row > end_row:
-            return None
-
-        # 收集行数据
-        rows_data = []
-        for row_idx in range(start_row, end_row + 1):
-            row_values = []
-            for col_idx in range(1, max_col + 1):
-                cell = sheet.cell(row=row_idx, column=col_idx)
-                value = cell.value
-                if value is not None:
-                    # 格式化值
-                    if isinstance(value, float):
-                        # 保留合理的小数位
-                        if value == int(value):
-                            value = int(value)
-                        else:
-                            value = round(value, 4)
-                    row_values.append(str(value))
-                else:
-                    row_values.append("")
-
-            # 跳过全空行
-            if any(v for v in row_values):
-                rows_data.append(row_values)
-
-        if not rows_data:
-            return None
-
-        # 生成内容文本
-        content_lines = []
-
-        # 添加表头
-        if headers:
-            content_lines.append(" | ".join(headers))
-            content_lines.append("-" * 40)
-
-        # 添加数据行
-        for row_values in rows_data:
-            content_lines.append(" | ".join(row_values))
-
-        content = "\n".join(content_lines)
-
-        # 检测块标题
-        title = self._detect_block_title(sheet, start_row, max_col, merged_ranges)
-
-        # 确定块类型
-        chunk_type = "data"
-        if start_row <= 2:
-            chunk_type = "header"
-
-        return ExcelChunk(
-            content=content,
-            title=title,
-            sheet=sheet_name,
-            row_range=f"{start_row}-{end_row}",
-            col_range=f"A-{get_column_letter(max_col)}",
-            chunk_type=chunk_type,
-            headers=headers,
-            source_file=source_file,
-            metadata={
-                "row_count": len(rows_data),
-                "col_count": max_col
-            }
-        )
-
-    def _detect_block_title(
-        self,
-        sheet,
-        row_idx: int,
-        max_col: int,
-        merged_ranges: List[Dict]
-    ) -> str:
-        """检测块标题"""
-        # 检查是否在合并单元格内
-        for merged in merged_ranges:
-            if merged["min_row"] <= row_idx <= merged["max_row"]:
-                if merged["value"]:
-                    return merged["value"]
-
-        # 检查第一列是否有标题性的内容
-        first_cell_value = sheet.cell(row=row_idx, column=1).value
-        if first_cell_value:
-            value_str = str(first_cell_value).strip()
-            # 短文本可能是标题
-            if len(value_str) < 30 and not re.match(r'^[\d\s\-\.]+$', value_str):
-                return value_str
-
-        return ""
-
+# ========== 兼容旧接口 ==========
 
 def parse_xlsx_enhanced(filepath: str) -> Dict[str, Any]:
     """
-    使用增强解析器处理 Excel 文件
+    兼容旧接口：使用增强解析器处理 Excel 文件
 
     Args:
         filepath: Excel 文件路径
 
     Returns:
-        解析结果
+        解析结果（兼容旧格式）
     """
-    parser = ExcelParserEnhanced()
-    return parser.parse(filepath)
+    result = parse_excel(filepath)
+
+    # 转换为旧格式
+    chunks = []
+    for chunk in result['chunks']:
+        chunks.append({
+            'content': chunk.content,
+            'title': chunk.title,
+            'sheet': chunk.sheet_name,
+            'row_range': f"{chunk.row_start+1}-{chunk.row_end}",
+            'col_range': f"A-{chr(64+chunk.col_count)}" if chunk.col_count <= 26 else "A-...",
+            'chunk_type': chunk.chunk_type,
+            'headers': chunk.headers,
+            'source_file': chunk.source_file,
+            'metadata': {
+                'row_count': chunk.row_end - chunk.row_start,
+                'col_count': chunk.col_count
+            }
+        })
+
+    return {
+        'chunks': chunks,
+        'sheets': [{'name': s, 'rows': 0, 'cols': 0} for s in result['sheets']],
+        'metadata': {
+            'source_file': result['source_file'],
+            'total_chunks': len(chunks)
+        }
+    }
 
 
 def get_excel_chunks_for_rag(
     filepath: str,
     min_chunk_size: int = 50
-) -> Tuple[List[str], List[Dict]]:
+) -> tuple:
     """
-    获取适合 RAG 系统的 Excel 分块
+    兼容旧接口：获取适合 RAG 系统的 Excel 分块
 
     Args:
         filepath: 文件路径
@@ -474,7 +423,7 @@ def get_excel_chunks_for_rag(
     Returns:
         (documents, metadatas) - 文档列表和元数据列表
     """
-    result = parse_xlsx_enhanced(filepath)
+    result = parse_excel(filepath)
 
     documents = []
     metadatas = []
@@ -484,9 +433,9 @@ def get_excel_chunks_for_rag(
             documents.append(chunk.content)
             metadatas.append({
                 'title': chunk.title,
-                'sheet': chunk.sheet,
-                'row_range': chunk.row_range,
-                'col_range': chunk.col_range,
+                'sheet': chunk.sheet_name,
+                'row_range': f"{chunk.row_start+1}-{chunk.row_end}",
+                'col_count': chunk.col_count,
                 'chunk_type': chunk.chunk_type,
                 'source_file': chunk.source_file
             })
@@ -501,26 +450,25 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding='utf-8')
 
     if len(sys.argv) < 2:
-        print("用法: python excel_parser_enhanced.py <Excel文件路径>")
+        print("用法: python excel_parser.py <Excel文件路径>")
         sys.exit(1)
 
-    filepath = sys.argv[1]
+    file_path = sys.argv[1]
 
-    print(f"正在解析: {filepath}")
-    result = parse_xlsx_enhanced(filepath)
+    print(f"正在解析: {file_path}")
+    result = parse_excel(file_path)
 
     print(f"\n解析完成:")
-    print(f"- 工作表数量: {len(result['sheets'])}")
-    print(f"- 分块数量: {len(result['chunks'])}")
+    print(f"- Sheets: {result['sheets']}")
+    print(f"- 总行数: {result['total_rows']}")
+    print(f"- 表格块数: {len(result['chunks'])}")
 
-    print("\n工作表信息:")
-    for sheet in result['sheets']:
-        print(f"  - {sheet['name']}: {sheet['rows']} 行 x {sheet['cols']} 列")
-
-    print("\n分块预览:")
-    for i, chunk in enumerate(result['chunks'][:5]):
-        print(f"\n--- 块 {i+1}: {chunk.title or '(无标题)'} ---")
-        print(f"工作表: {chunk.sheet}, 行范围: {chunk.row_range}")
-        print(f"类型: {chunk.chunk_type}, 行数: {chunk.metadata.get('row_count', 0)}")
+    # 显示每个块的信息
+    print("\n表格块详情:")
+    for i, chunk in enumerate(result['chunks']):
+        print(f"\n--- Chunk {i+1} ---")
+        print(f"Sheet: {chunk.sheet_name}")
+        print(f"行范围: {chunk.row_start+1} - {chunk.row_end}")
+        print(f"列数: {chunk.col_count}")
         preview = chunk.content[:200] + "..." if len(chunk.content) > 200 else chunk.content
-        print(preview)
+        print(f"内容预览: {preview}")
