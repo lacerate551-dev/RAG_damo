@@ -33,6 +33,7 @@ import threading
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 import logging
 
 import chromadb
@@ -47,6 +48,66 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# ==================== 辅助函数 ====================
+
+def _get_doc_type(filename: str) -> str:
+    """
+    根据文件扩展名判断文档类型
+
+    Args:
+        filename: 文件名
+
+    Returns:
+        文档类型: pdf, word, excel, ppt, other
+    """
+    ext = Path(filename).suffix.lower()
+    if ext == '.pdf':
+        return 'pdf'
+    elif ext in ('.docx', '.doc'):
+        return 'word'
+    elif ext in ('.xlsx', '.xls'):
+        return 'excel'
+    elif ext in ('.pptx', '.ppt'):
+        return 'ppt'
+    return 'other'
+
+
+def _extract_figure_number(caption: str, section: str = '') -> str:
+    """
+    从 caption 或 section 中提取图号（增强版）
+
+    支持格式：
+    - 图2.4, 图2-4
+    - Fig.2.4, Fig 2.4, Figure 2.4
+    - （图2）
+
+    Args:
+        caption: 图片标题/说明
+        section: 章节信息
+
+    Returns:
+        图号字符串，如 "2.4"；未找到返回空字符串
+    """
+    import re
+
+    text = f"{caption} {section}"
+
+    patterns = [
+        r'图\s*(\d+[\.\-]\d+)',      # 图2.4, 图2-4
+        r'Fig\.?\s*(\d+[\.\-]\d+)',  # Fig.2.4, Fig 2.4
+        r'Figure\s*(\d+[\.\-]\d+)',  # Figure 2.4
+        r'[（(]\s*图\s*(\d+)\s*[)）]',  # （图2）
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            # 统一格式：2.4
+            return match.group(1).replace('-', '.')
+
+    return ""
 
 
 # ==================== 配置常量 ====================
@@ -780,6 +841,9 @@ class KnowledgeBaseManager:
                 else:
                     text_chunks.append((i, page_info, chunk))
 
+            # 章节内序号计数器（用于 Word 文档语义定位）
+            section_counters = {}  # section_path -> 当前序号
+
             # 1. 处理文本块 - 直接向量化入库
             for idx, page_info, chunk in text_chunks:
                 text = page_info.get('text', '')
@@ -801,16 +865,34 @@ class KnowledgeBaseManager:
                     vector = vector[0]
                 chunk_id = f"{filename}_text_{idx}"
 
+                # 计算章节内序号（用于 Word 文档语义定位）
+                section = page_info.get('section_path', '') or page_info.get('section', '')
+                if section not in section_counters:
+                    section_counters[section] = 0
+                section_counters[section] += 1
+                section_chunk_id = section_counters[section]
+
                 metadata = {
                     'source': filename,
                     'page': page_info.get('page', 0),
+                    'page_end': page_info.get('page_end', page_info.get('page', 0)),  # 结束页码
                     'chunk_index': idx,
+                    'chunk_id': chunk_id,  # 切片唯一标识
                     'chunk_type': 'text',
-                    'section': page_info.get('section_path', '') or page_info.get('section', ''),
+                    'section': section,
+                    'section_chunk_id': section_chunk_id,  # 章节内序号（用于语义定位）
+                    'doc_type': _get_doc_type(filename),  # 文档类型: pdf/word/excel/ppt
+                    'preview': content[:50] if len(content) > 50 else content,  # 可搜索片段
                     'has_table': False,
                     'collection': collection.name,
                     **extra_metadata
                 }
+
+                # 添加 bbox（仅当存在时）
+                bbox = page_info.get('bbox')
+                if bbox:
+                    metadata['bbox'] = json.dumps(bbox)
+                    metadata['bbox_mode'] = 'normalized'
 
                 collection.add(
                     ids=[chunk_id],
@@ -837,26 +919,45 @@ class KnowledgeBaseManager:
 
                 chunk_id = f"{filename}_table_{idx}"
 
+                # 计算章节内序号
+                section = page_info.get('section_path', '') or page_info.get('section', '')
+                if section not in section_counters:
+                    section_counters[section] = 0
+                section_counters[section] += 1
+                section_chunk_id = section_counters[section]
+
                 # 表格元数据
                 table_meta = {
                     'source': filename,
                     'page': page_info.get('page', 0),
+                    'page_end': page_info.get('page_end', page_info.get('page', 0)),  # 结束页码
                     'chunk_index': idx,
+                    'chunk_id': chunk_id,  # 切片唯一标识
                     'chunk_type': 'table',
+                    'section': section,
+                    'section_chunk_id': section_chunk_id,  # 章节内序号
+                    'doc_type': _get_doc_type(filename),  # 文档类型: pdf/word/excel/ppt
+                    'preview': table_md[:50] if len(table_md) > 50 else table_md,  # 可搜索片段
                     'has_table': True,
                     'collection': collection.name,
                     'has_summary': False,  # 标记：未调用 LLM
                     **extra_metadata
                 }
 
+                # 添加 bbox（仅当存在时）
+                bbox = page_info.get('bbox')
+                if bbox:
+                    table_meta['bbox'] = json.dumps(bbox)
+                    table_meta['bbox_mode'] = 'normalized'
+
                 # 如果表格有图片，添加 image_path
                 table_image_path = chunk.image_path if hasattr(chunk, 'image_path') and chunk.image_path else None
                 if table_image_path:
                     table_meta['image_path'] = table_image_path
 
-                # 如果表格有关联图片列表（嵌入表格的图片），添加 images 字段
+                # 如果表格有关联图片列表（嵌入表格的图片），添加 images 字段（JSON 字符串）
                 if hasattr(chunk, 'images') and chunk.images:
-                    table_meta['images'] = chunk.images
+                    table_meta['images'] = json.dumps(chunk.images) if isinstance(chunk.images, list) else chunk.images
 
                 # 直接向量化原始表格（不调用 LLM）
                 vector = embedding_model.encode(table_md).tolist()
@@ -898,11 +999,28 @@ class KnowledgeBaseManager:
                 # 保留原始 chunk_type（image 或 chart）
                 original_chunk_type = page_info.get('chunk_type', 'image')
 
+                # 获取 caption（用于图片检索）
+                caption = page_info.get('caption', '') or (chunk.title if hasattr(chunk, 'title') else '')
+
+                # 计算章节内序号
+                section = page_info.get('section_path', '') or page_info.get('section', '')
+                if section not in section_counters:
+                    section_counters[section] = 0
+                section_counters[section] += 1
+                section_chunk_id = section_counters[section]
+
                 image_meta = {
                     'source': filename,
                     'page': page_info.get('page', 0),
+                    'page_end': page_info.get('page_end', page_info.get('page', 0)),  # 结束页码
                     'chunk_index': idx,
+                    'chunk_id': chunk_id,  # 切片唯一标识
                     'chunk_type': original_chunk_type,
+                    'section': section,
+                    'section_chunk_id': section_chunk_id,  # 章节内序号
+                    'doc_type': _get_doc_type(filename),  # 文档类型: pdf/word/excel/ppt
+                    'caption': caption,  # 图片标题/说明
+                    'figure_number': _extract_figure_number(caption, page_info.get('section', '')),  # 图号
                     'has_table': False,
                     'collection': collection.name,
                     'image_path': image_path,  # 存储相对路径（文件名）
@@ -910,8 +1028,17 @@ class KnowledgeBaseManager:
                     **extra_metadata
                 }
 
+                # 添加 bbox（仅当存在时）
+                bbox = page_info.get('bbox')
+                if bbox:
+                    image_meta['bbox'] = json.dumps(bbox)
+                    image_meta['bbox_mode'] = 'normalized'
+
                 # 生成轻量描述（不用 VLM）
                 description = self.generate_lightweight_image_description(full_image_path, chunk, page_info)
+
+                # 添加可搜索片段
+                image_meta['preview'] = description[:50] if len(description) > 50 else description
 
                 # 向量化入库
                 vector = embedding_model.encode(description).tolist()
@@ -1265,7 +1392,8 @@ class KnowledgeBaseManager:
         query_vector: List[float],
         query_text: str,
         top_k: int = 5,
-        use_bm25: bool = True
+        use_bm25: bool = True,
+        include_deprecated: bool = False
     ) -> Optional[SearchResult]:
         """
         单向量库检索
@@ -1276,6 +1404,7 @@ class KnowledgeBaseManager:
             query_text: 查询文本（用于 BM25）
             top_k: 返回数量
             use_bm25: 是否使用 BM25
+            include_deprecated: 是否包含已废止/已替代的文档
 
         Returns:
             检索结果
@@ -1284,10 +1413,16 @@ class KnowledgeBaseManager:
         if not collection or collection.count() == 0:
             return None
 
-        # 向量检索
+        # 构建 where 过滤条件
+        where_filter = None
+        if not include_deprecated:
+            where_filter = {"status": "active"}  # 只查询 active 状态
+
+        # 向量检索（带状态过滤）
         vector_result = collection.query(
             query_embeddings=[query_vector],
-            n_results=top_k
+            n_results=top_k,
+            where=where_filter  # 应用过滤
         )
 
         if not use_bm25:
@@ -1304,6 +1439,18 @@ class KnowledgeBaseManager:
         bm25_ids, bm25_docs, bm25_metas, bm25_scores = bm25_index.search(
             query_text, top_k=min(top_k * 2, 20)
         )
+
+        # 如果不包含废止文档，需要过滤 BM25 结果
+        if not include_deprecated and bm25_metas:
+            filtered_bm25 = []
+            for i, meta in enumerate(bm25_metas):
+                if meta.get('status', 'active') == 'active':
+                    filtered_bm25.append((bm25_ids[i], bm25_docs[i], bm25_metas[i], bm25_scores[i]))
+
+            if filtered_bm25:
+                bm25_ids, bm25_docs, bm25_metas, bm25_scores = zip(*filtered_bm25)
+            else:
+                bm25_ids, bm25_docs, bm25_metas, bm25_scores = [], [], [], []
 
         # RRF 融合
         return self._merge_results(
@@ -1475,6 +1622,74 @@ class KnowledgeBaseManager:
 
     # ==================== 版本管理与软删除 ====================
 
+    def mark_document_as_superseded(
+        self,
+        kb_name: str,
+        filename: str,
+        reason: str = "被新版本替代"
+    ) -> Dict:
+        """
+        标记文档为已替代状态（软删除）
+
+        Args:
+            kb_name: 知识库名称
+            filename: 文件名
+            reason: 替代原因
+
+        Returns:
+            操作结果
+        """
+        from datetime import datetime
+
+        collection = self.get_collection(kb_name)
+        if not collection:
+            return {"success": False, "message": "向量库不存在"}
+
+        # 1. 查询该文件的所有 active chunks
+        result = collection.get(
+            where={
+                "$and": [
+                    {"source": filename},
+                    {"status": "active"}
+                ]
+            }
+        )
+
+        if not result['ids']:
+            logger.warning(f"未找到活跃文档: {kb_name}/{filename}")
+            return {"success": False, "message": "未找到活跃文档"}
+
+        # 2. 更新 metadata
+        superseded_time = datetime.now().isoformat()
+        updated_metadatas = [
+            {
+                **m,
+                "status": "superseded",
+                "superseded_time": superseded_time,
+                "superseded_reason": reason
+            }
+            for m in result['metadatas']
+        ]
+
+        # 3. 批量更新
+        collection.update(
+            ids=result['ids'],
+            metadatas=updated_metadatas
+        )
+
+        # 4. 重建 BM25 索引
+        self.rebuild_bm25_index(kb_name)
+
+        logger.info(f"标记文档为 superseded: {kb_name}/{filename}, chunks: {len(result['ids'])}")
+
+        return {
+            "success": True,
+            "superseded_chunks": len(result['ids']),
+            "document_id": filename,
+            "collection": kb_name,
+            "superseded_time": superseded_time
+        }
+
     def deprecate_document(
         self,
         kb_name: str,
@@ -1531,6 +1746,34 @@ class KnowledgeBaseManager:
 
         # 更新BM25索引
         self.rebuild_bm25_index(kb_name)
+
+        # 创建版本记录
+        try:
+            from knowledge.document_versions import get_version_query
+            version_query = get_version_query()
+
+            # 创建废止版本记录（自动生成版本号）
+            version_query.create_version_record(
+                collection=kb_name,
+                document_id=filename,
+                status="deprecated",
+                change_summary=f"废止原因: {reason}",
+                created_by=deprecated_by,
+                chunk_count=len(result['ids'])
+            )
+
+            # 记录变更日志
+            version_query.log_version_change(
+                collection=kb_name,
+                document_id=filename,
+                change_type="deprecate",
+                old_status="active",
+                new_status="deprecated",
+                reason=reason,
+                changed_by=deprecated_by
+            )
+        except Exception as e:
+            logger.warning(f"创建版本记录失败: {e}")
 
         logger.info(f"软删除文档: {kb_name}/{filename}, chunks: {len(result['ids'])}, 原因: {reason}")
 
@@ -1591,6 +1834,34 @@ class KnowledgeBaseManager:
 
         # 更新BM25索引
         self.rebuild_bm25_index(kb_name)
+
+        # 创建版本记录
+        try:
+            from knowledge.document_versions import get_version_query
+            version_query = get_version_query()
+
+            # 创建恢复版本记录（自动生成版本号）
+            version_query.create_version_record(
+                collection=kb_name,
+                document_id=filename,
+                status="active",
+                change_summary="文档已恢复",
+                created_by="system",
+                chunk_count=len(result['ids'])
+            )
+
+            # 记录变更日志
+            version_query.log_version_change(
+                collection=kb_name,
+                document_id=filename,
+                change_type="restore",
+                old_status="deprecated",
+                new_status="active",
+                reason="文档恢复",
+                changed_by="system"
+            )
+        except Exception as e:
+            logger.warning(f"创建版本记录失败: {e}")
 
         logger.info(f"恢复文档: {kb_name}/{filename}, chunks: {len(result['ids'])}")
 

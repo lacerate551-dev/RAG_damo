@@ -23,15 +23,164 @@ from flask import Blueprint, request, jsonify, Response, current_app
 from auth.gateway import require_gateway_auth
 
 from auth.security import validate_query, filter_response
+from config import RAG_CHAT_MODEL
 
 chat_bp = Blueprint('chat', __name__)
-
-# 聊天使用更快的模型
-CHAT_MODEL = "qwen3.5-flash"
 
 
 def _get_agentic_rag():
     return current_app.config['AGENTIC_RAG']
+
+
+def _attach_citations(answer: str, contexts: list) -> dict:
+    """
+    自动为回答添加引用（不依赖 LLM 标注）
+
+    流程：
+    1. 将 answer 按句子分割
+    2. 对每个句子计算与各 context 的相似度
+    3. 相似度超过阈值则附加引用
+    4. 使用 [ref:chunk_id] 占位符（前端负责重新编号）
+
+    Args:
+        answer: LLM 生成的回答
+        contexts: 检索到的上下文列表
+
+    Returns:
+        {
+            "answer_with_refs": "回答文本（含 [ref:chunk_id] 标记）",
+            "citations": [引用列表]
+        }
+    """
+    import re
+
+    if not contexts:
+        return {"answer_with_refs": answer, "citations": []}
+
+    # 按 chunk_id 组织 contexts
+    ctx_by_chunk = {}
+    for ctx in contexts:
+        meta = ctx.get('meta', {})
+        chunk_id = meta.get('chunk_id') or f"{meta.get('source')}_{meta.get('chunk_index', 0)}"
+        ctx_by_chunk[chunk_id] = ctx
+
+    # 按句子分割
+    sentences = re.split(r'([。！？\n])', answer)
+    cited_chunks = set()  # 存储被引用的 chunk_id
+
+    result_sentences = []
+    for i in range(0, len(sentences), 2):
+        sentence = sentences[i]
+        punctuation = sentences[i + 1] if i + 1 < len(sentences) else ''
+
+        if len(sentence.strip()) < 10:  # 太短的句子不引用
+            result_sentences.append(sentence + punctuation)
+            continue
+
+        # 关键词匹配：检查句子是否包含某个 context 的关键信息
+        best_chunk_id = None
+        best_score = 0
+
+        for chunk_id, ctx in ctx_by_chunk.items():
+            ctx_doc = ctx.get('doc', '')
+            if not ctx_doc:
+                continue
+
+            # 简单关键词重叠匹配
+            overlap = len(set(sentence) & set(ctx_doc[:200]))
+            score = overlap / max(len(sentence), 1)
+
+            if score > best_score and score > 0.3:  # 阈值
+                best_score = score
+                best_chunk_id = chunk_id
+
+        if best_chunk_id:
+            cited_chunks.add(best_chunk_id)
+            # 使用 [ref:chunk_id] 占位符，前端负责重新编号
+            result_sentences.append(f"{sentence}[ref:{best_chunk_id}]{punctuation}")
+        else:
+            result_sentences.append(sentence + punctuation)
+
+    # 构建引用列表（只包含实际被引用的）
+    citations = []
+    for chunk_id in cited_chunks:
+        ctx = ctx_by_chunk.get(chunk_id)
+        if ctx:
+            meta = ctx.get('meta', {})
+            full_content = ctx.get('doc', '')  # 完整切片内容
+            citation = _build_citation(meta, full_content)
+            citations.append(citation)
+
+    return {
+        "answer_with_refs": "".join(result_sentences),
+        "citations": citations
+    }
+
+
+def _build_citation(meta: dict, full_content: str = '') -> dict:
+    """
+    根据文档类型构建定位信息（差异化处理）
+
+    PDF: 坐标定位（page + bbox）
+    Word: 语义定位（section + section_chunk_id + preview）
+    Excel: 表格定位（sheet + preview）
+    """
+    citation = {
+        "chunk_id": meta.get('chunk_id'),
+        "source": meta.get('source', ''),
+        "doc_type": meta.get('doc_type', 'other'),
+        "section": meta.get('section', ''),
+        "preview": meta.get('preview', ''),
+        "content": full_content or meta.get('preview', ''),  # 完整切片内容（前端可展开查看）
+        "chunk_type": meta.get('chunk_type', 'text'),
+    }
+
+    doc_type = meta.get('doc_type', 'other')
+
+    if doc_type == 'pdf':
+        # PDF: 坐标定位
+        bbox_raw = meta.get('bbox')
+        bbox = None
+        if bbox_raw:
+            try:
+                bbox = json.loads(bbox_raw) if isinstance(bbox_raw, str) else bbox_raw
+            except (json.JSONDecodeError, TypeError):
+                bbox = bbox_raw
+
+        citation.update({
+            "page": meta.get('page'),
+            "page_end": meta.get('page_end'),
+            "bbox": bbox,
+            "bbox_mode": meta.get('bbox_mode'),
+        })
+    elif doc_type == 'word':
+        # Word: 语义定位
+        citation.update({
+            "section_chunk_id": meta.get('section_chunk_id'),  # 章节内段落序号
+        })
+    elif doc_type == 'excel':
+        # Excel: 表格定位
+        citation.update({
+            "page": meta.get('page'),  # 工作表序号
+        })
+    else:
+        # 其他类型：返回所有可用信息
+        bbox_raw = meta.get('bbox')
+        bbox = None
+        if bbox_raw:
+            try:
+                bbox = json.loads(bbox_raw) if isinstance(bbox_raw, str) else bbox_raw
+            except (json.JSONDecodeError, TypeError):
+                bbox = bbox_raw
+
+        citation.update({
+            "page": meta.get('page'),
+            "page_end": meta.get('page_end'),
+            "bbox": bbox,
+            "bbox_mode": meta.get('bbox_mode'),
+        })
+
+    return citation
 
 
 def score_image_relevance(query: str, meta: dict) -> float:
@@ -242,7 +391,7 @@ def chat_with_llm(message: str, history: list = None, enable_web_search: bool = 
 
     # 调用 LLM
     response = client.chat.completions.create(
-        model=CHAT_MODEL,
+        model=RAG_CHAT_MODEL,
         messages=messages,
         max_tokens=2048
     )
@@ -397,7 +546,8 @@ def rag():
     请求体:
     {
         "message": "消息内容",
-        "history": [{"role": "user/assistant", "content": "..."}],  // 可选
+        "history": [{"role": "user/assistant", "content": "..."}],  // 可选（开发环境）
+        "chat_history": [{"role": "user/assistant", "content": "..."}],  // 可选（生产环境）
         "collections": ["public_kb"],  // 可选，知识库列表
         "session_id": "xxx"  // 可选，会话ID
     }
@@ -409,15 +559,25 @@ def rag():
     4. finish: 完成响应（包含完整 answer 和 sources）
     5. error: 错误事件
     """
+    from config import IS_PROD, ENABLE_SESSION
+
     data = request.json or {}
 
     message = data.get('message')
-    history = data.get('history', [])
+    # 兼容两种参数名：history（旧）和 chat_history（新）
+    history = data.get('history') or data.get('chat_history')
     collections = data.get('collections')
     session_id = data.get('session_id')
 
     if not message:
         return jsonify({"error": "缺少 message"}), 400
+
+    # 生产环境强制校验 chat_history
+    if IS_PROD and history is None:
+        return jsonify({
+            "error": "chat_history is required in production",
+            "code": "MISSING_HISTORY"
+        }), 400
 
     # 输入安全验证
     is_valid, reason = validate_query(message)
@@ -429,26 +589,40 @@ def rag():
         collections = ['public_kb']
 
     # ==================== 会话历史加载 ====================
-    # 如果没有传 history，尝试从 SessionManager 加载
-    session_manager = current_app.config.get('SESSION_MANAGER')
+    # 优先使用传入的 history，否则从 session_repo 加载
     user_id = request.current_user.get("user_id")
 
-    if not history and session_id and session_manager:
+    if history is not None:
+        # 使用传入的历史（生产环境必须传入）
+        pass
+    elif session_id and ENABLE_SESSION:
+        # 开发环境：从本地数据库加载
         try:
-            # 验证会话归属
-            sessions = session_manager.get_user_sessions(user_id)
-            session_ids = [s["session_id"] for s in sessions]
-            if session_id in session_ids:
-                history = session_manager.get_history(session_id, limit=10)
+            session_repo = current_app.session_repo
+            history = session_repo.get_history(session_id)
+            # 限制历史长度
+            history = history[-10:] if len(history) > 10 else history
         except Exception:
-            pass  # 加载失败不影响主流程
+            history = []
+    else:
+        history = []
 
-    # 如果没有 session_id，创建新会话
-    if not session_id and session_manager:
+    # 如果没有 session_id，创建新会话（仅开发环境）
+    if not session_id and ENABLE_SESSION:
         try:
-            session_id = session_manager.create_session(user_id)
+            session_repo = current_app.session_repo
+            session_id = session_repo.create_session(user_id)
         except Exception:
             pass  # 创建失败不影响主流程
+
+    # 提前获取 session_repo 引用，避免在生成器内部访问 current_app
+    # （生成器执行时应用上下文可能已结束）
+    session_repo_ref = None
+    if ENABLE_SESSION:
+        try:
+            session_repo_ref = current_app.session_repo
+        except Exception:
+            pass
 
     def generate():
         """生成 SSE 流"""
@@ -496,6 +670,8 @@ def rag():
                             'page_range': page_range,
                             'section': meta.get('section', '') or meta.get('section_path', ''),
                             'chunk_type': meta.get('chunk_type', 'text'),
+                            'doc_type': meta.get('doc_type', 'other'),  # 文档类型
+                            'section_chunk_id': meta.get('section_chunk_id'),  # 章节内序号
                             'score': round(score, 3) if isinstance(score, float) else score
                         }
                     # contexts 仍然保留所有结果用于生成答案
@@ -551,31 +727,36 @@ def rag():
             if selected_images:
                 rich_media['images'] = selected_images
 
-            # 7. 保存消息到会话
+            # 7. 保存消息到会话（仅开发环境）
             full_answer_text = "".join(full_answer)
-            if session_id and session_manager:
+            if session_id and session_repo_ref:
                 try:
                     # 保存用户消息
-                    session_manager.add_message(session_id, 'user', message)
-                    
-                    # 保存 AI 回答并附带元数据
-                    ai_meta = {
-                        "is_rag": True,
-                        "sources": sources,
-                        "images": rich_media.get("images", [])
-                    }
-                    session_manager.add_message(session_id, 'assistant', full_answer_text, metadata=ai_meta)
-                except Exception:
-                    pass  # 保存失败不影响主流程
+                    session_repo_ref.add_message(session_id, 'user', message)
+                    # 保存 AI 回答
+                    session_repo_ref.add_message(session_id, 'assistant', full_answer_text)
+                    # 更新会话最后活跃时间
+                    if hasattr(session_repo_ref, 'update_last_active'):
+                        session_repo_ref.update_last_active(session_id)
+                except Exception as e:
+                    import logging
+                    logging.warning(f"保存会话消息失败: {e}")
 
-            # 8. 发送完成事件
+            # 8. 添加引用标注（自动插入 [ref:chunk_id]）
+            citation_result = _attach_citations(full_answer_text, contexts)
+
+            # 9. 过滤敏感信息（违禁词等）
+            filtered_answer = filter_response(citation_result.get("answer_with_refs", full_answer_text))
+
+            # 10. 发送完成事件
             duration_ms = int((_time.time() - start_time) * 1000)
             finish_event = {
                 "type": "finish",
-                "answer": full_answer_text,
+                "answer": filtered_answer,
                 "mode": "rag",
                 "session_id": session_id,
                 "sources": sources,
+                "citations": citation_result.get("citations", []),  # 结构化引用列表
                 "images": rich_media["images"],
                 "tables": rich_media["tables"],
                 "sections": rich_media["sections"],

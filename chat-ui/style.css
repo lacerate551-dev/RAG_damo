@@ -800,6 +800,194 @@ body {
     margin-right: 8px;
 }
 
+/* 溯源信息详细展示（多维定位） */
+.source-item-detailed {
+    margin: 4px 0;
+    padding: 4px 8px;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 4px;
+    font-size: 13px;
+}
+
+.search-hint {
+    color: #94a3b8;
+    font-size: 12px;
+    font-style: italic;
+}
+
+.location-hint {
+    color: #60a5fa;
+    font-size: 12px;
+    margin-left: 4px;
+}
+
+/* 文档类型差异化样式 */
+.source-item-detailed[data-doc-type="word"] {
+    border-left: 3px solid #3b82f6;
+    padding-left: 8px;
+    margin-left: 4px;
+}
+
+.source-item-detailed[data-doc-type="pdf"] {
+    border-left: 3px solid #ef4444;
+    padding-left: 8px;
+    margin-left: 4px;
+}
+
+.source-item-detailed[data-doc-type="excel"] {
+    border-left: 3px solid #22c55e;
+    padding-left: 8px;
+    margin-left: 4px;
+}
+
+/* 引用标注样式 */
+.citation-ref {
+    color: #60a5fa;
+    cursor: pointer;
+    font-size: 0.7em;
+    vertical-align: super;
+    margin: 0 2px;
+    font-weight: 600;
+    background: rgba(96, 165, 250, 0.15);
+    padding: 1px 4px;
+    border-radius: 3px;
+    transition: all 0.2s ease;
+}
+
+.citation-ref:hover {
+    color: #fff;
+    background: rgba(96, 165, 250, 0.3);
+}
+
+/* 引用列表样式 */
+.message-citations {
+    margin-top: 16px;
+    padding: 12px 14px;
+    background: rgba(30, 41, 59, 0.6);
+    border-radius: 8px;
+    font-size: 13px;
+    border: 1px solid rgba(71, 85, 105, 0.3);
+}
+
+.message-citations strong {
+    color: #94a3b8;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.citations-list {
+    margin: 10px 0 0 0;
+    padding-left: 0;
+    list-style: none;
+    counter-reset: citation-counter;
+}
+
+.citation-item {
+    position: relative;
+    margin: 10px 0;
+    padding: 10px 12px 10px 40px;
+    background: rgba(15, 23, 42, 0.4);
+    border-radius: 6px;
+    border-left: 3px solid #475569;
+    transition: background 0.2s ease;
+}
+
+.citation-item:hover {
+    background: rgba(15, 23, 42, 0.6);
+}
+
+/* 编号标记 */
+.citation-item::before {
+    counter-increment: citation-counter;
+    content: "[" counter(citation-counter) "]";
+    position: absolute;
+    left: 12px;
+    top: 10px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #60a5fa;
+}
+
+.citation-item[data-doc-type="pdf"] {
+    border-left-color: #ef4444;
+}
+
+.citation-item[data-doc-type="word"] {
+    border-left-color: #3b82f6;
+}
+
+.citation-item[data-doc-type="excel"] {
+    border-left-color: #22c55e;
+}
+
+.citation-source {
+    font-weight: 500;
+    color: #f1f5f9;
+    font-size: 13px;
+}
+
+.citation-location {
+    color: #60a5fa;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+.citation-section {
+    display: block;
+    color: #94a3b8;
+    font-size: 11px;
+    margin-top: 4px;
+}
+
+.citation-preview {
+    display: block;
+    color: #64748b;
+    font-size: 11px;
+    font-style: italic;
+    margin-top: 4px;
+    padding: 4px 8px;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 4px;
+}
+
+.citation-content-wrapper {
+    margin-top: 4px;
+}
+
+.citation-full-content {
+    display: none;
+    color: #94a3b8;
+    font-size: 11px;
+    font-style: italic;
+    padding: 8px 12px;
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 4px;
+    margin-top: 4px;
+    max-height: 200px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.5;
+}
+
+.citation-expand-btn {
+    background: transparent;
+    border: 1px solid #475569;
+    color: #60a5fa;
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+    margin-top: 4px;
+    transition: all 0.2s ease;
+}
+
+.citation-expand-btn:hover {
+    background: rgba(96, 165, 250, 0.1);
+    border-color: #60a5fa;
+}
+
 .security-tag {
     font-size: 9px;
     padding: 2px 6px;

@@ -34,10 +34,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 # 导入配置
+from config import API_KEY, BASE_URL
 try:
-    from config import API_KEY, BASE_URL, GRAPH_EXTRACTION_MODEL
+    from config import GRAPH_EXTRACTION_MODEL
 except ImportError:
-    from rag_demo import API_KEY, BASE_URL
     GRAPH_EXTRACTION_MODEL = "qwen3.5-plus"
 
 from graph.graph_manager import Entity, Triple

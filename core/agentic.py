@@ -22,8 +22,12 @@ Agentic RAG - 知识库智能问答系统
 
 import json
 import sys
+import logging
 import requests
 from openai import OpenAI
+
+# 配置日志
+logger = logging.getLogger(__name__)
 
 # 导入现有RAG组件
 from core.engine import get_engine
@@ -60,6 +64,14 @@ try:
 except ImportError:
     HAS_CLASSIFIER = False
     QueryType = None
+
+# LLM 预算控制
+try:
+    from core.llm_budget import get_budget_controller, should_use_agent, CallType
+    HAS_BUDGET = True
+except ImportError:
+    HAS_BUDGET = False
+    CallType = None
 
 
 class AgenticRAG:
@@ -250,6 +262,13 @@ class AgenticRAG:
 
         emit_log("start", {"query": query})
 
+        # ==================== LLM 预算控制初始化 ====================
+        if HAS_BUDGET:
+            budget = get_budget_controller()
+            budget.start_query()
+        else:
+            budget = None
+
         if verbose:
             print("\n" + "=" * 60)
             print(f"[用户] {query}")
@@ -258,14 +277,24 @@ class AgenticRAG:
         # ==================== 统一 Query Rewriting 入口 ====================
         original_query = query
         if self.should_rewrite(query, history):
-            rewritten = self._rewrite_query(query, history, strategy="all")
-            if verbose:
-                print(f"\n[查询重写] {query} → {rewritten}")
-            emit_log("rewrite", {
-                "original": query,
-                "rewritten": rewritten
-            })
-            query = rewritten  # 使用重写后的查询
+            # 预算检查
+            can_rewrite = True
+            if budget and not budget.can_call(CallType.REWRITE):
+                can_rewrite = False
+                if verbose:
+                    print(f"\n[预算控制] 跳过查询重写（已达上限）")
+
+            if can_rewrite:
+                rewritten = self._rewrite_query(query, history, strategy="all")
+                if budget:
+                    budget.record_call(CallType.REWRITE, description="查询重写")
+                if verbose:
+                    print(f"\n[查询重写] {query} → {rewritten}")
+                emit_log("rewrite", {
+                    "original": query,
+                    "rewritten": rewritten
+                })
+                query = rewritten  # 使用重写后的查询
 
         # ==================== 新增：查询分类 ====================
         classified = None
@@ -282,6 +311,17 @@ class AgenticRAG:
                 print(f"\n[分类] 类型: {classified.query_type.value}, 跳过LLM: {classified.skip_llm_decision}")
                 if classified.keywords:
                     print(f"   关键词: {', '.join(classified.keywords[:5])}")
+
+        # ==================== Agent 使用判断 ====================
+        use_agent_flow = True  # 默认使用 Agent
+        if HAS_BUDGET and classified:
+            use_agent_flow = should_use_agent(query, classified_result=classified)
+            emit_log("agent_decision", {
+                "use_agent": use_agent_flow,
+                "query_type": classified.query_type.value if hasattr(classified.query_type, 'value') else str(classified.query_type)
+            })
+            if verbose:
+                print(f"\n[Agent判断] 使用Agent流程: {use_agent_flow}")
 
         # ==================== 元问题直接处理 ====================
         if classified and classified.query_type == QueryType.META:
@@ -810,6 +850,11 @@ class AgenticRAG:
             "total_duration_ms": round((time.time() - start_time) * 1000, 0)
         })
 
+        # 结束预算统计
+        if budget:
+            budget_stats = budget.end_query()
+            emit_log("budget", budget_stats)
+
         return {
             "answer": answer,
             "iterations": iteration,
@@ -882,16 +927,21 @@ class AgenticRAG:
 
         answer = self._generate_fused_answer(query, contexts)
         sources = self._extract_sources(contexts)
+
+        # 添加引用标注
+        citations_result = self._attach_citations(answer, contexts)
+
         # 只从相关来源提取图片（传入原始查询以提取特定文件名）
         source_names = [s.get("source") for s in sources if s.get("source")]
         rich_media = self._extract_rich_media(contexts, sources_filter=source_names, original_query=query)
 
         return {
-            "answer": answer,
+            "answer": citations_result["answer_with_refs"],
             "iterations": 1,
             "reasoning": [{"type": "web_search", "query": query}],
             "contexts": contexts,
             "sources": sources,
+            "citations": citations_result["citations"],  # 新增：精确引用列表
             "log_trace": log_trace,
             "classified": classified.to_dict() if classified else None,
             # 富媒体信息
@@ -901,9 +951,9 @@ class AgenticRAG:
         }
 
     def _extract_sources(self, contexts: list) -> list:
-        """提取来源列表，合并同一来源"""
+        """提取来源列表，返回结构化定位信息（支持多维定位）"""
         # 按来源分组
-        source_map = {}  # {source_key: {"source": str, "type": str, "count": int, "pages": list}}
+        source_map = {}  # {source_key: {"source": str, "type": str, "count": int, "pages": list, "sections": set, "doc_type": str, "previews": list, "section_chunk_ids": set}}
 
         for c in contexts:
             meta = c.get('meta', {})
@@ -912,46 +962,403 @@ class AgenticRAG:
             if source_type == self.SOURCE_KB:
                 source_key = meta.get('source', '未知')
                 page = meta.get('page')
+                page_end = meta.get('page_end', page)  # 获取结束页码
+                section = meta.get('section', '')  # 获取章节路径
+                doc_type = meta.get('doc_type', 'other')  # 文档类型
+                preview = meta.get('preview', '')  # 可搜索片段
+                section_chunk_id = meta.get('section_chunk_id')  # 章节内序号
             elif source_type == self.SOURCE_GRAPH:
                 entities = c.get('entities', [])
                 source_key = "知识图谱"
                 if entities:
                     source_key += f" ({', '.join(entities[:3])})"
                 page = None
+                page_end = None
+                section = ''
+                doc_type = 'graph'
+                preview = ''
+                section_chunk_id = None
             else:
                 source_key = meta.get('title', meta.get('source', '未知'))
                 page = None
+                page_end = None
+                section = ''
+                doc_type = 'other'
+                preview = ''
+                section_chunk_id = None
 
             # 合并同一来源
             if source_key not in source_map:
                 source_map[source_key] = {
                     "source": source_key,
                     "type": source_type,
+                    "doc_type": doc_type,  # 文档类型
                     "count": 0,
-                    "pages": []
+                    "pages": [],  # 存储页码范围元组 (start, end)
+                    "sections": set(),  # 存储章节路径
+                    "previews": [],  # 可搜索片段
+                    "section_chunk_ids": set()  # 章节内序号集合
                 }
 
             source_map[source_key]["count"] += 1
+
+            # 存储页码范围（元组形式）
             if page:
-                if page not in source_map[source_key]["pages"]:
-                    source_map[source_key]["pages"].append(page)
+                page_range = (page, page_end if page_end else page)
+                if page_range not in source_map[source_key]["pages"]:
+                    source_map[source_key]["pages"].append(page_range)
+
+            # 存储章节路径（去重）
+            if section:
+                source_map[source_key]["sections"].add(section)
+
+            # 存储可搜索片段（最多3个）
+            if preview and len(source_map[source_key]["previews"]) < 3:
+                if preview not in source_map[source_key]["previews"]:
+                    source_map[source_key]["previews"].append(preview)
+
+            # 存储章节内序号（用于 Word 文档语义定位）
+            if section_chunk_id:
+                source_map[source_key]["section_chunk_ids"].add(section_chunk_id)
 
         # 构建结果列表
         sources = []
         for key, info in source_map.items():
             source_str = info["source"]
-            # 如果有页码信息，添加到来源名称
-            if info["pages"]:
-                pages_str = ", ".join(f"第{p}页" for p in sorted(info["pages"]))
-                source_str = f"{source_str} ({pages_str})"
+            doc_type = info.get("doc_type", "other")
+            location_parts = []
+
+            # 根据文档类型决定展示策略
+            if doc_type == 'pdf':
+                # PDF: 页码优先，其次章节
+                if info["pages"]:
+                    # 检查是否有有效的页码范围（不是全部为1）
+                    valid_pages = [(s, e) for s, e in info["pages"] if s > 1 or e > 1]
+                    if valid_pages or not info["sections"]:
+                        # 有有效页码，或者没有章节信息时才显示页码
+                        page_strs = []
+                        for start, end in sorted(info["pages"], key=lambda x: x[0]):
+                            if start == end:
+                                page_strs.append(f"第{start}页")
+                            else:
+                                page_strs.append(f"第{start}-{end}页")
+                        location_parts.append(", ".join(page_strs))
+
+                # PDF也显示章节（如果有）
+                if info["sections"]:
+                    sections_list = sorted(info["sections"])[:3]
+                    sections_str = "、".join(sections_list)
+                    if len(info["sections"]) > 3:
+                        sections_str += f"等{len(info['sections'])}个章节"
+                    location_parts.append(sections_str)
+
+            elif doc_type == 'word':
+                # Word: 章节优先，不显示无效页码
+                if info["sections"]:
+                    sections_list = sorted(info["sections"])[:3]
+                    sections_str = "、".join(sections_list)
+                    if len(info["sections"]) > 3:
+                        sections_str += f"等{len(info['sections'])}个章节"
+                    location_parts.append(sections_str)
+
+                # 显示章节内段落信息（语义定位）
+                if info.get("section_chunk_ids"):
+                    chunk_ids = sorted(info["section_chunk_ids"])[:5]
+                    if chunk_ids:
+                        chunk_str = f"第{chunk_ids[0]}"
+                        if len(chunk_ids) > 1:
+                            chunk_str = f"第{chunk_ids[0]}-{chunk_ids[-1]}段"
+                        location_parts.append(chunk_str)
+
+            elif doc_type == 'excel':
+                # Excel: 显示章节（工作表名称）
+                if info["sections"]:
+                    sections_list = sorted(info["sections"])[:3]
+                    sections_str = "、".join(sections_list)
+                    location_parts.append(sections_str)
+
+            else:
+                # 其他类型：原有逻辑
+                if info["pages"]:
+                    valid_pages = [(s, e) for s, e in info["pages"] if s > 1 or e > 1]
+                    if valid_pages or not info["sections"]:
+                        page_strs = []
+                        for start, end in sorted(info["pages"], key=lambda x: x[0]):
+                            if start == end:
+                                page_strs.append(f"第{start}页")
+                            else:
+                                page_strs.append(f"第{start}-{end}页")
+                        location_parts.append(", ".join(page_strs))
+
+                if info["sections"]:
+                    sections_list = sorted(info["sections"])[:3]
+                    sections_str = "、".join(sections_list)
+                    if len(info["sections"]) > 3:
+                        sections_str += f"等{len(info['sections'])}个章节"
+                    location_parts.append(sections_str)
+
+            # 组合定位信息
+            if location_parts:
+                source_str = f"{source_str} ({' | '.join(location_parts)})"
 
             sources.append({
                 "source": source_str,
                 "type": info["type"],
-                "count": info["count"]  # 添加引用次数
+                "count": info["count"],
+                "doc_type": doc_type,  # 文档类型
+                "previews": info.get("previews", []),  # 可搜索片段
+                "section_chunk_ids": sorted(info.get("section_chunk_ids", []))[:5]  # 章节内序号
             })
 
         return sources
+
+    def _build_citation(self, meta: dict) -> dict:
+        """
+        根据文档类型构建定位信息（差异化处理）
+
+        PDF: 坐标定位（page + bbox）
+        Word: 语义定位（section + section_chunk_id + preview）
+        Excel: 表格定位（sheet + preview）
+
+        Args:
+            meta: 切片的元数据
+
+        Returns:
+            结构化的引用信息
+        """
+        citation = {
+            "chunk_id": meta.get('chunk_id'),
+            "source": meta.get('source', ''),
+            "doc_type": meta.get('doc_type', 'other'),
+            "section": meta.get('section', ''),
+            "preview": meta.get('preview', ''),
+            "chunk_type": meta.get('chunk_type', 'text'),
+        }
+
+        doc_type = meta.get('doc_type', 'other')
+
+        if doc_type == 'pdf':
+            # PDF: 坐标定位
+            bbox_raw = meta.get('bbox')
+            bbox = None
+            if bbox_raw:
+                try:
+                    bbox = json.loads(bbox_raw) if isinstance(bbox_raw, str) else bbox_raw
+                except (json.JSONDecodeError, TypeError):
+                    bbox = bbox_raw
+
+            citation.update({
+                "page": meta.get('page'),
+                "page_end": meta.get('page_end'),
+                "bbox": bbox,
+                "bbox_mode": meta.get('bbox_mode'),
+            })
+        elif doc_type == 'word':
+            # Word: 语义定位
+            citation.update({
+                "section_chunk_id": meta.get('section_chunk_id'),  # 章节内段落序号
+                # 不返回 page（无意义）
+            })
+        elif doc_type == 'excel':
+            # Excel: 表格定位
+            citation.update({
+                "page": meta.get('page'),  # 工作表序号
+            })
+        else:
+            # 其他类型：返回所有可用信息
+            bbox_raw = meta.get('bbox')
+            bbox = None
+            if bbox_raw:
+                try:
+                    bbox = json.loads(bbox_raw) if isinstance(bbox_raw, str) else bbox_raw
+                except (json.JSONDecodeError, TypeError):
+                    bbox = bbox_raw
+
+            citation.update({
+                "page": meta.get('page'),
+                "page_end": meta.get('page_end'),
+                "bbox": bbox,
+                "bbox_mode": meta.get('bbox_mode'),
+            })
+
+        return citation
+
+    def _attach_citations(self, answer: str, contexts: list) -> dict:
+        """
+        自动为回答添加引用（不依赖 LLM 标注）
+
+        流程：
+        1. 将 answer 按句子分割
+        2. 对每个句子计算与各 context 的相似度
+        3. 相似度超过阈值则附加引用
+        4. 使用 [ref:chunk_id] 占位符（前端负责重新编号）
+
+        Args:
+            answer: LLM 生成的回答
+            contexts: 检索到的上下文列表
+
+        Returns:
+            {
+                "answer_with_refs": "回答文本（含 [ref:chunk_id] 标记）",
+                "citations": [引用列表]
+            }
+        """
+        import re
+
+        if not contexts:
+            return {"answer_with_refs": answer, "citations": []}
+
+        # 按 chunk_id 组织 contexts
+        ctx_by_chunk = {}
+        for ctx in contexts:
+            meta = ctx.get('meta', {})
+            chunk_id = meta.get('chunk_id') or f"{meta.get('source')}_{meta.get('chunk_index', 0)}"
+            ctx_by_chunk[chunk_id] = ctx
+
+        # 按句子分割
+        sentences = re.split(r'([。！？\n])', answer)
+        cited_chunks = set()  # 存储被引用的 chunk_id
+
+        result_sentences = []
+        for i in range(0, len(sentences), 2):
+            sentence = sentences[i]
+            punctuation = sentences[i + 1] if i + 1 < len(sentences) else ''
+
+            if len(sentence.strip()) < 10:  # 太短的句子不引用
+                result_sentences.append(sentence + punctuation)
+                continue
+
+            # 关键词匹配：检查句子是否包含某个 context 的关键信息
+            best_chunk_id = None
+            best_score = 0
+
+            for chunk_id, ctx in ctx_by_chunk.items():
+                ctx_doc = ctx.get('doc', '')
+                if not ctx_doc:
+                    continue
+
+                # 简单关键词重叠匹配
+                overlap = len(set(sentence) & set(ctx_doc[:200]))
+                score = overlap / max(len(sentence), 1)
+
+                if score > best_score and score > 0.3:  # 阈值
+                    best_score = score
+                    best_chunk_id = chunk_id
+
+            if best_chunk_id:
+                cited_chunks.add(best_chunk_id)
+                # 使用 [ref:chunk_id] 占位符，前端负责重新编号
+                result_sentences.append(f"{sentence}[ref:{best_chunk_id}]{punctuation}")
+            else:
+                result_sentences.append(sentence + punctuation)
+
+        # 构建引用列表（只包含实际被引用的）
+        citations = []
+        for chunk_id in cited_chunks:
+            ctx = ctx_by_chunk.get(chunk_id)
+            if ctx:
+                meta = ctx.get('meta', {})
+                # 使用 _build_citation 构建差异化定位信息
+                citations.append(self._build_citation(meta))
+
+        return {
+            "answer_with_refs": "".join(result_sentences),
+            "citations": citations
+        }
+
+    def _find_figure(self, query: str, contexts: list, source: str = None) -> dict:
+        """
+        精确查找图表，带 fallback
+
+        流程：
+        1. 先从 contexts 中查找（匹配 figure_number）
+        2. 如果没找到，直接查向量库（fallback）
+
+        Args:
+            query: 用户查询（可能包含图号，如"图2.4"）
+            contexts: 检索到的上下文列表
+            source: 指定来源文件名（可选）
+
+        Returns:
+            {"found": True, "chunk_id": ..., "source": ..., ...} 或 {"found": False}
+        """
+        import re
+
+        # 提取查询中的图号
+        patterns = [
+            r'图\s*(\d+[\.\-]\d+)',      # 图2.4, 图2-4
+            r'Fig\.?\s*(\d+[\.\-]\d+)',  # Fig.2.4, Fig 2.4
+            r'Figure\s*(\d+[\.\-]\d+)',  # Figure 2.4
+        ]
+
+        target_figure = None
+        for pattern in patterns:
+            match = re.search(pattern, query, re.IGNORECASE)
+            if match:
+                target_figure = match.group(1).replace('-', '.')  # 统一格式
+                break
+
+        if not target_figure:
+            return {"found": False}
+
+        # 1. 从 contexts 中查找
+        for ctx in contexts:
+            meta = ctx.get('meta', {})
+            fig_num = meta.get('figure_number', '')
+            if fig_num == target_figure:
+                if not source or meta.get('source') == source:
+                    return {
+                        "found": True,
+                        "chunk_id": meta.get('chunk_id'),
+                        "source": meta.get('source'),
+                        "page": meta.get('page'),
+                        "caption": meta.get('caption'),
+                        "image_path": meta.get('image_path'),
+                    }
+
+        # 2. Fallback: 直接查向量库
+        try:
+            from knowledge.manager import get_kb_manager
+            kb_mgr = get_kb_manager()
+            coll = kb_mgr.get_collection('public_kb')
+
+            if coll:
+                # 构建查询条件
+                where_conditions = [{'chunk_type': {'$in': ['image', 'chart']}}]
+                if source:
+                    where_conditions.append({'source': source})
+
+                result = coll.get(
+                    where={'$and': where_conditions} if len(where_conditions) > 1 else where_conditions[0],
+                    include=['metadatas', 'documents']
+                )
+
+                for meta, doc in zip(result.get('metadatas', []), result.get('documents', [])):
+                    # 检查 figure_number 或 caption 中是否包含目标图号
+                    if meta.get('figure_number') == target_figure:
+                        return {
+                            "found": True,
+                            "chunk_id": meta.get('chunk_id'),
+                            "source": meta.get('source'),
+                            "page": meta.get('page'),
+                            "caption": meta.get('caption'),
+                            "image_path": meta.get('image_path'),
+                        }
+                    # 备用：在 caption 中搜索
+                    caption = meta.get('caption', '') or (doc if doc else '')
+                    if f"图{target_figure}" in caption or f"图 {target_figure}" in caption:
+                        return {
+                            "found": True,
+                            "chunk_id": meta.get('chunk_id'),
+                            "source": meta.get('source'),
+                            "page": meta.get('page'),
+                            "caption": meta.get('caption'),
+                            "image_path": meta.get('image_path'),
+                        }
+        except Exception as e:
+            logger.warning(f"_find_figure fallback 查询失败: {e}")
+
+        return {"found": False}
 
     def _get_images_for_source(self, source: str, collections: list = None) -> list:
         """
@@ -1026,7 +1433,7 @@ class AgenticRAG:
             contexts: 检索上下文列表
             sources_filter: 来源过滤列表（只返回这些来源的媒体）
             max_images: 最大返回图片数
-            original_query: 原始用户查询（用于提取特定文件名）
+            original_query: 原始用户查询（用于提取特定文件名或图号）
 
         Returns:
             {"images": [...], "tables": [...], "sections": [...]}
@@ -1046,6 +1453,25 @@ class AgenticRAG:
             match = re.search(file_pattern, original_query, re.IGNORECASE)
             if match:
                 specific_source = match.group(1)
+
+            # 检查是否包含图号查询（如"图2.4"）
+            figure_result = self._find_figure(original_query, contexts, specific_source)
+            if figure_result.get("found"):
+                # 找到精确匹配的图号，直接返回该图片
+                img_id = figure_result.get("image_path")
+                if img_id:
+                    return {
+                        "images": [{
+                            "id": img_id,
+                            "caption": figure_result.get("caption", ""),
+                            "url": f"/images/{img_id}",
+                            "page": figure_result.get("page"),
+                            "source": figure_result.get("source"),
+                            "chunk_id": figure_result.get("chunk_id"),
+                        }],
+                        "tables": [],
+                        "sections": []
+                    }
 
         # 如果用户查询指定了特定文件，优先使用该文件名过滤
         effective_filter = sources_filter
@@ -2372,12 +2798,17 @@ class AgenticRAG:
             answer = self._direct_answer(query, history)
 
         sources = self._extract_sources(contexts)
+
+        # 添加引用标注
+        citations_result = self._attach_citations(answer, contexts)
+
         # 只从相关来源提取图片（传入原始查询以提取特定文件名）
         source_names = [s.get("source") for s in sources if s.get("source")]
         rich_media = self._extract_rich_media(contexts, sources_filter=source_names, original_query=query)
         return {
-            "answer": answer,
+            "answer": citations_result["answer_with_refs"],
             "sources": sources,
+            "citations": citations_result["citations"],  # 新增：精确引用列表
             "web_searched": need_web,
             # 富媒体信息
             "images": rich_media["images"],
@@ -2704,11 +3135,14 @@ class AgenticRAG:
                     'source_type': self.SOURCE_WEB,
                     'query': query
                 } for r in web_results]
+                answer = self._generate_fused_answer(query, contexts)
+                citations_result = self._attach_citations(answer, contexts)
                 result = {
-                    'answer': self._generate_fused_answer(query, contexts),
+                    'answer': citations_result["answer_with_refs"],
                     'iterations': 1,
                     'contexts': contexts,
-                    'sources': self._extract_sources(contexts)
+                    'sources': self._extract_sources(contexts),
+                    'citations': citations_result["citations"]
                 }
             else:
                 result = self.process(user_input)

@@ -45,9 +45,10 @@ def _get_recommendation_service():
     if _recommendation_service is None:
         from services.outline import RecommendationService
         from config import DOCUMENTS_PATH
-        from rag_demo import collection, embedding_model
+        from core.engine import get_engine
+        _engine = get_engine()
         _recommendation_service = RecommendationService(
-            _get_outline_db(), DOCUMENTS_PATH, collection, embedding_model
+            _get_outline_db(), DOCUMENTS_PATH, _engine.collection, _engine.embedding_model
         )
     return _recommendation_service
 

@@ -468,7 +468,16 @@ def _parse_mineru_output(file_path: Path, output_dir) -> Dict[str, Any]:
         markdown_parts = [markdown_content]
 
     # 后处理：过滤空切片 → 合并碎片 → 拆分超长
-    chunks = _post_process_chunks(chunks)
+    # 使用配置中的切片约束
+    try:
+        from config import MIN_CHUNK_SIZE, MAX_CHUNK_SIZE
+        min_merge = MIN_CHUNK_SIZE // 2  # 合并阈值为最小切片的一半
+        max_size = MAX_CHUNK_SIZE
+    except ImportError:
+        min_merge = 100
+        max_size = 1200
+
+    chunks = _post_process_chunks(chunks, min_merge_size=min_merge, max_chunk_size=max_size)
 
     return {
         'markdown': "\n".join(markdown_parts),
@@ -758,7 +767,8 @@ def convert_to_rag_format(
         }
 
         if chunk.bbox:
-            page_info['bbox'] = chunk.bbox
+            # 确保 bbox 是纯 Python 列表（转换 numpy 类型）
+            page_info['bbox'] = [float(x) for x in chunk.bbox] if chunk.bbox else None
 
         pages_content.append(page_info)
 

@@ -395,7 +395,7 @@ async function sendRagMessage(msg) {
         state.sessionId = result.session_id;
         $('currentSessionId').textContent = state.sessionId ? state.sessionId.substring(0, 8) : '新会话';
         // 替换流式占位符为最终消息
-        finalizeStreamMessage(result.answer, result.sources, result.images);
+        finalizeStreamMessage(result.answer, result.sources, result.images, result.citations);
         loadSessions();
     }
 }
@@ -487,14 +487,14 @@ function appendStreamingContent(content) {
     }
 }
 
-function finalizeStreamMessage(answer, sources, images) {
+function finalizeStreamMessage(answer, sources, images, citations) {
     if (streamingMessageEl) {
         // 移除流式指示器
         streamingMessageEl.classList.remove('streaming');
         streamingMessageEl.removeAttribute('id');
 
         // 使用完整的消息格式
-        const formatted = formatMessage(answer, sources, false, true, images);
+        const formatted = formatMessage(answer, sources, false, true, images, citations);
         streamingMessageEl.innerHTML = formatted;
 
         streamingMessageEl = null;
@@ -510,7 +510,7 @@ function clearStreamingPlaceholder() {
     }
 }
 
-function addMessage(role, content, sources, webSearched, isRag, images) {
+function addMessage(role, content, sources, webSearched, isRag, images, citations) {
     const container = $('chatMessages');
     // 移除空状态
     const empty = container.querySelector('.empty-state');
@@ -562,12 +562,38 @@ function addMessage(role, content, sources, webSearched, isRag, images) {
 
     // 显示来源
     if (sources && sources.length > 0) {
-        html += '<div class="message-sources"><strong>来源:</strong> ';
+        html += '<div class="message-sources"><strong>来源:</strong><br>';
         sources.forEach((s, i) => {
             const level = s.security_level || s.level || '';
             const levelTag = level ? `<span class="security-tag ${level}">${level}</span>` : '';
-            html += `<span class="source-item">${levelTag}${escapeHtml(s.source || s)}</span>`;
-            if (i < sources.length - 1) html += ', ';
+
+            // 解析 source 字符串（可能已包含位置信息）
+            const sourceText = s.source || s;
+            const docType = s.doc_type || 'other';
+            const previews = s.previews || [];
+            const sectionChunkId = s.section_chunk_id;
+
+            html += `<div class="source-item-detailed" data-doc-type="${docType}">`;
+            html += `${levelTag}📄 <strong>${escapeHtml(sourceText)}</strong>`;
+
+            // 根据文档类型差异化展示定位信息
+            if (docType === 'pdf') {
+                // PDF: 页码信息已在 sourceText 中
+            } else if (docType === 'word') {
+                // Word: 显示章节内段落信息
+                if (sectionChunkId) {
+                    html += `<br><span class="location-hint">🔢 段落: 第${sectionChunkId}段（本章节）</span>`;
+                }
+            } else if (docType === 'excel') {
+                // Excel: 工作表信息已在 sourceText 中
+            }
+
+            // 所有文档类型都显示搜索片段（帮助用户定位）
+            if (previews.length > 0) {
+                html += `<br><span class="search-hint">🔍 搜索: "${escapeHtml(previews[0])}"</span>`;
+            }
+
+            html += `</div>`;
         });
         html += '</div>';
     }
@@ -600,10 +626,43 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+// 展开/收起引用内容
+function toggleCitationContent(contentId) {
+    const preview = document.getElementById(contentId);
+    const fullContent = document.getElementById(contentId + '-full');
+    const btn = preview.parentElement.querySelector('.citation-expand-btn');
+
+    if (fullContent.style.display === 'none') {
+        // 展开
+        preview.style.display = 'none';
+        fullContent.style.display = 'block';
+        btn.textContent = '收起';
+    } else {
+        // 收起
+        preview.style.display = 'inline';
+        fullContent.style.display = 'none';
+        btn.textContent = '展开';
+    }
+}
+
 // 简单的 Markdown 渲染（用于流式输出）
 function renderMarkdown(text) {
     if (!text) return '';
-    let html = escapeHtml(text);
+
+    // 先提取 <sup> 标签，避免被转义
+    const supPlaceholders = [];
+    let processedText = text.replace(/<sup class="citation-ref"[^>]*data-chunk-id="[^"]*"[^>]*>\[[^\]]+\]<\/sup>/g, (match) => {
+        supPlaceholders.push(match);
+        return `__SUP_PLACEHOLDER_${supPlaceholders.length - 1}__`;
+    });
+
+    // 转义 HTML（除了我们提取的 <sup> 标签）
+    let html = escapeHtml(processedText);
+
+    // 恢复 <sup> 标签
+    supPlaceholders.forEach((sup, i) => {
+        html = html.replace(`__SUP_PLACEHOLDER_${i}__`, sup);
+    });
 
     // 图片
     html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, url) => {
@@ -641,7 +700,7 @@ function renderMarkdown(text) {
 }
 
 // 格式化消息（用于流式输出完成后的最终显示）
-function formatMessage(content, sources, webSearched, isRag, images) {
+function formatMessage(content, sources, webSearched, isRag, images, citations) {
     const messageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
     let html = '';
@@ -658,14 +717,49 @@ function formatMessage(content, sources, webSearched, isRag, images) {
     }
     html += '</div>';
 
-    html += `<div class="message-content">${renderMarkdown(content)}</div>`;
+    // 处理引用标注：将 [ref:chunk_id] 替换为编号
+    let processedContent = content;
+    const citationMap = {};
+    const orderedCitations = []; // 按内容中出现顺序排列的引用
+
+    if (citations && citations.length > 0) {
+        // 先建立 chunk_id -> citation 的映射
+        const citationByChunkId = {};
+        citations.forEach(c => {
+            citationByChunkId[c.chunk_id] = c;
+        });
+
+        // 按内容中出现的顺序收集引用（去重）
+        const seenChunks = new Set();
+        const refPattern = /\[ref:([^\]]+)\]/g;
+        let match;
+        while ((match = refPattern.exec(content)) !== null) {
+            const chunkId = match[1];
+            if (!seenChunks.has(chunkId) && citationByChunkId[chunkId]) {
+                seenChunks.add(chunkId);
+                orderedCitations.push(citationByChunkId[chunkId]);
+                citationMap[chunkId] = orderedCitations.length; // 按出现顺序编号
+            }
+        }
+
+        // 替换 [ref:chunk_id] 为可点击的编号
+        processedContent = content.replace(/\[ref:([^\]]+)\]/g, (match, chunkId) => {
+            const num = citationMap[chunkId];
+            if (num) {
+                return `<sup class="citation-ref" data-chunk-id="${chunkId}">[${num}]</sup>`;
+            }
+            return '';
+        });
+    }
+
+    html += `<div class="message-content">${renderMarkdown(processedContent)}</div>`;
 
     // 显示图片
     if (images && images.length > 0) {
         html += '<div class="message-images"><strong>相关图片:</strong><div class="images-grid">';
         images.forEach(img => {
             const caption = img.caption ? `<div class="image-caption">${escapeHtml(img.caption)}</div>` : '';
-            const pageLabel = img.page ? `<span class="image-page">第${img.page}页</span>' : '';
+            const pageLabel = img.page ? `<span class="image-page">第${img.page}页</span>` : '';
             html += `
                 <div class="image-card">
                     <img src="${API_BASE}${img.url}" alt="${img.id}" loading="lazy" onclick="showImageModal('${API_BASE}${img.url}', '${escapeHtml(img.id)}')">
@@ -679,14 +773,96 @@ function formatMessage(content, sources, webSearched, isRag, images) {
         html += '</div></div>';
     }
 
-    // 显示来源
-    if (sources && sources.length > 0) {
-        html += '<div class="message-sources"><strong>来源:</strong> ';
+    // 显示引用列表（按内容中出现顺序，只显示实际被引用的）
+    if (orderedCitations.length > 0) {
+        html += '<div class="message-citations"><strong>引用来源:</strong><ol class="citations-list">';
+        orderedCitations.forEach((c, i) => {
+            const docType = c.doc_type || 'other';
+            let locationInfo = '';
+            let icon = '📄';
+
+            if (docType === 'pdf') {
+                icon = '📕';
+                if (c.page) {
+                    locationInfo = `第${c.page}页`;
+                    if (c.page_end && c.page_end !== c.page) {
+                        locationInfo += `-${c.page_end}页`;
+                    }
+                }
+            } else if (docType === 'word') {
+                icon = '📘';
+                if (c.section_chunk_id) {
+                    locationInfo = `第${c.section_chunk_id}段`;
+                }
+            } else if (docType === 'excel') {
+                icon = '📗';
+                if (c.page) {
+                    locationInfo = `工作表${c.page}`;
+                }
+            }
+
+            // 完整内容（用于展开查看）
+            const fullContent = c.content || c.preview || '';
+            // 截断 preview 到 50 字符（用于默认显示）
+            let preview = c.preview || '';
+            if (preview.length > 50) {
+                preview = preview.substring(0, 50) + '...';
+            }
+
+            html += `<li class="citation-item" data-doc-type="${docType}" data-chunk-id="${c.chunk_id}">`;
+            html += `<span class="citation-source">${icon} ${escapeHtml(c.source || '未知')}</span>`;
+            if (locationInfo) {
+                html += `<span class="citation-location"> (${locationInfo})</span>`;
+            }
+            if (c.section) {
+                html += `<br><span class="citation-section">${escapeHtml(c.section)}</span>`;
+            }
+            // 可展开的内容预览
+            if (fullContent) {
+                const contentId = `citation-content-${Date.now()}-${i}`;
+                html += `<br><div class="citation-content-wrapper">`;
+                html += `<span class="citation-preview collapsed" id="${contentId}">"${escapeHtml(preview)}"</span>`;
+                html += `<div class="citation-full-content" id="${contentId}-full" style="display:none;">"${escapeHtml(fullContent)}"</div>`;
+                html += `<button class="citation-expand-btn" onclick="toggleCitationContent('${contentId}')">展开</button>`;
+                html += `</div>`;
+            }
+            html += '</li>';
+        });
+        html += '</ol></div>';
+    } else if (sources && sources.length > 0) {
+        // 兼容旧格式：显示来源
+        html += '<div class="message-sources"><strong>来源:</strong><br>';
         sources.forEach((s, i) => {
             const level = s.security_level || s.level || '';
             const levelTag = level ? `<span class="security-tag ${level}">${level}</span>` : '';
-            html += `<span class="source-item">${levelTag}${escapeHtml(s.source || s)}</span>`;
-            if (i < sources.length - 1) html += ', ';
+
+            // 解析 source 字符串（可能已包含位置信息）
+            const sourceText = s.source || s;
+            const docType = s.doc_type || 'other';
+            const previews = s.previews || [];
+            const sectionChunkId = s.section_chunk_id;
+
+            html += `<div class="source-item-detailed" data-doc-type="${docType}">`;
+            html += `${levelTag}📄 <strong>${escapeHtml(sourceText)}</strong>`;
+
+            // 根据文档类型差异化展示定位信息
+            if (docType === 'pdf') {
+                // PDF: 页码信息已在 sourceText 中
+            } else if (docType === 'word') {
+                // Word: 显示章节内段落信息
+                if (sectionChunkId) {
+                    html += `<br><span class="location-hint">🔢 段落: 第${sectionChunkId}段（本章节）</span>`;
+                }
+            } else if (docType === 'excel') {
+                // Excel: 工作表信息已在 sourceText 中
+            }
+
+            // 所有文档类型都显示搜索片段（帮助用户定位）
+            if (previews.length > 0) {
+                html += `<br><span class="search-hint">🔍 搜索: "${escapeHtml(previews[0])}"</span>`;
+            }
+
+            html += `</div>`;
         });
         html += '</div>';
     }
@@ -797,7 +973,8 @@ function renderMessages(sessionId) {
             meta.sources || [],
             meta.web_searched || false,
             meta.is_rag || false,
-            meta.images || []
+            meta.images || [],
+            meta.citations || []  // 修复：从会话历史恢复引用信息
         );
     });
 }

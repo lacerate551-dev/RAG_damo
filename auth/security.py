@@ -12,7 +12,33 @@ Prompt 注入防护模块 - 输入验证、查询隔离、输出过滤
 """
 
 import re
+import os
 from typing import Tuple, Optional
+from pathlib import Path
+
+
+# ==================== 违禁词配置 ====================
+
+# 违禁词文件路径
+BANNED_WORDS_FILE = Path(__file__).parent.parent / "config" / "banned_words.txt"
+
+def _load_banned_words() -> list:
+    """从配置文件加载违禁词"""
+    banned_words = []
+    try:
+        if BANNED_WORDS_FILE.exists():
+            with open(BANNED_WORDS_FILE, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    # 跳过空行和注释
+                    if line and not line.startswith('#'):
+                        banned_words.append(line)
+    except Exception as e:
+        print(f"加载违禁词文件失败: {e}")
+    return banned_words
+
+# 加载违禁词列表
+BANNED_WORDS = _load_banned_words()
 
 
 # ==================== 输入验证 ====================
@@ -49,6 +75,11 @@ def validate_query(query: str) -> Tuple[bool, str]:
 
     if len(query) > MAX_QUERY_LENGTH:
         return False, f"查询内容过长（最多{MAX_QUERY_LENGTH}字符）"
+
+    # 检测违禁词
+    for word in BANNED_WORDS:
+        if word in query:
+            return False, "查询包含违禁内容"
 
     # 检测注入模式
     for pattern in INJECTION_PATTERNS:
@@ -93,9 +124,7 @@ def is_safe_response(response: str) -> Tuple[bool, Optional[str]]:
 
 def filter_response(response: str) -> str:
     """
-    过滤 LLM 响应中的敏感信息
-
-    将匹配到的敏感内容替换为 [已过滤]
+    过滤 LLM 响应中的敏感信息（API密钥、密码等）
     """
     filtered = response
 

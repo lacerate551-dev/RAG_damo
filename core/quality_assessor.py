@@ -23,6 +23,7 @@
 from dataclasses import dataclass
 from typing import List, Optional
 from enum import Enum
+from config import RAG_CHAT_MODEL
 
 
 class QualityDimension(Enum):
@@ -80,7 +81,7 @@ class QualityAssessor:
             model: 模型名称
         """
         self.llm_client = llm_client
-        self.model = model or "qwen3.5-flash"
+        self.model = model or RAG_CHAT_MODEL
 
     def assess(self, query: str, documents: List[str],
                metadatas: List[dict] = None) -> QualityAssessment:
@@ -484,10 +485,11 @@ def create_assessor() -> QualityAssessor:
     try:
         from openai import OpenAI
         try:
-            from config import API_KEY, BASE_URL, MODEL
+            from config import API_KEY, BASE_URL, RAG_CHAT_MODEL
+            MODEL = RAG_CHAT_MODEL
         except ImportError:
             from config import API_KEY, BASE_URL
-            MODEL = "qwen3.5-flash"
+            MODEL = "qwen3.5-flash"  # fallback
 
         client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
         return QualityAssessor(llm_client=client, model=MODEL)

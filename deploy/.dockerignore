@@ -1,0 +1,62 @@
+# .dockerignore
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 环境变量
+.env
+.env.*
+!.env.production
+
+# 数据库（不打包到镜像）
+*.db
+*.db-shm
+*.db-wal
+data/
+knowledge/vector_store/
+.data/
+models/
+
+# 日志
+*.log
+logs/
+
+# 文档
+docs/
+*.md
+!README.md
+
+# 测试
+tests/
+test_*.py
+*_test.py
+
+# 临时文件
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+CLAUDE.md
+UPLOAD_CHECKLIST.md

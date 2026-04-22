@@ -29,10 +29,7 @@ from dataclasses import dataclass
 from openai import OpenAI
 
 # 导入配置
-try:
-    from config import API_KEY, BASE_URL, MODEL
-except ImportError:
-    from rag_demo import API_KEY, BASE_URL, MODEL
+from config import API_KEY, BASE_URL, MODEL
 
 # 导入权限管理
 from auth.gateway import get_accessible_collections, normalize_department_name
@@ -517,11 +514,12 @@ class KnowledgeBaseRouter:
             查询向量，失败返回None
         """
         try:
-            # 尝试使用 rag_demo 的 embedding_model
-            from rag_demo import embedding_model
+            # 尝试使用 RAGEngine 的 embedding_model
+            from core.engine import get_engine
+            embedding_model = get_engine().embedding_model
             return embedding_model.encode(query).tolist()
-        except ImportError:
-            pass
+        except Exception as e:
+            logger.debug(f"无法从 RAGEngine 获取向量模型: {e}")
 
         try:
             # 尝试使用 sentence-transformers

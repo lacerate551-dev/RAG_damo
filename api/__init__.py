@@ -31,24 +31,38 @@ def create_app():
     """
     from flask import Flask
     from flask_cors import CORS
+    from config import ENABLE_SESSION, ENABLE_FEEDBACK, IS_PROD
 
     app = Flask(__name__)
     CORS(app)
+
+    # ==================== Repository 依赖注入 ====================
+
+    # 会话存储：开发环境用SQLite，生产环境无状态
+    if ENABLE_SESSION:
+        from repositories.sqlite_session_repo import SQLiteSessionRepo
+        app.session_repo = SQLiteSessionRepo()
+        print("[INFO] 会话存储: SQLite (开发环境)")
+    else:
+        from repositories.stateless_session_repo import StatelessSessionRepo
+        app.session_repo = StatelessSessionRepo()
+        print("[INFO] 会话存储: 无状态 (生产环境)")
 
     # ==================== 核心服务初始化 ====================
 
     # Agentic RAG 引擎
     try:
         from core.agentic import AgenticRAG
+        from config import ENABLE_WEB_SEARCH, ENABLE_GRAPH_RAG
         agentic_rag = AgenticRAG(
-            enable_web_search=False,  # 关闭网络搜索
-            enable_graph=False        # 关闭图谱检索
+            enable_web_search=ENABLE_WEB_SEARCH,
+            enable_graph=ENABLE_GRAPH_RAG
         )
         app.config['AGENTIC_RAG'] = agentic_rag
-        print("✓ Agentic RAG 引擎已初始化（仅知识库模式）")
+        print(f"[INFO] Agentic RAG 引擎已初始化（网络搜索={'启用' if ENABLE_WEB_SEARCH else '关闭'}，图谱检索={'启用' if ENABLE_GRAPH_RAG else '关闭'}）")
     except Exception as e:
         app.config['AGENTIC_RAG'] = None
-        print(f"✗ Agentic RAG 初始化失败: {e}")
+        print(f"[WARN] Agentic RAG 初始化失败: {e}")
 
     # 同步服务
     try:
@@ -56,20 +70,21 @@ def create_app():
         from config import DOCUMENTS_PATH
         sync_service = KnowledgeSyncService(documents_path=DOCUMENTS_PATH)
         app.config['SYNC_SERVICE'] = sync_service
-        print("✓ 知识库同步服务已初始化")
+        print("[INFO] 知识库同步服务已初始化")
     except Exception as e:
         app.config['SYNC_SERVICE'] = None
-        print(f"✗ 知识库同步服务未启用: {e}")
+        print(f"[WARN] 知识库同步服务未启用: {e}")
 
-    # 会话管理器
-    try:
-        from services.session import SessionManager
-        session_manager = SessionManager()
-        app.config['SESSION_MANAGER'] = session_manager
-        print("✓ 会话管理器已初始化")
-    except Exception as e:
-        app.config['SESSION_MANAGER'] = None
-        print(f"✗ 会话管理器初始化失败: {e}")
+    # 会话管理器（仅开发环境）
+    if ENABLE_SESSION:
+        try:
+            from services.session import SessionManager
+            session_manager = SessionManager()
+            app.config['SESSION_MANAGER'] = session_manager
+            print("[INFO] 会话管理器已初始化")
+        except Exception as e:
+            app.config['SESSION_MANAGER'] = None
+            print(f"[WARN] 会话管理器初始化失败: {e}")
 
     # ==================== 注册 Blueprint ====================
 
@@ -92,37 +107,44 @@ def create_app():
     from api.auth_routes import auth_bp
     app.register_blueprint(auth_bp)
 
-    # 会话管理
-    try:
-        from api.session_routes import session_bp
-        app.register_blueprint(session_bp)
-        print("✓ 会话管理 API 已启用")
-    except ImportError as e:
-        print(f"提示: 会话管理 API 未加载: {e}")
+    # 会话管理（仅开发环境）
+    if ENABLE_SESSION:
+        try:
+            from api.session_routes import session_bp
+            app.register_blueprint(session_bp)
+            print("[INFO] 会话管理 API 已启用")
+        except ImportError as e:
+            print(f"[INFO] 会话管理 API 未加载: {e}")
 
-    # 反馈系统
-    try:
-        from api.feedback_routes import feedback_bp
-        app.register_blueprint(feedback_bp)
-        print("✓ 反馈系统 API 已启用")
-    except ImportError as e:
-        print(f"提示: 反馈系统 API 未加载: {e}")
+    # 反馈系统（开发和生产环境都启用）
+    if ENABLE_FEEDBACK:
+        try:
+            from api.feedback_routes import feedback_bp
+            app.register_blueprint(feedback_bp)
+            print("[INFO] 反馈系统 API 已启用")
+        except ImportError as e:
+            print(f"[INFO] 反馈系统 API 未加载: {e}")
 
-    # 图谱服务（可选）
-    try:
-        from api.graph_routes import graph_bp
-        app.register_blueprint(graph_bp)
-        print("✓ 知识图谱 API 已启用")
-    except ImportError as e:
-        print(f"提示: 知识图谱 API 未加载: {e}")
+    # 图谱服务（跳过，不使用）
+    # try:
+    #     from api.graph_routes import graph_bp
+    #     app.register_blueprint(graph_bp)
+    #     print("✓ 知识图谱 API 已启用")
+    # except ImportError as e:
+    #     print(f"提示: 知识图谱 API 未加载: {e}")
 
     # 出题系统（可选）
     try:
         from exam_pkg.api import exam_bp
         app.register_blueprint(exam_bp, url_prefix='/exam')
-        print("✓ 出题系统 API 已启用: /exam")
+        print("[INFO] 出题系统 API 已启用: /exam")
     except ImportError as e:
-        print(f"提示: 出题系统 API 未加载: {e}")
+        print(f"[INFO] 出题系统 API 未加载: {e}")
+
+    # ==================== 生产环境启动校验 ====================
+
+    if IS_PROD:
+        _validate_production_config()
 
     # ==================== 启动信息 ====================
 
@@ -131,11 +153,19 @@ def create_app():
     return app
 
 
+def _validate_production_config():
+    """生产环境启动前检查"""
+    import os
+    assert os.getenv("DASHSCOPE_API_KEY") or os.environ.get("DASHSCOPE_API_KEY"), \
+        "Missing DASHSCOPE_API_KEY in production environment"
+    print("[PROD] Configuration validated")
+
+
 def _print_startup_info(app):
     """打印启动信息摘要"""
     route_count = len([rule for rule in app.url_map.iter_rules() if rule.endpoint != 'static'])
 
-    print(f"\n✓ 应用初始化完成，共注册 {route_count} 个路由")
+    print(f"\n[INFO] 应用初始化完成，共注册 {route_count} 个路由")
     print("  问答接口: /chat, /rag, /rag/stream, /search")
     print("  向量库:   /collections, /collections/<name>")
     print("  文档管理: /documents/upload, /documents/list, /documents/*")

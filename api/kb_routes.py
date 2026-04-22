@@ -310,3 +310,126 @@ def test_routing():
             "reason": intent.reason
         }
     })
+
+
+# ==================== 文档版本管理 API ====================
+
+@kb_bp.route('/collections/<kb_name>/documents/<path:filename>/deprecate', methods=['POST'])
+@require_gateway_auth
+def deprecate_document(kb_name, filename):
+    """
+    废止文档（软删除）
+
+    请求体:
+    {
+        "reason": "废止原因"
+    }
+
+    返回:
+    {
+        "success": true,
+        "deprecated_chunks": 15,
+        "document_id": "报销制度.pdf",
+        "collection": "public_kb",
+        "deprecated_date": "2024-01-20T15:00:00"
+    }
+    """
+    kb_manager, _, err = _require_multi_kb()
+    if err:
+        return err
+
+    user = request.current_user
+    data = request.json or {}
+    reason = data.get('reason', '文档已废止')
+
+    try:
+        result = kb_manager.deprecate_document(
+            kb_name,
+            filename,
+            reason,
+            deprecated_by=user.get('user_id', 'unknown')
+        )
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@kb_bp.route('/collections/<kb_name>/documents/<path:filename>/restore', methods=['POST'])
+@require_gateway_auth
+def restore_document(kb_name, filename):
+    """
+    恢复已废止的文档
+
+    返回:
+    {
+        "success": true,
+        "restored_chunks": 15,
+        "document_id": "报销制度.pdf",
+        "collection": "public_kb"
+    }
+    """
+    kb_manager, _, err = _require_multi_kb()
+    if err:
+        return err
+
+    try:
+        result = kb_manager.restore_document(kb_name, filename)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@kb_bp.route('/collections/<kb_name>/documents/<path:filename>/versions', methods=['GET'])
+@require_gateway_auth
+def get_document_versions(kb_name, filename):
+    """
+    获取文档版本历史
+
+    查询参数:
+    - limit: 返回数量限制（默认10）
+
+    返回:
+    {
+        "success": true,
+        "document_id": "报销制度.pdf",
+        "collection": "public_kb",
+        "versions": [
+            {
+                "version": "v2",
+                "status": "active",
+                "created_at": "2024-01-15T10:00:00",
+                "chunk_count": 20
+            },
+            {
+                "version": "v1",
+                "status": "superseded",
+                "created_at": "2023-01-01T10:00:00",
+                "chunk_count": 15
+            }
+        ],
+        "total": 2
+    }
+    """
+    _, _, err = _require_multi_kb()
+    if err:
+        return err
+
+    limit = request.args.get('limit', 10, type=int)
+
+    try:
+        from knowledge.document_versions import get_version_query
+        version_query = get_version_query()
+
+        versions = version_query.get_document_history(kb_name, filename, limit)
+        versions_data = [v.to_dict() for v in versions]
+
+        return jsonify({
+            "success": True,
+            "document_id": filename,
+            "collection": kb_name,
+            "versions": versions_data,
+            "total": len(versions_data)
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+

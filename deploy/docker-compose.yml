@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  rag-service:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: rag-service
+    ports:
+      - "5001:5001"
+    volumes:
+      - ../knowledge/vector_store:/app/knowledge/vector_store  # 向量索引（必须）
+      - ../.data:/app/.data                    # 上传文件
+      - ../documents:/app/documents            # 源文档
+      - ../models:/app/models                  # 嵌入模型
+      # 生产环境不挂载 data/ 目录（不使用SQLite）
+    environment:
+      - APP_ENV=prod
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - DASHSCOPE_MODEL=${DASHSCOPE_MODEL:-qwen3.5-plus}
+      - USE_GRAPH_RAG=false
+    restart: unless-stopped
+    # 资源限制：Embedding模型加载需要较多内存
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5001/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s  # 给启动留出时间

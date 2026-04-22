@@ -32,6 +32,13 @@ import logging
 
 from data.db import get_connection, init_databases
 
+# 缓存支持
+try:
+    from core.cache import get_cache_manager
+    CACHE_AVAILABLE = True
+except ImportError:
+    CACHE_AVAILABLE = False
+
 # 设置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -538,7 +545,11 @@ class KnowledgeSyncService:
                 chunks_added = kb_manager.add_file_to_kb(
                     kb_name=kb_name,
                     filepath=file_path,
-                    extra_metadata={'status': 'active', 'version': 'v1'}
+                    extra_metadata={
+                        'status': 'active',
+                        'version': 'v1',
+                        'change_time': datetime.now().isoformat()
+                    }
                 )
                 # 更新哈希记录
                 self.db.set_document_hash(
@@ -548,17 +559,58 @@ class KnowledgeSyncService:
                     os.path.getsize(file_path) if os.path.exists(file_path) else 0,
                     datetime.now()
                 )
+
+                # 创建版本记录
+                try:
+                    from knowledge.document_versions import get_version_query
+                    version_query = get_version_query()
+                    version_query.create_version_record(
+                        collection=kb_name,
+                        document_id=change.document_name,
+                        version="v1",
+                        status="active",
+                        change_summary="新增文档",
+                        created_by="sync_service",
+                        chunk_count=chunks_added
+                    )
+                except Exception as e:
+                    logger.warning(f"创建版本记录失败: {e}")
+
                 logger.info(f"已添加文档到 {kb_name}: {change.document_id}, 片段数: {chunks_added}")
 
             elif change.change_type == ChangeType.MODIFIED:
-                # 修改文档：先删除旧索引，再添加新索引
-                deleted = kb_manager.delete_document(kb_name, change.document_name)
+                # 修改文档：使用版本管理策略
+                # 1. 获取当前版本号
+                old_version = self._get_current_version(kb_name, change.document_name)
+
+                # 2. 标记旧版本为 superseded（如果存在）
+                if old_version:
+                    try:
+                        kb_manager.mark_document_as_superseded(
+                            kb_name,
+                            change.document_name,
+                            reason="文档更新"
+                        )
+                        logger.info(f"标记旧版本为 superseded: {change.document_name} {old_version}")
+                    except Exception as e:
+                        logger.warning(f"标记旧版本失败: {e}")
+
+                # 3. 生成新版本号
+                new_version = self._generate_version_id(kb_name, change.document_name)
+
+                # 4. 添加新版本
                 chunks_added = kb_manager.add_file_to_kb(
                     kb_name=kb_name,
                     filepath=file_path,
-                    extra_metadata={'status': 'active', 'version': 'v1'}
+                    extra_metadata={
+                        'status': 'active',
+                        'version': new_version,
+                        'previous_version': old_version or '',
+                        'change_time': datetime.now().isoformat()
+                    }
                 )
-                # 更新哈希记录
+
+                # 5. 更新哈希记录
                 self.db.set_document_hash(
                     change.document_id,
                     change.document_name,
@@ -566,7 +618,18 @@ class KnowledgeSyncService:
                     os.path.getsize(file_path) if os.path.exists(file_path) else 0,
                     datetime.now()
                 )
-                logger.info(f"已更新文档: {change.document_id}, 删除 {deleted} 片段, 添加 {chunks_added} 片段")
+
+                # 6. 记录版本变更
+                if old_version:
+                    self._record_version_change(
+                        kb_name,
+                        change.document_name,
+                        old_version,
+                        new_version,
+                        "文档更新"
+                    )
+
+                logger.info(f"已更新文档: {change.document_id}, 版本: {old_version} → {new_version}, 添加 {chunks_added} 片段")
 
             elif change.change_type == ChangeType.DELETED:
                 # 删除文档
@@ -574,6 +637,16 @@ class KnowledgeSyncService:
                 # 删除哈希记录
                 self.db.delete_document_hash(change.document_id)
                 logger.info(f"已删除文档: {change.document_id}, 删除 {deleted} 片段")
+
+            # ==================== 缓存失效 ====================
+            # 文档变更后递增知识库版本号，使旧缓存自动失效
+            if CACHE_AVAILABLE:
+                try:
+                    cache = get_cache_manager()
+                    cache.increment_kb_version(kb_name)
+                    logger.debug(f"已递增知识库版本号: {kb_name}")
+                except Exception as e:
+                    logger.warning(f"递增缓存版本号失败: {e}")
 
             return True
 
@@ -605,6 +678,83 @@ class KnowledgeSyncService:
             return 'public_kb'
         else:
             return f'dept_{subdir}'
+
+    def _get_current_version(self, kb_name: str, filename: str) -> str:
+        """
+        获取文档当前版本号
+
+        Args:
+            kb_name: 知识库名称
+            filename: 文件名
+
+        Returns:
+            当前版本号，如 "v1", "v2"，不存在则返回 None
+        """
+        try:
+            from knowledge.document_versions import get_version_query
+            version_query = get_version_query()
+            active_version = version_query.get_active_version(kb_name, filename)
+            return active_version.version if active_version else None
+        except Exception as e:
+            logger.warning(f"获取当前版本失败: {e}")
+            return None
+
+    def _generate_version_id(self, kb_name: str, filename: str) -> str:
+        """
+        生成新版本号
+
+        Args:
+            kb_name: 知识库名称
+            filename: 文件名
+
+        Returns:
+            新版本号，如 "v1", "v2", "v3"
+        """
+        current_version = self._get_current_version(kb_name, filename)
+        if not current_version:
+            return "v1"
+
+        # 从 "v1" 提取数字并递增
+        try:
+            version_num = int(current_version.replace('v', ''))
+            return f"v{version_num + 1}"
+        except:
+            return "v1"
+
+    def _record_version_change(
+        self,
+        kb_name: str,
+        filename: str,
+        old_version: str,
+        new_version: str,
+        reason: str
+    ):
+        """
+        记录版本变更到数据库
+
+        Args:
+            kb_name: 知识库名称
+            filename: 文件名
+            old_version: 旧版本号
+            new_version: 新版本号
+            reason: 变更原因
+        """
+        try:
+            from knowledge.document_versions import get_version_query
+            version_query = get_version_query()
+            version_query.log_version_change(
+                collection=kb_name,
+                document_id=filename,
+                change_type="update",
+                old_version=old_version,
+                new_version=new_version,
+                old_status="active",
+                new_status="active",
+                reason=reason,
+                changed_by="sync_service"
+            )
+        except Exception as e:
+            logger.warning(f"记录版本变更失败: {e}")
 
     def sync_now(self) -> SyncResult:
         """立即执行同步"""

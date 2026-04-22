@@ -15,6 +15,13 @@ from openai import OpenAI
 
 from parsers import MINERU_AVAILABLE, PANDAS_AVAILABLE
 
+# 缓存支持（延迟导入避免循环依赖）
+try:
+    from core.cache import get_cache_manager, RAGCacheManager
+    CACHE_AVAILABLE = True
+except ImportError:
+    CACHE_AVAILABLE = False
+
 # 延迟导入，防止循环依赖
 _engine_instance = None
 
@@ -25,10 +32,55 @@ try:
         CHROMA_DB_PATH, DOCUMENTS_PATH, BM25_INDEXES_PATH,
         USE_MULTI_KB, USE_HYBRID_SEARCH, VECTOR_WEIGHT, BM25_WEIGHT,
         USE_RERANK, RERANK_CANDIDATES, RERANK_TOP_K,
-        CHUNK_SIZE, CHUNK_OVERLAP
+        CHUNK_SIZE, CHUNK_OVERLAP,
+        # 设备配置
+        EMBEDDING_DEVICE, RERANK_DEVICE,
+        # 自适应 TopK 配置
+        ADAPTIVE_TOPK_ENABLED, ADAPTIVE_LOW_CONFIDENCE, ADAPTIVE_HIGH_CONFIDENCE,
+        ADAPTIVE_EXPAND_RATIO, ADAPTIVE_SHRINK_RATIO, ADAPTIVE_MIN_TOPK, ADAPTIVE_MAX_TOPK,
+        # 切片配置
+        MIN_CHUNK_SIZE, MAX_CHUNK_SIZE, SECTION_FILTER_ENABLED
     )
 except ImportError:
-    pass
+    # 默认值
+    ADAPTIVE_TOPK_ENABLED = True
+    ADAPTIVE_LOW_CONFIDENCE = 0.5
+    ADAPTIVE_HIGH_CONFIDENCE = 0.8
+    ADAPTIVE_EXPAND_RATIO = 2.0
+    ADAPTIVE_SHRINK_RATIO = 0.5
+    ADAPTIVE_MIN_TOPK = 3
+    ADAPTIVE_MAX_TOPK = 20
+    MIN_CHUNK_SIZE = 200
+    MAX_CHUNK_SIZE = 1200
+    SECTION_FILTER_ENABLED = True
+    EMBEDDING_DEVICE = "auto"
+    RERANK_DEVICE = "auto"
+
+
+def _get_device(device_config: str) -> str:
+    """
+    解析设备配置
+
+    Args:
+        device_config: 设备配置 ("auto", "cuda", "cpu", "cuda:0" 等)
+
+    Returns:
+        实际设备字符串
+    """
+    if device_config == "auto":
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device = "cuda"
+                print(f"[INFO] 检测到GPU: {torch.cuda.get_device_name(0)}")
+                return device
+            else:
+                print("[INFO] 未检测到GPU，使用CPU")
+                return "cpu"
+        except ImportError:
+            print("[INFO] PyTorch未安装，使用CPU")
+            return "cpu"
+    return device_config
 
 from core.bm25_index import BM25Index
 
@@ -57,6 +109,9 @@ class RAGEngine:
         self.kb_manager = None
         self.kb_router = None
 
+        # 自适应 TopK 策略
+        self._adaptive_topk = None
+
         self._initialized = False
 
     def initialize(self):
@@ -73,8 +128,9 @@ class RAGEngine:
 
         # 1. 向量模型
         if os.path.exists(EMBEDDING_MODEL_PATH):
-            self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_PATH)
-            print(f"[OK] 向量模型加载完成: {EMBEDDING_MODEL_PATH}")
+            device = _get_device(EMBEDDING_DEVICE)
+            self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_PATH, device=device)
+            print(f"[OK] 向量模型加载完成: {EMBEDDING_MODEL_PATH} (设备: {device})")
         else:
             raise RuntimeError(f"向量模型未找到: {EMBEDDING_MODEL_PATH}")
 
@@ -108,8 +164,9 @@ class RAGEngine:
         # 5. Reranker 模型
         if USE_RERANK:
             if os.path.exists(RERANK_MODEL_PATH):
-                self.reranker = CrossEncoder(RERANK_MODEL_PATH)
-                print(f"[OK] Rerank模型加载完成: {RERANK_MODEL_PATH}")
+                device = _get_device(RERANK_DEVICE)
+                self.reranker = CrossEncoder(RERANK_MODEL_PATH, device=device)
+                print(f"[OK] Rerank模型加载完成: {RERANK_MODEL_PATH} (设备: {device})")
             else:
                 try:
                     os.makedirs(RERANK_MODEL_PATH, exist_ok=True)
@@ -118,11 +175,24 @@ class RAGEngine:
                     tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-reranker-base")
                     model.save_pretrained(RERANK_MODEL_PATH)
                     tokenizer.save_pretrained(RERANK_MODEL_PATH)
-                    self.reranker = CrossEncoder(RERANK_MODEL_PATH)
-                    print(f"[OK] Rerank模型下载完成: {RERANK_MODEL_PATH}")
                 except Exception as e:
                     print(f"[FAIL] Rerank模型加载失败: {e}")
                     USE_RERANK = False
+
+        # 6. 自适应 TopK 策略
+        if ADAPTIVE_TOPK_ENABLED:
+            from core.adaptive_topk import AdaptiveConfig, AdaptiveTopK
+            config = AdaptiveConfig(
+                enabled=ADAPTIVE_TOPK_ENABLED,
+                low_confidence_threshold=ADAPTIVE_LOW_CONFIDENCE,
+                high_confidence_threshold=ADAPTIVE_HIGH_CONFIDENCE,
+                expand_ratio=ADAPTIVE_EXPAND_RATIO,
+                shrink_ratio=ADAPTIVE_SHRINK_RATIO,
+                min_top_k=ADAPTIVE_MIN_TOPK,
+                max_top_k=ADAPTIVE_MAX_TOPK
+            )
+            self._adaptive_topk = AdaptiveTopK(config)
+            print(f"[OK] 自适应TopK已启用 (低={ADAPTIVE_LOW_CONFIDENCE}, 高={ADAPTIVE_HIGH_CONFIDENCE})")
 
         self._initialized = True
 
@@ -135,7 +205,7 @@ class RAGEngine:
         Args:
             query: 查询文本
             top_k: 返回结果数量
-            allowed_levels: 允许访问的安全级别列表
+            allowed_levels: 兏许访问的安全级别列表
             role: 用户角色（多向量库模式）
             department: 用户部门（多向量库模式）
             collections: 指定查询的向量库列表
@@ -144,8 +214,36 @@ class RAGEngine:
         if not self._initialized:
             self.initialize()
 
+        # ==================== 查询缓存检查 ====================
+        cache_enabled = False
+        if CACHE_AVAILABLE:
+            try:
+                from config import QUERY_CACHE_ENABLED
+                cache_enabled = QUERY_CACHE_ENABLED
+            except ImportError:
+                cache_enabled = True  # 默认启用
+
+            if cache_enabled:
+                cache = get_cache_manager()
+                # 确定缓存键的知识库名称
+                kb_name = "public_kb"
+                if USE_MULTI_KB and collections:
+                    kb_name = collections[0] if len(collections) == 1 else "multi"
+
+                cached_result = cache.get_query_result(query, kb_name)
+                if cached_result is not None:
+                    # 缓存命中，直接返回
+                    return cached_result
+
         if USE_MULTI_KB and self.kb_manager:
-            return self._search_multi_kb(query, top_k, role, department, collections, source_filter=source_filter)
+            result = self._search_multi_kb(query, top_k, role, department, collections, source_filter=source_filter)
+            # 缓存多知识库结果
+            if cache_enabled and result.get('ids') and result['ids'][0]:
+                top_dist = result['distances'][0][0] if result.get('distances') and result['distances'][0] else 1.0
+                top_score = 1.0 - top_dist
+                if top_score >= 0.3:
+                    cache.set_query_result(query, kb_name, result)
+            return result
 
         # 构建 where 条件（支持多个过滤条件组合）
         conditions = []
@@ -162,6 +260,7 @@ class RAGEngine:
 
         query_vector = self.embedding_model.encode(query).tolist()
         recall_k = RERANK_CANDIDATES if (USE_RERANK or USE_HYBRID_SEARCH) else top_k
+        recall_k = max(recall_k, top_k * 3)  # 确保有足够的候选
 
         query_kwargs = {
             "query_embeddings": [query_vector],
@@ -195,6 +294,12 @@ class RAGEngine:
         else:
             fused_results = results_list[0]
 
+        # 过滤废止切片
+        fused_results = self._filter_deprecated_chunks(fused_results)
+
+        # 章节过滤（如果查询中提到了章节）
+        fused_results = self._filter_by_section(fused_results, query)
+
         if USE_RERANK and self.reranker:
             fused_results = self.rerank_results(query, fused_results, top_k)
         else:
@@ -205,6 +310,22 @@ class RAGEngine:
 
         # 时间衰减（Time Decay）
         fused_results = self._apply_time_decay(fused_results)
+
+        # 自适应 TopK：根据置信度调整返回数量
+        if self._adaptive_topk and fused_results.get('distances') and fused_results['distances'][0]:
+            top_score = 1.0 - fused_results['distances'][0][0]  # 距离转相似度
+            adjusted_k, should_retrieve, reason = self._adaptive_topk.adjust(top_score, top_k)
+            if "high_confidence" in reason:
+                # 高置信度时截断结果
+                fused_results = self._truncate_results(fused_results, adjusted_k)
+
+        # ==================== 缓存结果 ====================
+        if cache_enabled and fused_results.get('ids') and fused_results['ids'][0]:
+            # 只缓存有结果且置信度较高的查询
+            top_dist = fused_results['distances'][0][0] if fused_results.get('distances') and fused_results['distances'][0] else 1.0
+            top_score = 1.0 - top_dist  # 距离转相似度
+            if top_score >= 0.3:  # 置信度阈值
+                cache.set_query_result(query, kb_name, fused_results)
 
         return fused_results
 
@@ -417,12 +538,9 @@ class RAGEngine:
             return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
 
         query_vector = self.embedding_model.encode(query).tolist()
+        # 扩大召回数量，以便过滤废止切片后仍有足够结果
         recall_k = RERANK_CANDIDATES if (USE_RERANK or USE_HYBRID_SEARCH) else top_k
-
-        # 构建 where 过滤条件
-        where_filter = None
-        if source_filter:
-            where_filter = {"source": source_filter}
+        recall_k = max(recall_k, top_k * 3)  # 确保有足够的候选
 
         all_results = []
         for coll_name in target_collections:
@@ -430,13 +548,14 @@ class RAGEngine:
                 coll = self.kb_manager.get_collection(coll_name)
                 if not coll: continue
 
-                # 使用 where 过滤
+                # 构建 where 过滤条件（排除废止切片）
+                # ChromaDB 不支持 != 操作，需要在查询后过滤
                 query_kwargs = {
                     "query_embeddings": [query_vector],
                     "n_results": recall_k
                 }
-                if where_filter:
-                    query_kwargs["where"] = where_filter
+                if source_filter:
+                    query_kwargs["where"] = {"source": source_filter}
 
                 results = coll.query(**query_kwargs)
                 if results['metadatas'] and results['metadatas'][0]:
@@ -459,6 +578,13 @@ class RAGEngine:
                     except Exception: pass
             except Exception: continue
 
+        # ========== FAQ 检索 ==========
+        faq_results = self._search_faq_collection(query_vector, top_k=3)
+        if faq_results and faq_results.get('ids') and faq_results['ids'][0]:
+            for meta in faq_results['metadatas'][0]:
+                meta['_collection'] = 'faq_kb'
+            all_results.append(faq_results)
+
         if not all_results:
             return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
 
@@ -468,12 +594,140 @@ class RAGEngine:
             weights = [VECTOR_WEIGHT if i % 2 == 0 else BM25_WEIGHT for i in range(len(all_results))]
             fused_results = self.reciprocal_rank_fusion(all_results, weights)
 
+        # 过滤废止切片（status != "active" 或 status == "deprecated"）
+        fused_results = self._filter_deprecated_chunks(fused_results)
+
+        # 章节过滤（如果查询中提到了章节）
+        fused_results = self._filter_by_section(fused_results, query)
+
         if USE_RERANK and self.reranker:
             fused_results = self.rerank_results(query, fused_results, top_k)
         else:
             fused_results = self._truncate_results(fused_results, top_k)
 
+        # FAQ 分数加权
+        fused_results = self._boost_faq_chunks(fused_results)
+
+        # 时间衰减
+        fused_results = self._apply_time_decay(fused_results)
+
+        # 自适应 TopK：根据置信度调整返回数量
+        if self._adaptive_topk and fused_results.get('distances') and fused_results['distances'][0]:
+            top_score = 1.0 - fused_results['distances'][0][0]  # 距离转相似度
+            adjusted_k, should_retrieve, reason = self._adaptive_topk.adjust(top_score, top_k)
+            if "high_confidence" in reason:
+                # 高置信度时截断结果
+                fused_results = self._truncate_results(fused_results, adjusted_k)
+
         return fused_results
+
+    def _filter_deprecated_chunks(self, results: dict) -> dict:
+        """
+        过滤废止切片，只保留 active 状态的切片
+
+        Args:
+            results: 检索结果
+
+        Returns:
+            过滤后的结果
+        """
+        if not results['metadatas'] or not results['metadatas'][0]:
+            return results
+
+        filtered_ids = []
+        filtered_docs = []
+        filtered_metas = []
+        filtered_distances = []
+
+        for i, (doc_id, doc, meta, dist) in enumerate(zip(
+            results['ids'][0],
+            results['documents'][0],
+            results['metadatas'][0],
+            results['distances'][0] if results['distances'] else [0] * len(results['ids'][0])
+        )):
+            # 只保留 active 状态的切片（未标记或标记为 active）
+            status = meta.get('status', 'active')
+            if status == 'active':
+                filtered_ids.append(doc_id)
+                filtered_docs.append(doc)
+                filtered_metas.append(meta)
+                filtered_distances.append(dist)
+
+        return {
+            'ids': [filtered_ids],
+            'documents': [filtered_docs],
+            'metadatas': [filtered_metas],
+            'distances': [filtered_distances]
+        }
+
+    def _filter_by_section(self, results: dict, query: str) -> dict:
+        """
+        根据查询中的章节信息过滤结果
+
+        如果查询中明确提到了章节（如"第一章"、"一、"），则优先返回该章节的切片。
+
+        Args:
+            results: 检索结果
+            query: 用户查询
+
+        Returns:
+            过滤后的结果
+        """
+        if not SECTION_FILTER_ENABLED:
+            return results
+
+        if not results['metadatas'] or not results['metadatas'][0]:
+            return results
+
+        # 从查询中提取章节关键词
+        import re
+        section_patterns = [
+            r'第[一二三四五六七八九十\d]+章',
+            r'第\s*\d+\s*章',
+            r'[一二三四五六七八九十]+、',
+        ]
+
+        mentioned_sections = []
+        for pattern in section_patterns:
+            matches = re.findall(pattern, query)
+            mentioned_sections.extend(matches)
+
+        if not mentioned_sections:
+            return results
+
+        # 过滤切片
+        filtered_ids = []
+        filtered_docs = []
+        filtered_metas = []
+        filtered_distances = []
+
+        for i, (doc_id, doc, meta, dist) in enumerate(zip(
+            results['ids'][0],
+            results['documents'][0],
+            results['metadatas'][0],
+            results['distances'][0] if results['distances'] else [0] * len(results['ids'][0])
+        )):
+            section = meta.get('section', meta.get('section_path', ''))
+
+            # 检查是否匹配任一章节
+            for section_kw in mentioned_sections:
+                if section_kw in section or section_kw in doc:
+                    filtered_ids.append(doc_id)
+                    filtered_docs.append(doc)
+                    filtered_metas.append(meta)
+                    filtered_distances.append(dist)
+                    break
+
+        # 如果过滤后结果为空，返回原始结果
+        if not filtered_ids:
+            return results
+
+        return {
+            'ids': [filtered_ids],
+            'documents': [filtered_docs],
+            'metadatas': [filtered_metas],
+            'distances': [filtered_distances]
+        }
 
     # ---------------- 底层融合辅助算法 ----------------
 

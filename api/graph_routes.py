@@ -97,7 +97,7 @@ def build_graph():
         }), 400
 
     try:
-        from rag_demo import rebuild_knowledge_graph
+        from graph.graph_rag import rebuild_knowledge_graph
 
         success = rebuild_knowledge_graph(verbose=True)
 

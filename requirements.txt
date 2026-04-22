@@ -1,37 +1,47 @@
-# RAG Demo 依赖库
+# RAG 服务依赖库
 # 安装命令: pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 核心依赖
-chromadb>=0.4.0
-sentence-transformers>=2.2.0
-openai>=1.0.0
+# ==================== 核心依赖 ====================
+chromadb>=0.4.0                    # 向量数据库
+sentence-transformers>=2.2.0       # 向量嵌入模型
+openai>=1.0.0                      # LLM API 客户端
+numpy>=1.24.0                      # 数值计算
 
-# 文档解析
-pdfplumber>=0.10.0
-python-docx>=0.8.11
-openpyxl>=3.1.0
-docx2txt>=0.8
-opendataloader-pdf>=2.2.0
+# ==================== Web 服务 ====================
+flask>=2.0.0                       # Web 框架
+flask-cors>=4.0.0                  # CORS 支持
+werkzeug>=2.0.0                    # WSGI 工具
+python-dotenv>=1.0.0               # 环境变量管理
 
-# Web服务
-flask>=2.0.0
-flask-cors>=4.0.0
-PyJWT>=2.8.0
-python-dotenv>=1.0.0
+# ==================== 检索相关 ====================
+rank-bm25>=0.2.2                   # BM25 关键词检索
+jieba>=0.42.1                      # 中文分词
 
-# 检索相关
-rank-bm25>=0.2.2
-jieba>=0.42.1
+# ==================== 文档解析 ====================
+# PDF 解析 - MinerU (主要)
+# 注意: MinerU 依赖较大，需单独安装: pip install magic-pdf[full]
 
-# 文件监控
-watchdog>=3.0.0
+# Excel 解析
+pandas>=2.0.0                      # 数据处理
+openpyxl>=3.1.0                    # Excel 文件读取
 
-# 其他
-requests>=2.28.0
-transformers>=4.30.0
-numpy>=1.24.0
+# Word/PDF 备用解析（可选）
+pdfplumber>=0.10.0                 # PDF 解析（outline 服务备用）
+python-docx>=0.8.11                # Word 解析（outline 服务备用）
 
-# Graph RAG 相关
-neo4j>=5.0.0
-langchain-community>=0.3.0
-langchain-experimental>=0.3.0
+# ==================== 文本分块 ====================
+langchain-text-splitters>=0.3.0    # 语义分块器
+
+# ==================== 文件监控（可选） ====================
+watchdog>=3.0.0                    # 文件变更监控（sync 服务）
+
+# ==================== 图谱功能（可选） ====================
+# Neo4j 图数据库 - 仅启用图谱功能时需要
+# neo4j>=5.0.0
+
+# ==================== HTTP 请求 ====================
+requests>=2.28.0                   # HTTP 客户端
+
+# ==================== 生产部署（可选） ====================
+gunicorn>=21.0.0                   # WSGI 服务器（Linux/Mac）
+# uvicorn>=0.24.0                  # ASGI 服务器（异步场景）

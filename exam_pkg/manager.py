@@ -53,10 +53,11 @@ except ImportError:
 
 # 导入配置
 try:
-    from config import DIFY_API_URL, DIFY_QUESTION_API_KEY, DIFY_GRADE_API_KEY
+    from config import DIFY_API_URL, DIFY_QUESTION_API_KEY, DIFY_GRADE_API_KEY, ENABLE_DIFY_WORKFLOW
 except ImportError:
     print("错误: 请创建config.py文件并配置API密钥")
     print("参考config.example.py")
+    ENABLE_DIFY_WORKFLOW = False
     DIFY_API_URL = "https://api.dify.ai/v1"
     DIFY_QUESTION_API_KEY = ""
     DIFY_GRADE_API_KEY = ""

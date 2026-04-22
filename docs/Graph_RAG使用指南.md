@@ -72,7 +72,7 @@ USE_GRAPH_RAG = True  # 启用图谱检索
 ### 2. 构建向量索引
 
 ```bash
-python rag_demo.py --rebuild
+python scripts/rebuild_multi_kb.py
 ```
 
 ### 3. 构建知识图谱
