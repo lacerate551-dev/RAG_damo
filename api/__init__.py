@@ -29,11 +29,14 @@ def create_app():
 
     创建并配置 Flask 应用，注册所有 Blueprint。
     """
-    from flask import Flask
+    from flask import Flask, send_from_directory
     from flask_cors import CORS
     from config import ENABLE_SESSION, ENABLE_FEEDBACK, IS_PROD
 
-    app = Flask(__name__)
+    # 静态文件目录（前端）
+    static_folder = os.path.join(PROJECT_ROOT, 'chat-ui')
+
+    app = Flask(__name__, static_folder=static_folder, static_url_path='')
     CORS(app)
 
     # ==================== Repository 依赖注入 ====================
@@ -146,6 +149,39 @@ def create_app():
     if IS_PROD:
         _validate_production_config()
 
+    # ==================== 前端静态文件路由 ====================
+
+    # 首页
+    @app.route('/')
+    def serve_index():
+        """首页"""
+        return send_from_directory(static_folder, 'index.html')
+
+    # 静态文件（需要明确指定，避免与 API 路由冲突）
+    @app.route('/app.js')
+    def serve_app_js():
+        return send_from_directory(static_folder, 'app.js')
+
+    @app.route('/style.css')
+    def serve_style_css():
+        return send_from_directory(static_folder, 'style.css')
+
+    @app.route('/exam.html')
+    def serve_exam_html():
+        return send_from_directory(static_folder, 'exam.html')
+
+    @app.route('/exam.js')
+    def serve_exam_js():
+        return send_from_directory(static_folder, 'exam.js')
+
+    @app.route('/api-test.html')
+    def serve_api_test_html():
+        return send_from_directory(static_folder, 'api-test.html')
+
+    @app.route('/api-test.js')
+    def serve_api_test_js():
+        return send_from_directory(static_folder, 'api-test.js')
+
     # ==================== 启动信息 ====================
 
     _print_startup_info(app)
@@ -156,7 +192,10 @@ def create_app():
 def _validate_production_config():
     """生产环境启动前检查"""
     import os
-    assert os.getenv("DASHSCOPE_API_KEY") or os.environ.get("DASHSCOPE_API_KEY"), \
+    from config import DASHSCOPE_API_KEY
+    # 检查环境变量或配置文件中的 API Key
+    has_key = os.getenv("DASHSCOPE_API_KEY") or os.environ.get("DASHSCOPE_API_KEY") or DASHSCOPE_API_KEY
+    assert has_key and has_key != "", \
         "Missing DASHSCOPE_API_KEY in production environment"
     print("[PROD] Configuration validated")
 

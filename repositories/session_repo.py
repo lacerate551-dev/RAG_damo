@@ -20,12 +20,12 @@ class BaseSessionRepo(ABC):
             session_id: 会话ID
 
         Returns:
-            消息列表，每条消息包含 role 和 content
+            消息列表，每条消息包含 role、content 和可选的 metadata
         """
         pass
 
     @abstractmethod
-    def add_message(self, session_id: str, role: str, content: str) -> None:
+    def add_message(self, session_id: str, role: str, content: str, metadata: Optional[Dict] = None) -> None:
         """
         添加消息到会话
 
@@ -33,6 +33,7 @@ class BaseSessionRepo(ABC):
             session_id: 会话ID
             role: 角色（user/assistant）
             content: 消息内容
+            metadata: 可选的元数据（如图片、来源等）
         """
         pass
 

@@ -216,6 +216,146 @@ class SearchResult:
     collection_name: str = ""
 
 
+# ==================== 语义增强辅助函数 ====================
+
+def _extract_section(section_path: str, max_levels: int = 3) -> str:
+    """
+    动态截断章节路径
+
+    保留核心 + 末尾，最多 max_levels 级
+
+    Args:
+        section_path: 完整章节路径
+        max_levels: 最多保留级数（默认3级）
+
+    Returns:
+        截断后的章节路径
+    """
+    parts = [p.strip() for p in section_path.split('>') if p.strip()]
+
+    if len(parts) <= max_levels:
+        return ' > '.join(parts)
+
+    # 保留"核心 + 末尾"：倒数第 max_levels 级到最后
+    return ' > '.join(parts[-max_levels:])
+
+
+def _build_semantic_content_for_text(chunk, page_info: dict, doc_type: str) -> str:
+    """
+    构建语义增强内容（文本类型）
+
+    PDF 和 Word 差异化处理：
+    - PDF: 有 text_level、bbox，标题识别准确
+    - Word: 无 text_level、bbox，依赖启发式识别
+
+    Args:
+        chunk: MinerUChunk 对象
+        page_info: 页面信息字典
+        doc_type: 文档类型 ('pdf', 'word', 'excel', 'ppt')
+
+    Returns:
+        语义增强后的内容字符串
+    """
+    parts = []
+
+    # 1. 标题：不加标签，权重更高
+    title = getattr(chunk, 'title', '') or ''
+    # title 可能是列表，需要转换为字符串
+    if isinstance(title, list):
+        title = ' '.join(str(t) for t in title if t) or ''
+    text_level = getattr(chunk, 'text_level', 0)
+
+    if title and title.strip() and text_level > 0:
+        # 直接放标题，不加【标题】标签，让 embedding 更聚焦
+        parts.append(title.strip())
+
+    # 2. 章节：动态截断（最多3级，避免噪声）
+    section = page_info.get('section_path', '') or page_info.get('section', '')
+    # section 可能是列表，需要转换为字符串
+    if isinstance(section, list):
+        section = ' > '.join(str(s) for s in section if s) or ''
+    if section and section.strip():
+        section = _extract_section(section, max_levels=3)
+        parts.append(f"主题：{section}")
+
+    # 3. 内容：核心信息
+    content = chunk.content if hasattr(chunk, 'content') else page_info.get('text', '')
+    if isinstance(content, list):
+        content = '\n'.join(str(item) for item in content)
+    parts.append(content)
+
+    return "\n".join(parts)
+
+
+def _build_semantic_content_for_table(table_md: str, page_info: dict, chunk, doc_type: str) -> str:
+    """
+    构建语义增强内容（表格类型）
+
+    PDF 和 Word 差异化处理：
+    - PDF: 有 table_caption，直接使用
+    - Word: 无 table_caption，从表格内容推断
+
+    Args:
+        table_md: 表格 Markdown 内容
+        page_info: 页面信息字典
+        chunk: MinerUChunk 对象
+        doc_type: 文档类型
+
+    Returns:
+        语义增强后的内容字符串
+    """
+    parts = []
+
+    # 1. 章节（动态截断，最多3级）
+    section = page_info.get('section_path', '') or page_info.get('section', '')
+    # section 可能是列表，需要转换为字符串
+    if isinstance(section, list):
+        section = ' > '.join(str(s) for s in section if s) or ''
+    if section and section.strip():
+        section = _extract_section(section, max_levels=3)
+        parts.append(f"主题：{section}")
+
+    # 2. 表格标题
+    caption = getattr(chunk, 'title', '') or ''
+    # caption 可能是列表，需要转换为字符串
+    if isinstance(caption, list):
+        caption = ' '.join(str(c) for c in caption if c) or ''
+    if caption and caption.strip() and caption != "表格":
+        parts.append(f"表格：{caption.strip()}")
+
+    # 3. 表头（关键语义）
+    lines = table_md.split('\n')
+    headers = []
+    for line in lines:
+        if line.startswith('|') and '---' not in line:
+            headers = [h.strip() for h in line.split('|') if h.strip()]
+            if headers and len(headers) > 1:
+                parts.append(f"字段：{', '.join(headers)}")
+            break
+
+    # 4. 表格描述（语义摘要，不截断数据）
+    row_count = len([l for l in lines if l.startswith('|') and '---' not in l])
+    if headers:
+        parts.append(f"描述：该表包含{row_count}行数据，记录各{', '.join(headers[:3])}信息")
+    else:
+        parts.append(f"描述：该表包含{row_count}行数据")
+
+    # 5. 示例数据（仅展示一行，不截断表格）
+    for line in lines:
+        if line.startswith('|') and '---' not in line and headers:
+            cells = [c.strip() for c in line.split('|') if c.strip()]
+            if cells and cells != headers:
+                example_parts = []
+                for i, h in enumerate(headers[:2]):
+                    if i < len(cells):
+                        example_parts.append(f"{h}={cells[i]}")
+                if example_parts:
+                    parts.append(f"示例：{', '.join(example_parts)}")
+                break
+
+    return "\n".join(parts)
+
+
 # ==================== BM25 索引管理 ====================
 
 class BM25Index:
@@ -524,12 +664,41 @@ class KnowledgeBaseManager:
         """
         列出所有向量库
 
+        会检测 ChromaDB 中实际存在的向量库，并自动补充缺失的元数据。
+
         Returns:
             向量库信息列表
         """
         result = []
 
-        # 从元数据获取
+        # 获取 ChromaDB 中实际存在的向量库
+        try:
+            # 使用 public_kb 的 client 获取所有集合（它们共享同一个 client）
+            client = self._get_client("public_kb")
+            actual_collections = [c.name for c in client.list_collections()]
+        except Exception as e:
+            logger.warning(f"获取 ChromaDB 集合列表失败: {e}")
+            actual_collections = list(self._metadata.get("collections", {}).keys())
+
+        # 确保 ChromaDB 中的每个集合都有元数据记录
+        for name in actual_collections:
+            if name not in self._metadata.get("collections", {}):
+                # 自动补充缺失的元数据
+                if "collections" not in self._metadata:
+                    self._metadata["collections"] = {}
+                from datetime import datetime
+                self._metadata["collections"][name] = {
+                    "display_name": name,
+                    "department": "",
+                    "description": "",
+                    "created_at": datetime.now().isoformat()
+                }
+                logger.info(f"自动补充向量库元数据: {name}")
+
+        # 保存更新后的元数据
+        self._save_metadata()
+
+        # 从元数据构建返回结果
         for name, info in self._metadata.get("collections", {}).items():
             collection = self.get_collection(name)
             result.append(CollectionInfo(
@@ -613,6 +782,127 @@ class KnowledgeBaseManager:
         except Exception as e:
             logger.error(f"重建 BM25 索引失败: {e}")
             return False
+
+    def update_image_descriptions(self, kb_name: str) -> dict:
+        """
+        更新图片切片的轻量级描述（提取图号/表号）
+
+        用于已入库的文档，重新生成图片描述以包含图号信息
+
+        Args:
+            kb_name: 向量库名称
+
+        Returns:
+            更新统计信息
+        """
+        try:
+            collection = self.get_collection(kb_name)
+            if not collection:
+                return {"success": False, "error": "向量库不存在"}
+
+            # 获取所有图片/图表切片
+            result = collection.get(include=['documents', 'metadatas'])
+
+            image_count = 0
+            updated_count = 0
+            updated_ids = []
+            updated_docs = []
+            updated_metas = []
+
+            for i, (id_, doc, meta) in enumerate(zip(result['ids'], result['documents'], result['metadatas'])):
+                chunk_type = meta.get('chunk_type', '')
+                if chunk_type not in ('image', 'chart'):
+                    continue
+
+                image_count += 1
+
+                # 提取图号（从多个来源）
+                import re
+                figure_number = ""
+                table_number = ""
+
+                # 来源列表
+                sources = [
+                    doc,  # 完整文档
+                    meta.get('section', ''),
+                    meta.get('section_path', ''),
+                    meta.get('caption', '')
+                ]
+
+                for source_text in sources:
+                    if not source_text:
+                        continue
+
+                    # 提取图号
+                    if not figure_number:
+                        fig_match = re.search(r'(?:[见如及和与])?图\s*(\d+\.?\d*)', source_text)
+                        if fig_match:
+                            figure_number = fig_match.group(1)
+
+                    # 提取表号
+                    if not table_number:
+                        table_match = re.search(r'(?:[见如及和与])?表\s*(\d+\.?\d*)', source_text)
+                        if table_match:
+                            table_number = table_match.group(1)
+
+                # 如果找到图号，更新描述
+                if figure_number or table_number:
+                    # 构建新描述（在开头添加图号/表号）
+                    prefix_parts = []
+                    if figure_number:
+                        prefix_parts.append(f"图{figure_number}")
+                    if table_number:
+                        prefix_parts.append(f"表{table_number}")
+
+                    prefix = " ".join(prefix_parts)
+
+                    # 检查当前描述是否已包含图号
+                    has_figure_in_start = False
+                    first_line = doc.split('\n')[0] if doc else ""
+                    for pn in prefix_parts:
+                        if pn in first_line:
+                            has_figure_in_start = True
+                            break
+
+                    if not has_figure_in_start:
+                        # 在描述开头添加图号
+                        new_doc = f"{prefix} {doc}"
+                        updated_ids.append(id_)
+                        updated_docs.append(new_doc)
+                        updated_metas.append(meta)
+                        updated_count += 1
+
+            # 批量更新
+            if updated_ids:
+                # 需要重新生成向量
+                from sentence_transformers import SentenceTransformer
+                embedding_model = SentenceTransformer('models/bge-base-zh-v1.5')
+
+                for id_, doc, meta in zip(updated_ids, updated_docs, updated_metas):
+                    vector = embedding_model.encode(doc).tolist()
+                    if isinstance(vector[0], list):
+                        vector = vector[0]
+
+                    collection.update(
+                        ids=[id_],
+                        embeddings=[vector],
+                        documents=[doc],
+                        metadatas=[meta]
+                    )
+
+                # 重建 BM25 索引
+                self.rebuild_bm25_index(kb_name)
+
+            logger.info(f"更新图片描述: {kb_name}, 图片数: {image_count}, 更新数: {updated_count}")
+            return {
+                "success": True,
+                "image_count": image_count,
+                "updated_count": updated_count
+            }
+
+        except Exception as e:
+            logger.error(f"更新图片描述失败: {e}")
+            return {"success": False, "error": str(e)}
 
     # ==================== 权限管理 ====================
 
@@ -758,10 +1048,11 @@ class KnowledgeBaseManager:
         embedding_model=None,
         extra_metadata: dict = None,
         enable_table_summary: bool = True,
-        enable_image_description: bool = False
+        enable_image_description: bool = False,
+        file_content: bytes = None  # 新增：支持直接传入文件内容
     ) -> int:
         """
-        添加文件到指定向量库（v5 统一解析版）
+        添加文件到指定向量库（v6 支持企业文件系统）
 
         使用统一的 parse_document() 入口，支持：
         - PDF/DOCX/PPTX/图片 → MinerU 解析
@@ -770,19 +1061,34 @@ class KnowledgeBaseManager:
 
         Args:
             kb_name: 向量库名称
-            filepath: 文件绝对路径
+            filepath: 文件路径（相对路径或绝对路径）
             embedding_model: 向量模型（可选，默认使用 engine 的）
             extra_metadata: 额外的元数据（如 status, version 等）
             enable_table_summary: 是否启用表格摘要管道（LLM 生成摘要）
             enable_image_description: 是否启用图片描述管道（VLM 生成描述）
+            file_content: 文件二进制内容（可选，用于企业文件系统集成）
 
         Returns:
             添加的片段数量
         """
         collection = self.get_collection(kb_name)
         if not collection:
-            logger.error(f"向量库不存在: {kb_name}")
+            logger.error(f"获取向量库失败: {kb_name}")
             return 0
+
+        # 确保元数据中有该向量库记录（get_or_create_collection 可能创建了集合但没更新元数据）
+        if kb_name not in self._metadata.get("collections", {}):
+            if "collections" not in self._metadata:
+                self._metadata["collections"] = {}
+            from datetime import datetime
+            self._metadata["collections"][kb_name] = {
+                "display_name": kb_name,
+                "department": "",
+                "description": "",
+                "created_at": datetime.now().isoformat()
+            }
+            self._save_metadata()
+            logger.info(f"更新向量库元数据: {kb_name}")
 
         # 获取向量模型
         if embedding_model is None:
@@ -859,7 +1165,10 @@ class KnowledgeBaseManager:
                 elif not isinstance(content, str):
                     content = str(content)
 
-                vector = embedding_model.encode(content).tolist()
+                # 构建语义增强内容用于 embedding
+                doc_type = _get_doc_type(filename)
+                semantic_content = _build_semantic_content_for_text(chunk, page_info, doc_type)
+                vector = embedding_model.encode(semantic_content).tolist()
                 # 确保是 1D 列表（单个文档的向量）
                 if isinstance(vector[0], list):
                     vector = vector[0]
@@ -867,6 +1176,9 @@ class KnowledgeBaseManager:
 
                 # 计算章节内序号（用于 Word 文档语义定位）
                 section = page_info.get('section_path', '') or page_info.get('section', '')
+                # section 可能是列表，需要转换为字符串
+                if isinstance(section, list):
+                    section = ' > '.join(str(s) for s in section if s) or ''
                 if section not in section_counters:
                     section_counters[section] = 0
                 section_counters[section] += 1
@@ -887,6 +1199,12 @@ class KnowledgeBaseManager:
                     'collection': collection.name,
                     **extra_metadata
                 }
+
+                # ========== P2：图文关联索引 ==========
+                # 提取文本中的图表引用
+                referenced_images = self._extract_figure_references(content)
+                if referenced_images:
+                    metadata['referenced_images'] = referenced_images
 
                 # 添加 bbox（仅当存在时）
                 bbox = page_info.get('bbox')
@@ -921,6 +1239,9 @@ class KnowledgeBaseManager:
 
                 # 计算章节内序号
                 section = page_info.get('section_path', '') or page_info.get('section', '')
+                # section 可能是列表，需要转换为字符串
+                if isinstance(section, list):
+                    section = ' > '.join(str(s) for s in section if s) or ''
                 if section not in section_counters:
                     section_counters[section] = 0
                 section_counters[section] += 1
@@ -959,8 +1280,10 @@ class KnowledgeBaseManager:
                 if hasattr(chunk, 'images') and chunk.images:
                     table_meta['images'] = json.dumps(chunk.images) if isinstance(chunk.images, list) else chunk.images
 
-                # 直接向量化原始表格（不调用 LLM）
-                vector = embedding_model.encode(table_md).tolist()
+                # 构建语义增强内容用于 embedding
+                doc_type = table_meta.get('doc_type', 'other')
+                semantic_content = _build_semantic_content_for_table(table_md, page_info, chunk, doc_type)
+                vector = embedding_model.encode(semantic_content).tolist()
                 if isinstance(vector[0], list):
                     vector = vector[0]
 
@@ -1004,6 +1327,9 @@ class KnowledgeBaseManager:
 
                 # 计算章节内序号
                 section = page_info.get('section_path', '') or page_info.get('section', '')
+                # section 可能是列表，需要转换为字符串
+                if isinstance(section, list):
+                    section = ' > '.join(str(s) for s in section if s) or ''
                 if section not in section_counters:
                     section_counters[section] = 0
                 section_counters[section] += 1
@@ -1034,21 +1360,36 @@ class KnowledgeBaseManager:
                     image_meta['bbox'] = json.dumps(bbox)
                     image_meta['bbox_mode'] = 'normalized'
 
-                # 生成轻量描述（不用 VLM）
-                description = self.generate_lightweight_image_description(full_image_path, chunk, page_info)
+                # 优先使用 VLM 缓存（如果存在）
+                vlm_desc = self._get_vlm_cache(full_image_path)
 
-                # 添加可搜索片段
-                image_meta['preview'] = description[:50] if len(description) > 50 else description
+                if vlm_desc:
+                    # 使用 VLM 描述
+                    full_description = vlm_desc
+                    image_meta['has_vlm_desc'] = True
+                    image_meta['preview'] = vlm_desc[:50] if len(vlm_desc) > 50 else vlm_desc
+                    logger.info(f"使用 VLM 缓存: {image_path}")
+                else:
+                    # 生成轻量描述（包含上下文）
+                    full_description = self.generate_lightweight_image_description(full_image_path, chunk, page_info)
+                    image_meta['preview'] = full_description[:50] if len(full_description) > 50 else full_description
 
-                # 向量化入库
-                vector = embedding_model.encode(description).tolist()
+                # ========== P1：双字段存储 ==========
+                # 生成短摘要（用于检索匹配）
+                short_summary = self.generate_image_short_summary(chunk, page_info, full_description)
+
+                # 完整描述存到 metadata（用于 LLM 上下文）
+                image_meta['full_description'] = full_description
+
+                # 向量化入库（使用短摘要）
+                vector = embedding_model.encode(short_summary).tolist()
                 if isinstance(vector[0], list):
                     vector = vector[0]
 
                 collection.add(
                     ids=[chunk_id],
                     embeddings=[vector],
-                    documents=[description],
+                    documents=[short_summary],  # 短摘要用于检索
                     metadatas=[image_meta]
                 )
 
@@ -1090,6 +1431,9 @@ class KnowledgeBaseManager:
 
         # 智能提取标题：chunk.title → 表格首行列名 → 降级
         title = getattr(chunk, 'title', '') if hasattr(chunk, 'title') else ''
+        # title 可能是列表，需要转换为字符串
+        if isinstance(title, list):
+            title = ' '.join(str(t) for t in title if t) or ''
         if not title or title == '表格':
             title = self._extract_table_title(table_md)
 
@@ -1213,11 +1557,170 @@ class KnowledgeBaseManager:
         logger.debug(f"图片保留：{filename}")
         return True
 
+    def _get_vlm_cache(self, image_path: str) -> str | None:
+        """
+        检查是否有 VLM 缓存描述
+
+        Args:
+            image_path: 图片完整路径
+
+        Returns:
+            VLM 描述文本，如果不存在则返回 None
+        """
+        import hashlib
+        from pathlib import Path
+
+        try:
+            if not os.path.exists(image_path):
+                return None
+
+            # 计算图片哈希
+            img_hash = hashlib.md5(open(image_path, 'rb').read()).hexdigest()
+
+            # 检查缓存文件
+            cache_file = Path(f'.data/cache/vlm/{img_hash}.txt')
+            if cache_file.exists():
+                return cache_file.read_text(encoding='utf-8')
+        except Exception as e:
+            logger.debug(f"检查 VLM 缓存失败: {e}")
+
+        return None
+
+    def generate_image_short_summary(self, chunk, page_info: dict, full_description: str = "") -> str:
+        """
+        生成图片短摘要（用于向量检索匹配）
+
+        短摘要格式：图2.3：2003-2022年三峡电站逐年发电量柱状图，峰值1118亿千瓦时
+        特点：20-40字，关键词密集，便于检索匹配
+
+        Args:
+            chunk: 原始 chunk 对象
+            page_info: 页面信息字典
+            full_description: 完整描述（VLM 或轻量描述）
+
+        Returns:
+            短摘要文本
+        """
+        import re
+
+        # 1. 提取图号/表号
+        figure_number = ""
+        table_number = ""
+
+        # 从多个来源提取
+        section = page_info.get('section_path', '') or page_info.get('section', '')
+        title = chunk.title if hasattr(chunk, 'title') and chunk.title else ""
+        caption = page_info.get('caption', '')
+
+        for source in [section, title, caption, full_description]:
+            if not source:
+                continue
+            # 提取图号
+            fig_match = re.search(r'图\s*(\d+\.?\d*)', str(source))
+            if fig_match and not figure_number:
+                figure_number = fig_match.group(1)
+            # 提取表号
+            table_match = re.search(r'表\s*(\d+\.?\d*)', str(source))
+            if table_match and not table_number:
+                table_number = table_match.group(1)
+
+        # 2. 提取核心主题（从完整描述或上下文）
+        chunk_type = page_info.get('chunk_type', 'image')
+
+        # 从完整描述中提取关键信息
+        keywords = []
+
+        # 提取年份范围
+        year_match = re.search(r'(\d{4})\s*[-至到]\s*(\d{4})', full_description)
+        if year_match:
+            keywords.append(f"{year_match.group(1)}-{year_match.group(2)}年")
+
+        # 提取关键数值
+        num_match = re.search(r'(\d+\.?\d*)\s*(亿|万|千瓦时|吨|米)', full_description)
+        if num_match:
+            keywords.append(f"{num_match.group(1)}{num_match.group(2)}")
+
+        # 从 section 中提取主题
+        if section:
+            # 提取章节主题（如"发电"、"航运"）
+            section_parts = section.split('>')
+            if section_parts:
+                last_part = section_parts[-1].strip()
+                # 提取主题词
+                theme_match = re.search(r'(\d+\.?\d*)\s*(.+)', last_part)
+                if theme_match:
+                    keywords.append(theme_match.group(2).strip()[:10])
+
+        # 3. 构建短摘要
+        if chunk_type == 'chart':
+            type_label = "图表"
+            # 尝试从描述中提取图表类型
+            if '柱状图' in full_description:
+                type_label = "柱状图"
+            elif '折线图' in full_description or '曲线图' in full_description:
+                type_label = "折线图"
+            elif '饼图' in full_description:
+                type_label = "饼图"
+        elif chunk_type == 'table':
+            type_label = "表格"
+        else:
+            type_label = "图片"
+
+        # 构建短摘要
+        if figure_number:
+            summary = f"图{figure_number}："
+        elif table_number:
+            summary = f"表{table_number}："
+        else:
+            summary = f"{type_label}："
+
+        # 添加关键词
+        if keywords:
+            summary += "，".join(keywords[:3])
+
+        # 从完整描述中提取主题句（前 30 字）
+        if full_description and len(keywords) < 2:
+            # 提取描述的第一句作为主题
+            first_sentence = full_description.split('。')[0][:30]
+            if first_sentence:
+                summary += first_sentence
+
+        # 限制长度（20-40 字）
+        if len(summary) > 45:
+            summary = summary[:42] + "..."
+
+        return summary
+
+    def _extract_figure_references(self, text: str) -> list:
+        """
+        提取文本中的图表引用（P2：图文关联索引）
+
+        Args:
+            text: 文本内容
+
+        Returns:
+            引用的图号/表号列表，如 ['2.3', '2.2']
+        """
+        import re
+
+        references = []
+
+        # 提取图号引用：见图2.3、如图2.3、图2.3、图 2.3 等
+        fig_matches = re.findall(r'(?:[见如及和与])?图\s*(\d+\.?\d*)', text)
+        references.extend(fig_matches)
+
+        # 提取表号引用：见表2.2、如表2.2、表2.2、表 2.2 等
+        table_matches = re.findall(r'(?:[见如及和与])?表\s*(\d+\.?\d*)', text)
+        references.extend(table_matches)
+
+        # 去重
+        return list(set(references))
+
     def generate_lightweight_image_description(self, image_path: str, chunk, page_info: dict) -> str:
         """
-        生成轻量级图片描述（Phase 2：不用 VLM）
+        生成轻量级图片描述（包含上下文，用于语义检索）
 
-        信息来源：文件名 + 标题/caption + 章节路径 + 页码
+        信息来源：图号/表号 + 标题/caption + 章节路径 + 页码 + 前后文本上下文
 
         Args:
             image_path: 图片路径
@@ -1225,26 +1728,70 @@ class KnowledgeBaseManager:
             page_info: 页面信息字典
 
         Returns:
-            轻量级描述文本
+            轻量级描述文本（包含上下文，便于语义检索命中）
         """
+        import re
         parts = []
 
         # 1. 图片类型
         chunk_type = page_info.get('chunk_type', 'image')
-        type_label = "图表" if chunk_type == 'chart' else "图片"
+        is_chart = chunk_type == 'chart'
+        type_label = "图表" if is_chart else "图片"
 
-        # 2. 标题或 caption
-        title = chunk.title if hasattr(chunk, 'title') and chunk.title else ""
-        caption = page_info.get('caption', '')
+        # 2. 提取图号/表号（关键！用于精确匹配）
+        figure_number = ""
+        table_number = ""
 
-        # 3. 章节路径
+        # 从多个来源提取图号
+        sources_to_check = []
+
+        # 章节路径
         section = page_info.get('section_path', '') or page_info.get('section', '')
+        if section:
+            sources_to_check.append(section)
 
-        # 4. 页码
+        # 标题
+        title = chunk.title if hasattr(chunk, 'title') and chunk.title else ""
+        if title:
+            sources_to_check.append(title)
+
+        # caption
+        caption = page_info.get('caption', '')
+        if caption:
+            sources_to_check.append(caption)
+
+        # 上下文
+        context_before = ""
+        context_after = ""
+        if hasattr(chunk, 'context_before') and chunk.context_before:
+            context_before = chunk.context_before[:500]
+            sources_to_check.append(context_before)
+        if hasattr(chunk, 'context_after') and chunk.context_after:
+            context_after = chunk.context_after[:500]
+            sources_to_check.append(context_after)
+
+        # 从所有来源提取图号
+        for source_text in sources_to_check:
+            if not figure_number:
+                fig_match = re.search(r'(?:[见如及和与])?图\s*(\d+\.?\d*)', source_text)
+                if fig_match:
+                    figure_number = fig_match.group(1)
+            if not table_number:
+                table_match = re.search(r'(?:[见如及和与])?表\s*(\d+\.?\d*)', source_text)
+                if table_match:
+                    table_number = table_match.group(1)
+
+        # 3. 页码
         page = page_info.get('page', 0)
 
-        # 组装描述
-        if caption:
+        # 4. 组装描述（图号/表号放在最前面）
+        if figure_number:
+            parts.append(f"图{figure_number}")
+        if table_number:
+            parts.append(f"表{table_number}")
+
+        # 标题或 caption
+        if caption and caption not in ("图片", "图表"):
             parts.append(caption)
         elif title and title not in ("图片", "图表"):
             parts.append(title)
@@ -1254,14 +1801,24 @@ class KnowledgeBaseManager:
 
         parts.append(f"第{page}页")
 
-        return f"{type_label}：{'，'.join(parts)}"
+        # 组装完整描述
+        description_parts = [f"{type_label}：{'，'.join(parts)}"]
 
-    def _generate_image_description(self, image_path: str) -> str:
+        # 添加上下文（用于语义检索）
+        if context_before:
+            description_parts.append(f"前文：{context_before}")
+        if context_after:
+            description_parts.append(f"后文：{context_after}")
+
+        return "\n".join(description_parts)
+
+    def _generate_image_description(self, image_path: str, metadata: dict = None) -> str:
         """
-        生成图片描述（VLM）
+        生成图片描述（VLM），结合元数据增强描述质量
 
         Args:
             image_path: 图片路径
+            metadata: 图片元数据（包含 section、page、caption、上下文等）
 
         Returns:
             图片描述文本
@@ -1278,6 +1835,98 @@ class KnowledgeBaseManager:
             ext = os.path.splitext(image_path)[1].lower()
             image_format = 'png' if ext in ['.png', '.jpg', '.jpeg'] else 'png'
 
+            # 构建上下文信息
+            context_info = ""
+            figure_number = ""
+            source_file = ""
+
+            if metadata:
+                parts = []
+
+                # 提取文件来源
+                source_file = metadata.get('source', '')
+                if source_file:
+                    parts.append(f"来源文档：{source_file}")
+
+                # 检查是否为表格图片
+                is_table = metadata.get('is_table', False)
+                table_number = metadata.get('table_number', '')
+
+                # 提取图号/表号（优先级：显式传递 > section 中提取 > caption 中提取）
+                if is_table and table_number:
+                    # 表格图片：使用表号
+                    parts.append(f"表格编号：表{table_number}")
+                elif metadata.get('figure_number'):
+                    figure_number = metadata['figure_number']
+                elif metadata.get('section'):
+                    import re
+                    # 根据类型提取编号
+                    if is_table:
+                        table_match = re.search(r'[见如]?表\s*(\d+\.?\d*)', metadata['section'])
+                        if table_match:
+                            table_number = table_match.group(1)
+                    else:
+                        fig_match = re.search(r'[见如]?图\s*(\d+\.?\d*)', metadata['section'])
+                        if fig_match:
+                            figure_number = fig_match.group(1)
+                    parts.append(f"章节：{metadata['section']}")
+
+                # 也从完整文档文本中提取编号
+                doc_text = metadata.get('doc_text', '')
+                if is_table and not table_number and doc_text:
+                    import re
+                    table_match = re.search(r'[见如]?表\s*(\d+\.?\d*)', doc_text)
+                    if table_match:
+                        table_number = table_match.group(1)
+                elif not figure_number and doc_text:
+                    import re
+                    fig_match = re.search(r'[见如]?图\s*(\d+\.?\d*)', doc_text)
+                    if fig_match:
+                        figure_number = fig_match.group(1)
+
+                if metadata.get('page'):
+                    parts.append(f"第{metadata['page']}页")
+
+                caption = metadata.get('caption', '')
+                if caption and caption not in ('图片', '图表'):
+                    parts.append(f"标题：{caption}")
+                    # 从 caption 中提取图号
+                    if not figure_number:
+                        import re
+                        fig_match = re.search(r'图\s*(\d+\.?\d*)', caption)
+                        if fig_match:
+                            figure_number = fig_match.group(1)
+
+                if parts:
+                    context_info = f"\n\n【已知上下文】\n" + "\n".join(parts)
+
+            # 构建增强 prompt（区分图片和表格）
+            if is_table and table_number:
+                number_instruction = f"\n5. 这是表{table_number}，请在描述开头明确标注「表{table_number}」"
+                prompt = f"""请分析这张表格图片并生成详细描述。
+
+要求：
+1. 这是表格图片，请识别表格结构和内容
+2. 描述表格的主要数据、关键指标或统计信息
+3. 如果表格有标题行，请说明表格主题
+4. 输出格式：[表格] 主要内容描述{number_instruction}{context_info}
+
+请直接输出描述，不超过150字。"""
+            else:
+                figure_instruction = ""
+                if figure_number:
+                    figure_instruction = f"\n5. 如果识别出这是图{figure_number}，请在描述开头明确标注「图{figure_number}」"
+
+                prompt = f"""请分析这张图片并生成详细描述。
+
+要求：
+1. 识别图片类型（折线图、柱状图、流程图、示意图、表格图等）
+2. 描述图片的主要内容、数据趋势或关键信息
+3. 如果是数据图表，提取关键数值和趋势
+4. 输出格式：[图片类型] 主要内容描述{figure_instruction}{context_info}
+
+请直接输出描述，不超过150字。"""
+
             client = get_llm_client()
 
             # 使用视觉模型
@@ -1286,14 +1935,35 @@ class KnowledgeBaseManager:
                 messages=[{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "请简要描述这张图片的内容，不超过100字。"},
+                        {"type": "text", "text": prompt},
                         {"type": "image_url", "image_url": {"url": f"data:image/{image_format};base64,{image_data}"}}
                     ]
                 }],
-                max_tokens=200
+                max_tokens=300
             )
 
-            return response.choices[0].message.content.strip()
+            content = response.choices[0].message.content
+            if content:
+                # 根据类型添加编号前缀
+                if is_table and table_number:
+                    # 表格图片
+                    if f"表{table_number}" not in content:
+                        content = f"表{table_number}：{content}"
+                elif figure_number:
+                    # 普通图片
+                    if f"图{figure_number}" not in content:
+                        content = f"图{figure_number}：{content}"
+                # 如果有文件来源但描述中没有，在末尾添加
+                if source_file and source_file not in content:
+                    content = f"{content}（来源：{source_file}）"
+                return content.strip()
+            else:
+                logger.warning("VLM 返回空内容")
+                if is_table and table_number:
+                    return f"表{table_number}：{os.path.basename(image_path)}（来源：{source_file}）" if source_file else f"表{table_number}：{os.path.basename(image_path)}"
+                elif figure_number:
+                    return f"图{figure_number}：{os.path.basename(image_path)}（来源：{source_file}）" if source_file else f"图{figure_number}：{os.path.basename(image_path)}"
+                return f"图片：{os.path.basename(image_path)}"
 
         except Exception as e:
             logger.warning(f"图片描述生成失败: {e}")

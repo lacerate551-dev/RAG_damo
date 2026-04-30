@@ -113,6 +113,9 @@ class MinerUChunk:
     table_html: Optional[str] = None  # 表格 HTML（如果是表格）
     image_path: Optional[str] = None  # 图片路径（独立图片）
     images: Optional[List[Dict]] = None  # 关联图片列表: [{"id": "abc.jpg", "order": 1}]
+    # 图片上下文（用于语义检索）
+    context_before: str = ""          # 图片前的文本上下文
+    context_after: str = ""           # 图片后的文本上下文
 
 
 def parse_with_mineru(
@@ -352,8 +355,36 @@ def _parse_mineru_output(file_path: Path, output_dir) -> Dict[str, Any]:
         with open(md_path, 'r', encoding='utf-8') as f:
             markdown_content = f.read()
 
+    # 第一遍扫描：收集所有文本内容（用于构建图片上下文）
+    text_items = []  # [(index, text, page_idx), ...]
+    for idx, item in enumerate(content_list):
+        if item.get("type") == "text":
+            text = item.get("text", "").strip()
+            if text:
+                text_items.append((idx, text, item.get("page_idx", 0)))
+
+    def get_context_for_image(image_idx: int, page_idx: int, window: int = 3) -> tuple:
+        """获取图片前后的文本上下文"""
+        context_before = []
+        context_after = []
+
+        # 查找图片前后的文本项
+        for item_idx, text, item_page in text_items:
+            if item_idx < image_idx and item_page >= page_idx - 1:
+                # 图片之前的文本（同页或上一页）
+                context_before.append(text)
+            elif item_idx > image_idx and item_page <= page_idx + 1:
+                # 图片之后的文本（同页或下一页）
+                context_after.append(text)
+
+        # 只保留最近的 window 条
+        context_before = context_before[-window:] if context_before else []
+        context_after = context_after[:window] if context_after else []
+
+        return " ".join(context_before), " ".join(context_after)
+
     # 解析 content_list
-    for item in content_list:
+    for idx, item in enumerate(content_list):
         item_type = item.get("type", "text")
         page_idx = item.get("page_idx", 0)
         bbox = item.get("bbox", [])
@@ -448,6 +479,9 @@ def _parse_mineru_output(file_path: Path, output_dir) -> Dict[str, Any]:
             # 图表类型标记为 chart，便于后续区分处理
             chunk_type = "chart" if item_type == "chart" else "image"
 
+            # 获取图片上下文
+            context_before, context_after = get_context_for_image(idx, page_idx)
+
             chunk = MinerUChunk(
                 content=caption or ("图表" if item_type == "chart" else "图片"),
                 chunk_type=chunk_type,
@@ -457,7 +491,9 @@ def _parse_mineru_output(file_path: Path, output_dir) -> Dict[str, Any]:
                 section_path=section_path,
                 bbox=bbox,
                 source_file=file_path.name,
-                image_path=img_path
+                image_path=img_path,
+                context_before=context_before,
+                context_after=context_after
             )
             chunks.append(chunk)
             if img_path:

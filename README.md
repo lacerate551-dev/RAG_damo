@@ -2,11 +2,17 @@
 
 基于本地向量模型 + Chroma向量数据库 + Neo4j知识图谱 + Qwen API 的智能知识库问答系统，支持双模式对话、Agentic RAG 和 Graph RAG。
 
-> **最新版本**: v6.2.0 (部署优化版：新增 Docker 部署方案、会话管理重构、查询增强优化)
+> **最新版本**: v6.3.0 (状态码系统：统一 API 响应格式、MMR 去重优化、查询扩展增强)
 
 ## 功能特性
 
-### 最新特性 (v6.2.0)
+### 最新特性 (v6.3.0)
+- **状态码系统**：统一 API 响应格式，新增 `status_code` 字段便于后端判断处理状态（10xx 处理中、20xx 成功、40xx 客户端错误、50xx 服务端错误）
+- **MMR 去重优化**：支持高精度版（语义向量）和轻量版（文本相似度）双模式切换
+- **查询扩展增强**：新增查询扩展器、语义缓存、意图分析器
+- **部署稳定性**：Gunicorn gthread 模式修复心跳超时问题，Docker shm_size 优化
+
+### v6.2.0 特性
 - **Docker 部署方案**：新增完整 Docker 部署配置（Dockerfile、docker-compose、nginx）
 - **会话管理重构**：引入 Repository 模式，支持无状态/SQLite 双模式会话存储
 - **查询增强优化**：新增自适应 TopK、查询分解器、缓存层、LLM 预算管理
@@ -488,7 +494,8 @@ USE_GRAPH_RAG = True
 
 | 版本 | 更新内容 |
 |------|----------|
-| **v6.2.0** | 部署优化版：Docker 部署方案、会话管理 Repository 重构、查询增强（自适应TopK/分解器/缓存）、配置模板化 |
+| **v6.3.0** | 状态码系统：统一 API 响应格式(status_code)、MMR 双模式去重、查询扩展增强、Gunicorn gthread 稳定性修复 |
+| v6.2.0 | 部署优化版：Docker 部署方案、会话管理 Repository 重构、查询增强（自适应TopK/分解器/缓存）、配置模板化 |
 | v6.1.0 | 部署准备版：表格摘要懒加载优化、MinerU解析器统一、出题系统增强、新增后端对接规范文档 |
 | v6.0.0 | 模块化架构重构：代码拆分为 core/api/parsers/knowledge/services/auth/exam_pkg 模块；新增图片提取功能；前端优化；统一入口 main.py |
 | v5.0.0 | 多向量库权限控制、文档生命周期、本地出卷系统、ODL解析、Semantic Chunker |

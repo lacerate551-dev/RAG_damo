@@ -15,7 +15,7 @@
 """
 
 import os
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app
 from auth.gateway import require_gateway_auth
 
 kb_bp = Blueprint('kb', __name__)
@@ -430,6 +430,32 @@ def get_document_versions(kb_name, filename):
             "versions": versions_data,
             "total": len(versions_data)
         })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@kb_bp.route('/collections/<kb_name>/update-image-descriptions', methods=['POST'])
+@require_gateway_auth
+def update_image_descriptions(kb_name):
+    """
+    更新图片切片的轻量级描述（提取图号/表号）
+
+    用于已入库的文档，重新生成图片描述以包含图号信息，提高检索准确度。
+
+    返回:
+    {
+        "success": true,
+        "image_count": 9,
+        "updated_count": 5
+    }
+    """
+    kb_manager, _, err = _require_multi_kb()
+    if err:
+        return err
+
+    try:
+        result = kb_manager.update_image_descriptions(kb_name)
+        return jsonify(result)
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 

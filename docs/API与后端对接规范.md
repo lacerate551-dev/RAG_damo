@@ -1,193 +1,153 @@
-# API与后端对接规范
-
-> 本文档由原《后端对接规范》与《API接口文档》合并而来，保留了完整的架构、权责边界设计以及最新的API定义。
-
 # RAG 服务 API 接口规范
 
 > 本文档供后端开发人员参考，用于对接 RAG 知识库服务。
+> 
+> **文档版本**: v3.1  
+> **最后更新**: 2026-04-26  
+> **维护者**: RAG服务开发组
 
 ---
 
-## 一、职责边界
+## 一、服务概述
 
-### 1.1 后端负责
+### 1.1 职责边界
 
-| 职责 | 说明 |
-|------|------|
-| **用户认证** | JWT/Session 验证，确保用户身份合法 |
-| **权限判断** | 判断用户可访问哪些知识库，生成 `collections` 列表 |
-| **会话管理** | 创建/删除会话，存储会话元数据 |
-| **消息存储** | 存储用户问题和 AI 回答的完整原文 |
-| **知识库权限表** | 维护用户与知识库的权限关系 |
+| 职责 | 后端负责 | RAG服务负责 |
+|------|----------|-------------|
+| **用户认证** | JWT/Session 验证 | - |
+| **权限判断** | 判断用户可访问的知识库 | - |
+| **会话管理** | 创建/删除会话，存储消息 | - |
+| **知识库问答** | - | 检索 + 生成回答 |
+| **向量检索** | - | 向量 + BM25 混合检索 |
+| **文档处理** | - | 上传、解析、切片、向量化 |
+| **反馈系统** | - | 收集反馈、FAQ 管理 |
 
-### 1.2 RAG 服务负责
-
-| 职责 | 说明 |
-|------|------|
-| **知识库问答** | 在指定知识库中检索，生成回答 |
-| **向量检索** | 向量相似度检索 + BM25 关键词检索 |
-| **返回溯源** | 返回答案来源（chunks），供前端展示 |
-| **文档处理** | 文档上传、切片、向量化 |
-
-### 1.3 数据流
+### 1.2 数据流
 
 ```
-┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
-│  前端   │───▶│  后端   │───▶│   RAG   │───▶│  后端   │
-└─────────┘    └─────────┘    └─────────┘    └─────────┘
-                    │                              │
-                    ▼                              ▼
-              ┌──────────┐                  ┌──────────┐
-              │ 权限判断 │                  │ 存储消息 │
-              │ 生成collections            │ 更新会话 │
-              └──────────┘                  └──────────┘
+┌─────────┐    ┌─────────┐    ┌─────────┐
+│  前端   │───▶│  后端   │───▶│   RAG   │
+└─────────┘    └─────────┘    └─────────┘
+                    │               │
+                    ▼               ▼
+              ┌──────────┐   ┌──────────┐
+              │ 权限判断 │   │ 向量检索 │
+              │ 会话管理 │   │ 生成回答 │
+              └──────────┘   └──────────┘
 ```
+
+### 1.3 服务端口
+
+- **默认端口**: 5001
+- **启动命令**: `python main.py`
 
 ---
 
 ## 二、认证方式
 
-### 2.1 模式说明
+### 2.1 生产模式（APP_ENV=prod）
 
-RAG 服务支持两种模式，通过环境变量 `DEV_MODE` 控制：
-
-| 模式 | DEV_MODE | Header | 适用场景 |
-|------|----------|--------|----------|
-| **开发模式** | `true` | 可选（支持模拟用户） | 前端测试、开发调试 |
-| **生产模式** | `false` | 不需要 | 后端直接调用 |
-
-### 2.2 生产模式调用（推荐）
-
-生产环境下，后端直接调用，**不需要传 Header**：
+后端调用 RAG 服务时，**不需要传认证 Header**。权限由后端通过 `collections` 参数控制。
 
 ```http
-POST http://rag-service:5001/rag
+POST http://localhost:5001/rag
 Content-Type: application/json
 
 {
   "message": "出差补助标准是什么？",
   "collections": ["public_kb", "dept_finance"],
-  "history": [
-    {"role": "user", "content": "之前的问题"},
-    {"role": "assistant", "content": "之前的回答"}
-  ]
+  "chat_history": []
 }
 ```
 
-**说明**：
-- 权限由后端控制，通过 `collections` 参数指定可访问的知识库
-- 会话由后端管理，通过 `history` 参数传入对话历史
-- RAG 服务完全无状态，只负责问答检索
+### 2.2 开发模式（APP_ENV=dev）
 
-### 2.3 开发模式调用
+支持模拟用户测试，可通过 Header 传递用户信息：
 
-开发环境下（`DEV_MODE=true`），支持模拟用户测试：
-
-**方式 1：使用模拟 Token**
 ```http
-POST http://rag-service:5001/rag
-Authorization: Bearer mock-token-admin
+POST http://localhost:5001/rag
 Content-Type: application/json
+X-User-ID: admin001
+X-User-Role: admin
+X-User-Department: 技术部
 
 {
   "message": "问题",
   "collections": ["public_kb"],
-  "history": []
-}
-```
-
-**方式 2：不传 Header（自动使用开发用户）**
-```http
-POST http://rag-service:5001/rag
-Content-Type: application/json
-
-{
-  "message": "问题",
-  "collections": ["public_kb"],
-  "history": []
+  "chat_history": []
 }
 ```
 
 **模拟用户列表**：
-| Token | user_id | role | department |
-|-------|---------|------|------------|
-| `mock-token-admin` | admin001 | admin | 管理部 |
-| `mock-token-manager` | manager001 | manager | 财务部 |
-| `mock-token-user` | user001 | user | 技术部 |
 
-### 2.4 环境配置
+| X-User-ID | X-User-Role | 说明 |
+|-----------|-------------|------|
+| admin001 | admin | 管理员 |
+| manager001 | manager | 部门管理员 |
+| user001 | user | 普通用户 |
+
+### 2.3 环境配置
 
 ```bash
-# 开发环境（默认）
-DEV_MODE=true
-
 # 生产环境
-DEV_MODE=false
+APP_ENV=prod
+DASHSCOPE_API_KEY=your-api-key-here
+
+# 开发环境（默认）
+APP_ENV=dev
 ```
 
 ---
 
-## 三、问答接口
+## 三、核心接口
 
-### 3.1 普通聊天
+### 3.1 健康检查
 
 ```
-POST /chat
+GET /health
 ```
 
-**请求体：**
+**认证**: 不需要
+
+**响应**:
 ```json
 {
-  "message": "用户消息",
-  "history": [
-    {"role": "user", "content": "历史问题"},
-    {"role": "assistant", "content": "历史回答"}
-  ]
+  "status": "ok",
+  "knowledge_base": "多向量库模式 (按集合提供服务)",
+  "bm25_index": "动态按需加载",
+  "mode": "Agentic RAG"
 }
 ```
 
-**响应：**
-```json
-{
-  "answer": "AI 回复内容",
-  "mode": "chat",
-  "sources": [],
-  "web_searched": false
-}
-```
-
-### 3.2 知识库问答（核心接口 - SSE 流式返回）
+### 3.2 知识库问答（核心接口）
 
 ```
 POST /rag
 ```
 
-> **重要变更**：`/rag` 接口已升级为 **SSE 流式返回**，不再返回阻塞 JSON。
-> 原独立的 `/rag/stream` 端点已合并至此端点。
+**认证**: 不需要（生产模式）
 
-**请求体：**
+**请求体**:
 ```json
 {
   "message": "用户问题",
   "collections": ["public_kb", "dept_finance"],
-  "session_id": "可选，用于后端日志追踪",
-  "history": [
+  "chat_history": [
     {"role": "user", "content": "历史问题"},
     {"role": "assistant", "content": "历史回答"}
   ]
 }
 ```
 
-**参数说明：**
+**参数说明**:
 
 | 参数 | 类型 | 必需 | 说明 |
 |------|------|------|------|
 | `message` | string | ✅ | 用户问题 |
 | `collections` | string[] | ✅ | 用户有权限的知识库列表，由后端判断后传入 |
-| `session_id` | string | ❌ | 会话标识（首次对话不传，后续对话传入以加载历史） |
-| `history` | array | ❌ | 对话历史（可选，如传入 session_id 则自动加载） |
+| `chat_history` | array | ✅ | 对话历史（生产环境必须传入） |
 
-**响应：SSE 流式事件**
+**响应**: SSE 流式返回
 
 ```
 Content-Type: text/event-stream
@@ -200,30 +160,27 @@ data: {"type": "chunk", "content": "根"}
 
 data: {"type": "chunk", "content": "据"}
 
-data: {"type": "chunk", "content": "公司"}
-
 ...
 
-data: {"type": "finish", "answer": "完整答案...", "mode": "rag", "session_id": "xxx", "sources": [...], "images": [], "tables": [], "sections": [], "duration_ms": 1500}
+data: {"type": "finish", "answer": "完整答案...", "mode": "rag", "sources": [...], "images": [], "tables": [], "duration_ms": 1500}
 ```
 
-**SSE 事件类型：**
+**SSE 事件类型**:
 
-| 事件类型 | 字段 | 说明 |
-|---------|------|------|
-| `start` | `message` | 开始处理，前端可显示加载状态 |
-| `sources` | `sources` | 检索到的来源，可提前展示溯源 |
-| `chunk` | `content` | 每个 token，用于打字机效果 |
-| `finish` | 完整响应对象 | **必须消费**，包含完整答案用于存储 |
-| `error` | `message`, `traceback` | 错误事件，前端显示错误提示 |
+| 事件类型 | 说明 |
+|---------|------|
+| `start` | 开始处理 |
+| `sources` | 检索到的来源 |
+| `chunk` | 每个 token（打字机效果） |
+| `finish` | 完整响应对象（**必须消费**） |
+| `error` | 错误事件 |
 
-**finish 事件完整结构：**
+**finish 事件结构**:
 ```json
 {
   "type": "finish",
   "answer": "完整答案文本",
   "mode": "rag",
-  "session_id": "会话ID（首次对话自动创建）",
   "sources": [
     {
       "source": "文档名.pdf",
@@ -235,107 +192,27 @@ data: {"type": "finish", "answer": "完整答案...", "mode": "rag", "session_id
       "score": 0.856
     }
   ],
-  "images": [
-    {
-      "id": "img_001",
-      "caption": "图片描述",
-      "url": "/images/img_001",
-      "source": "文档名.pdf",
-      "page": 2
-    }
-  ],
+  "images": [],
   "tables": [],
   "sections": ["章节路径"],
   "duration_ms": 1500
 }
 ```
 
-**sources 字段说明（Phase 2.1 更新）：**
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `source` | string | 来源文件名 |
-| `page` | int | 起始页码 |
-| `page_end` | int\|null | 结束页码（跨页切片时有值） |
-| `page_range` | string | 页码范围显示文本，如 `"5"` 或 `"5-8"` |
-| `section` | string | 所属章节路径 |
-| `chunk_type` | string | 切片类型：`text`、`table`、`image` |
-| `score` | float | 相关性分数（0-1） |
-
-**前端显示建议：**
-- 单页：`第5页`
-- 跨页：`第5-8页`
-- 带章节：`第5页 / 1. Introduction`
-
-**后端消费示例（JavaScript）：**
-```javascript
-const response = await fetch('http://rag-service:5001/rag', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    message: '出差补助标准是什么？',
-    collections: ['public_kb'],
-    history: []
-  })
-});
-
-const reader = response.body.getReader();
-const decoder = new TextDecoder();
-let fullAnswer = '';
-let sources = [];
-
-while (true) {
-  const { done, value } = await reader.read();
-  if (done) break;
-
-  const text = decoder.decode(value);
-  const lines = text.split('\n');
-
-  for (const line of lines) {
-    if (line.startsWith('data: ')) {
-      const event = JSON.parse(line.slice(6));
-
-      switch (event.type) {
-        case 'start':
-          console.log('开始处理:', event.message);
-          break;
-        case 'sources':
-          sources = event.sources;
-          break;
-        case 'chunk':
-          fullAnswer += event.content;
-          // 可实时推送给前端显示打字机效果
-          break;
-        case 'finish':
-          // 使用完整答案存储到数据库
-          fullAnswer = event.answer;  // 以 finish 中的为准
-          sources = event.sources;
-          break;
-        case 'error':
-          console.error('RAG 错误:', event.message);
-          break;
-      }
-    }
-  }
-}
-
-// 存储 fullAnswer 和 sources 到数据库
-```
-
-**后端消费示例（Python）：**
+**后端消费示例（Python）**:
 ```python
 import requests
 import json
 
 def call_rag_stream(message, collections, history=None):
     response = requests.post(
-        'http://rag-service:5001/rag',
+        'http://localhost:5001/rag',
         json={
             'message': message,
             'collections': collections,
-            'history': history or []
+            'chat_history': history or []
         },
-        stream=True  # 启用流式读取
+        stream=True
     )
 
     full_answer = ''
@@ -349,14 +226,12 @@ def call_rag_stream(message, collections, history=None):
         if line.startswith('data: '):
             event = json.loads(line[6:])
 
-            if event['type'] == 'start':
-                print(f"开始: {event['message']}")
-            elif event['type'] == 'sources':
+            if event['type'] == 'sources':
                 sources = event['sources']
             elif event['type'] == 'chunk':
                 full_answer += event['content']
             elif event['type'] == 'finish':
-                full_answer = event['answer']  # 以 finish 为准
+                full_answer = event['answer']
                 sources = event['sources']
                 break
             elif event['type'] == 'error':
@@ -366,67 +241,23 @@ def call_rag_stream(message, collections, history=None):
 
 # 使用
 answer, sources = call_rag_stream('出差补助标准是什么？', ['public_kb'])
-# 存储 answer 和 sources 到数据库
 ```
 
-### 3.3 会话管理（多轮对话）
-
-> **开发环境特性**：RAG 服务内置 SQLite 会话存储，支持完整的多轮对话测试。
-
-**会话管理流程：**
+### 3.3 普通聊天
 
 ```
-首次对话:
-POST /rag { "message": "出差补助标准", "collections": ["public_kb"] }
-    ↓
-finish 事件返回 session_id
-    ↓
-前端保存 session_id
-
-后续对话:
-POST /rag { "message": "它有什么限制", "session_id": "xxx", "collections": ["public_kb"] }
-    ↓
-RAG 服务自动加载历史 → Query Rewriting 消歧 → 生成回答
-    ↓
-finish 事件返回相同 session_id
+POST /chat
 ```
 
-**关键点：**
-1. 首次对话不传 `session_id`，RAG 服务自动创建新会话
-2. 后续对话传入 `session_id`，RAG 服务自动加载历史（无需前端传 `history`）
-3. Query Rewriting 会利用历史上下文进行消歧和实体补全
-
-**会话相关 API：**
-
-| 接口 | 说明 |
-|------|------|
-| `GET /sessions` | 获取用户会话列表 |
-| `GET /history/<session_id>` | 获取会话历史 |
-| `DELETE /session/<session_id>` | 删除会话 |
-
-**后端实现参考（数据库表结构）：**
-
-```sql
-CREATE TABLE sessions (
-    session_id VARCHAR(64) PRIMARY KEY,
-    user_id VARCHAR(64) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    metadata JSON
-);
-
-CREATE TABLE messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id VARCHAR(64) NOT NULL,
-    role VARCHAR(20) NOT NULL,  -- 'user' 或 'assistant'
-    content TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-);
-
-CREATE INDEX idx_messages_session ON messages(session_id);
-CREATE INDEX idx_sessions_user ON sessions(user_id);
+**请求体**:
+```json
+{
+  "message": "用户消息",
+  "chat_history": []
+}
 ```
+
+**响应**: SSE 流式返回（同 /rag）
 
 ### 3.4 混合检索
 
@@ -434,16 +265,16 @@ CREATE INDEX idx_sessions_user ON sessions(user_id);
 POST /search
 ```
 
-**请求体：**
+**请求体**:
 ```json
 {
-  "query": "检索关键词",
-  "top_k": 5,
-  "collections": ["public_kb", "dept_finance"]
+  "message": "检索关键词",
+  "collections": ["public_kb"],
+  "chat_history": []
 }
 ```
 
-**响应：**
+**响应**:
 ```json
 {
   "contexts": ["文档片段1", "文档片段2"],
@@ -465,16 +296,16 @@ POST /search
 GET /collections
 ```
 
-**响应：**
+**响应**:
 ```json
 {
   "collections": [
     {
       "name": "public_kb",
       "display_name": "公开知识库",
-      "document_count": 150,
-      "department": null,
-      "description": "全员可访问"
+      "document_count": 137,
+      "department": "",
+      "description": "所有人可访问"
     }
   ],
   "total": 1
@@ -487,54 +318,89 @@ GET /collections
 POST /collections
 ```
 
-**请求体：**
+**请求体**:
 ```json
 {
   "name": "dept_finance",
   "display_name": "财务部知识库",
-  "department": "财务部",
+  "department": "finance",
   "description": "财务部专用知识库"
 }
 ```
 
-### 4.3 修改向量库
-
-```
-PUT /collections/<name>
-```
-
-### 4.4 删除向量库
+### 4.3 删除向量库
 
 ```
 DELETE /collections/<name>
+```
+
+### 4.4 获取向量库文档列表
+
+```
+GET /collections/<kb_name>/documents
+```
+
+**响应**:
+```json
+{
+  "collection": "public_kb",
+  "documents": [
+    {"source": "文档名.pdf", "chunks": 30}
+  ],
+  "total": 3
+}
+```
+
+### 4.5 知识库路由测试
+
+```
+POST /kb/route
+```
+
+**请求体**:
+```json
+{
+  "query": "财务部报销流程"
+}
+```
+
+**响应**:
+```json
+{
+  "target_collections": ["dept_finance", "public_kb"],
+  "routing_reason": "检测到部门关键词"
+}
 ```
 
 ---
 
 ## 五、文档管理接口
 
-### 5.1 上传单个文件
+### 5.1 上传文档
 
 ```
 POST /documents/upload
 Content-Type: multipart/form-data
 ```
 
-**表单参数：**
-- `file`: 文件（必需）
-- `collection`: 目标向量库名称（必需）
+**表单参数**:
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `file` | file | ✅ | 文件 |
+| `collection` | string | ✅ | 目标向量库名称 |
 
-**响应：**
+**响应**:
 ```json
 {
   "success": true,
-  "message": "文件上传成功，已保存并添加到向量库",
+  "message": "文件上传成功，已添加到向量库",
   "file": {
     "filename": "document.pdf",
     "collection": "public_kb",
     "path": "public/document.pdf",
     "size": 1024000
-  }
+  },
+  "chunk_count": 15
 }
 ```
 
@@ -545,14 +411,31 @@ POST /documents/batch-upload
 Content-Type: multipart/form-data
 ```
 
-**表单参数：**
-- `files`: 文件列表（必需）
-- `collection`: 目标向量库名称（必需）
+**表单参数**:
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `files` | file[] | ✅ | 文件列表 |
+| `collection` | string | ✅ | 目标向量库名称 |
 
 ### 5.3 文档列表
 
 ```
-GET /documents/list?collection=public_kb
+GET /documents/list
+```
+
+**响应**:
+```json
+{
+  "documents": [
+    {
+      "collection": "public_kb",
+      "filename": "文档名.pdf",
+      "path": "public_kb/文档名.pdf",
+      "size": 1024000,
+      "last_modified": "2026-04-26T10:00:00"
+    }
+  ]
+}
 ```
 
 ### 5.4 删除文档
@@ -561,162 +444,295 @@ GET /documents/list?collection=public_kb
 DELETE /documents/<path>
 ```
 
-### 5.5 查看文件切片
+### 5.5 查看文档切片
 
 ```
 GET /documents/<path>/chunks
 ```
 
-**响应：**
-```json
-{
-  "success": true,
-  "document_id": "public/document.pdf",
-  "collection": "public_kb",
-  "chunks": [
-    {
-      "id": "chunk_001",
-      "content": "切片内容...",
-      "metadata": {"page": 1, "section": "第一章"}
-    }
-  ],
-  "total": 25
-}
+### 5.6 文档状态
+
+```
+GET /documents/<path>/status
 ```
 
 ---
 
-## 六、同步服务接口
+## 六、切片管理接口
 
-> **注意**：同步服务用于检测文档变更并自动更新向量库。订阅通知功能由后端负责。
-
-### 6.1 触发同步
+### 6.1 新增切片
 
 ```
-POST /sync
+POST /chunks
 ```
 
-**请求体（可选）：**
+**请求体**:
 ```json
 {
-  "collection": "向量库名称",  // 可选，不传则同步所有
-  "full_sync": false          // 是否全量同步，默认 false
+  "collection": "public_kb",
+  "document_id": "doc_001",
+  "content": "切片内容",
+  "metadata": {"page": 1, "section": "第一章"}
 }
 ```
 
-**响应：**
-```json
-{
-  "success": true,
-  "result": {
-    "added": 3,
-    "updated": 2,
-    "deleted": 1,
-    "errors": []
-  }
-}
+### 6.2 修改切片
+
+```
+PUT /chunks/<chunk_id>
 ```
 
-### 6.2 同步状态
+### 6.3 删除切片
+
+```
+DELETE /chunks/<chunk_id>
+```
+
+---
+
+## 七、同步服务接口
+
+### 7.1 同步状态
 
 ```
 GET /sync/status
 ```
 
-**响应：**
+**响应**:
 ```json
 {
   "enabled": true,
-  "monitoring": true,
-  "last_sync": "2026-04-19T18:30:00",
-  "documents_tracked": 150
+  "monitoring": false,
+  "last_sync": null,
+  "documents_tracked": 0
 }
 ```
 
-### 6.3 同步历史
+### 7.2 触发同步
+
+```
+POST /sync
+```
+
+**请求体**（可选）:
+```json
+{
+  "collection": "public_kb",
+  "full_sync": false
+}
+```
+
+### 7.3 同步历史
 
 ```
 GET /sync/history?limit=20
 ```
 
-**参数：**
-
-| 参数 | 类型 | 必需 | 说明 |
-|------|------|------|------|
-| `limit` | int | ❌ | 返回记录数，默认 20 |
-
-**响应：**
-```json
-{
-  "history": [
-    {
-      "sync_time": "2026-04-19T18:30:00",
-      "collection": "public_kb",
-      "added": 3,
-      "updated": 2,
-      "deleted": 1,
-      "status": "success"
-    }
-  ]
-}
-```
-
-### 6.4 变更日志
+### 7.4 变更日志
 
 ```
-GET /sync/changes?limit=50&collection=public_kb
+GET /sync/changes?limit=50
 ```
 
-**参数：**
-
-| 参数 | 类型 | 必需 | 说明 |
-|------|------|------|------|
-| `limit` | int | ❌ | 返回记录数，默认 50 |
-| `collection` | string | ❌ | 过滤指定向量库 |
-
-**响应：**
-```json
-{
-  "changes": [
-    {
-      "change_time": "2026-04-19T18:25:00",
-      "document": "规章制度/考勤制度.docx",
-      "change_type": "modified",
-      "collection": "public_kb"
-    }
-  ]
-}
-```
-
-### 6.5 启动/停止文件监控
+### 7.5 启动/停止监控
 
 ```
 POST /sync/start
 POST /sync/stop
 ```
 
-**响应：**
+---
+
+## 八、图片服务接口
+
+### 8.1 获取图片
+
+```
+GET /images/<image_id>
+```
+
+**响应**: 图片二进制数据
+
+### 8.2 图片信息
+
+```
+GET /images/<image_id>/info
+```
+
+### 8.3 图片列表
+
+```
+GET /images/list?limit=20
+```
+
+**响应**:
 ```json
 {
-  "message": "文件监控已启动"
+  "images": [
+    {
+      "image_id": "abc123",
+      "size_bytes": 56932,
+      "url": "/images/abc123"
+    }
+  ],
+  "total": 11
 }
+```
+
+### 8.4 图片统计
+
+```
+GET /images/stats
 ```
 
 ---
 
-## 七、出题接口
+## 九、反馈系统接口
 
-### 7.1 生成题目
+### 9.1 提交反馈
+
+```
+POST /feedback
+```
+
+**请求体**:
+```json
+{
+  "session_id": "xxx",
+  "query": "问题内容",
+  "answer": "回答内容",
+  "rating": 1,
+  "sources": ["doc.pdf"],
+  "reason": "回答准确"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `rating` | int | `1`=赞, `-1`=踩 |
+
+### 9.2 反馈统计
+
+```
+GET /feedback/stats
+```
+
+**响应**:
+```json
+{
+  "success": true,
+  "stats": {
+    "total_feedback": 4,
+    "positive_count": 4,
+    "negative_count": 0,
+    "satisfaction_rate": 100.0
+  }
+}
+```
+
+### 9.3 反馈列表
+
+```
+GET /feedback/list
+```
+
+### 9.4 周报/月报
+
+```
+GET /reports/weekly
+GET /reports/monthly
+```
+
+---
+
+## 十、FAQ 管理接口
+
+### 10.1 FAQ 列表
+
+```
+GET /faq
+```
+
+**响应**:
+```json
+{
+  "faqs": [
+    {
+      "id": 1,
+      "question": "问题",
+      "answer": "答案",
+      "frequency": 5,
+      "status": "approved"
+    }
+  ]
+}
+```
+
+### 10.2 新增 FAQ
+
+```
+POST /faq
+```
+
+**请求体**:
+```json
+{
+  "question": "问题",
+  "answer": "答案",
+  "source_documents": ["doc.pdf"]
+}
+```
+
+### 10.3 更新/删除 FAQ
+
+```
+PUT /faq/<faq_id>
+DELETE /faq/<faq_id>
+```
+
+### 10.4 FAQ 建议列表
+
+```
+GET /faq/suggestions
+```
+
+### 10.5 批准/拒绝建议
+
+```
+POST /faq/suggestions/<id>/approve
+POST /faq/suggestions/<id>/reject
+```
+
+---
+
+## 十一、出题系统接口
+
+### 11.1 健康检查
+
+```
+GET /exam/health
+```
+
+**响应**:
+```json
+{
+  "service": "exam-api",
+  "status": "ok",
+  "version": "2.0"
+}
+```
+
+### 11.2 生成题目
 
 ```
 POST /exam/generate
 ```
 
-**请求体：**
+**请求体**:
 ```json
 {
   "file_path": "public/考勤制度.docx",
-  "collection": "dept_a_kb",
+  "collection": "public_kb",
   "question_types": {
     "single_choice": 3,
     "multiple_choice": 2,
@@ -729,29 +745,11 @@ POST /exam/generate
 }
 ```
 
-**参数说明：**
-
-| 参数 | 类型 | 必需 | 说明 |
-|------|------|------|------|
-| `file_path` | string | ✅ | 文件路径（相对于 documents 目录） |
-| `collection` | string 或 string[] | ✅ | 向量库名称，支持数组（按优先级排序） |
-| `question_types` | object | ✅ | 题型及数量，键为题型名，值为数量 |
-| `difficulty` | int | ❌ | 难度等级 1-5，默认 3 |
-| `request_id` | string | ❌ | 请求 ID，相同 ID 返回缓存结果（幂等性） |
-
-**collection 参数说明：**
-
-后端应根据用户权限传入可访问的向量库列表：
-- 单个向量库：`"dept_a_kb"`
-- 多个向量库：`["dept_a_kb", "public_kb"]`（按优先级排序，优先在第一个库检索）
-
-**响应：**
+**响应**:
 ```json
 {
   "success": true,
-  "request_id": "xxx",
   "total": 10,
-  "source_chunks_used": 15,
   "questions": [
     {
       "question_type": "single_choice",
@@ -761,703 +759,367 @@ POST /exam/generate
         "data": {
           "options": [
             {"key": "A", "content": "选项A"},
-            {"key": "B", "content": "选项B"},
-            {"key": "C", "content": "选项C"},
-            {"key": "D", "content": "选项D"}
+            {"key": "B", "content": "选项B"}
           ]
         },
         "answer": "B",
-        "explanation": "答案解析"
+        "explanation": "解析"
       },
       "source_trace": {
         "document_name": "考勤制度.docx",
-        "chunk_ids": ["chunk_001"],
-        "page_numbers": [5],
-        "sources": [
-          {
-            "chunk_id": "chunk_001",
-            "page": 5,
-            "section": "请假制度",
-            "snippet": "原文片段..."
-          }
-        ]
+        "page_numbers": [5]
       }
     }
   ]
 }
 ```
 
-**题型与 answer 格式对照：**
-
-| 题型 | question_type | answer 格式 | data 字段 |
-|------|---------------|-------------|-----------|
-| 单选题 | single_choice | `"B"` | `options[]` |
-| 多选题 | multiple_choice | `["A", "C"]` | `options[]` |
-| 判断题 | true_false | `true` / `false` | 无 |
-| 填空题 | fill_blank | `[["答案1"], ["答案2", "同义词"]]` | `blank_count` |
-| 简答题 | subjective | `"参考范文..."` | `scoring_points[]` |
-
-**后端职责：**
-
-| 操作 | 说明 |
-|------|------|
-| 权限校验 | 判断用户是否有出题权限（通常为管理员） |
-| 生成 question_id | 入库时生成 UUID |
-| 设置 score | 根据题型或配置设定满分 |
-| 添加 tags | 根据业务需求添加标签 |
-| 审核入库 | 人工或自动审核后存入题库 |
-
-**错误响应格式：**
-
-```json
-{
-  "success": false,
-  "error": "错误描述",
-  "error_code": "ERROR_CODE"
-}
-```
-
-**常见错误码：**
-
-| 错误码 | HTTP 状态码 | 说明 |
-|--------|-------------|------|
-| `FILE_NOT_FOUND` | 404 | 指定文件不存在 |
-| `COLLECTION_NOT_FOUND` | 404 | 指定向量库不存在 |
-| `NO_CONTENT` | 400 | 文件内容为空，无法出题 |
-| `LLM_ERROR` | 500 | LLM 调用失败 |
-| `PARSE_ERROR` | 500 | 解析 LLM 响应失败 |
-
-**幂等性说明：**
-
-- 传入 `request_id` 时，相同 ID 会返回缓存结果
-- 缓存有效期：24 小时
-- 建议后端生成 UUID 作为 `request_id`，便于追踪和去重
-
-### 7.2 批改答案
+### 11.3 批改答案
 
 ```
 POST /exam/grade
 ```
 
-#### 请求体
-
+**请求体**:
 ```json
 {
-  "request_id": "可选，用于幂等性追踪",
   "answers": [
     {
-      "question_id": "uuid-001",
+      "question_id": "q001",
       "question_type": "single_choice",
       "question_content": {
-        "stem": "题干内容",
-        "data": {"options": [{"key": "A", "content": "选项A"}, {"key": "B", "content": "选项B"}]},
+        "stem": "题干",
+        "data": {"options": [...]},
         "answer": "B"
       },
       "student_answer": "A",
       "max_score": 2.0
-    },
-    {
-      "question_id": "uuid-002",
-      "question_type": "multiple_choice",
-      "question_content": {
-        "stem": "多选题题干",
-        "data": {"options": [...]},
-        "answer": ["A", "C"]
-      },
-      "student_answer": ["A", "B"],
-      "max_score": 4.0
-    },
-    {
-      "question_id": "uuid-003",
-      "question_type": "true_false",
-      "question_content": {
-        "stem": "判断题题干",
-        "answer": "T"
-      },
-      "student_answer": "F",
-      "max_score": 2.0
-    },
-    {
-      "question_id": "uuid-004",
-      "question_type": "fill_blank",
-      "question_content": {
-        "stem": "填空题有___个空",
-        "answer": [["答案1", "同义词1"], ["答案2"]]
-      },
-      "student_answer": ["学生答案1", "学生答案2"],
-      "max_score": 4.0
-    },
-    {
-      "question_id": "uuid-005",
-      "question_type": "subjective",
-      "question_content": {
-        "stem": "简答题题干",
-        "data": {
-          "scoring_points": [
-            {"point": "要点1", "weight": 0.4},
-            {"point": "要点2", "weight": 0.6}
-          ]
-        },
-        "answer": "参考答案..."
-      },
-      "student_answer": "学生作答内容...",
-      "max_score": 10.0
     }
   ]
 }
 ```
 
-#### 请求参数说明
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `request_id` | string | 否 | 请求 ID，用于追踪和幂等性 |
-| `answers` | array | 是 | 答案列表 |
-
-**answers 数组中每个对象的字段：**
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `question_id` | string | **是** | 题目 ID（后端生成，用于匹配结果） |
-| `question_type` | string | 是 | 题型：single_choice/multiple_choice/true_false/fill_blank/subjective |
-| `question_content` | object | 是 | 题目内容（从出题结果中获取） |
-| `student_answer` | any | 是 | 学生答案（格式见下表） |
-| `max_score` | number | 是 | 该题满分 |
-
-**各题型 student_answer 格式：**
-
-| 题型 | 格式 | 示例 |
-|------|------|------|
-| single_choice | string | `"B"` |
-| multiple_choice | array | `["A", "C"]` |
-| true_false | string | `"T"` 或 `"F"` |
-| fill_blank | array | `["答案1", "答案2"]` |
-| subjective | string | `"学生作答的长文本..."` |
-
-#### 响应
-
+**响应**:
 ```json
 {
   "success": true,
-  "request_id": "可选，原样返回",
   "total_score": 12.5,
   "total_max_score": 22.0,
   "score_rate": 56.8,
   "results": [
     {
-      "question_id": "uuid-001",
+      "question_id": "q001",
       "score": 0,
       "max_score": 2.0,
       "correct": false,
       "feedback": "正确答案: B"
-    },
-    {
-      "question_id": "uuid-002",
-      "score": 0,
-      "max_score": 4.0,
-      "correct": false,
-      "feedback": "正确答案: ['A', 'C']"
-    },
-    {
-      "question_id": "uuid-003",
-      "score": 0,
-      "max_score": 2.0,
-      "correct": false,
-      "feedback": "正确答案: T"
-    },
-    {
-      "question_id": "uuid-004",
-      "score": 2.0,
-      "max_score": 4.0,
-      "details": {
-        "blank_scores": [2.0, 0],
-        "correct_answers": [["答案1", "同义词1"], ["答案2"]]
-      }
-    },
-    {
-      "question_id": "uuid-005",
-      "score": 7.5,
-      "max_score": 10.0,
-      "details": {
-        "scoring_breakdown": [
-          {"point": "要点1", "weight": 0.4, "achieved": 0.35, "comment": "部分掌握"},
-          {"point": "要点2", "weight": 0.6, "achieved": 0.55, "comment": "基本掌握"}
-        ],
-        "highlights": ["思路清晰"],
-        "shortcomings": ["细节不够完整"],
-        "overall_feedback": "整体回答良好，建议补充细节。"
-      }
     }
   ]
 }
 ```
 
-#### 批卷逻辑说明
+---
 
-| 题型 | 批卷方式 | 说明 |
-|------|----------|------|
-| single_choice | 本地判断 | 学生答案 == 正确答案 |
-| multiple_choice | 本地判断 | set(学生答案) == set(正确答案)，顺序无关 |
-| true_false | 本地判断 | 学生答案 == 正确答案 |
-| fill_blank | 本地模糊匹配 | 按空给分，支持同义词匹配（忽略大小写和空格） |
-| subjective | LLM 评分 | 并发调用 LLM，带重试和限流机制 |
+## 十二、版本管理接口
 
-#### 注意事项
-
-1. **question_id 必填**：用于匹配批卷结果，后端需在调用时传入
-2. **顺序保证**：results 数组顺序与 answers 数组顺序一致
-3. **主观题超时**：主观题批阅有 15 秒超时，失败时返回 score=0
-4. **填空题同义词**：answer 字段支持同义词数组，如 `[["北京", "Beijing"]]`
-
-#### 后端对接流程
-
-**重要：RAG 服务是无状态的，不存储题库数据。所有题目信息需由后端传入。**
+### 12.1 废止文档
 
 ```
-完整批卷流程：
-
-┌─────────────┐                    ┌─────────────┐
-│   后端      │                    │  RAG 服务   │
-├─────────────┤                    ├─────────────┤
-│ 1. 接收学生答案                    │             │
-│ 2. 查询数据库获取题目              │             │
-│ 3. 组装请求 ────────────────────▶ │ 4. 批卷处理 │
-│                                   │   - 客观题：本地比对
-│                                   │   - 主观题：LLM评分
-│ 6. 更新学生成绩 ◀──────────────── │ 5. 返回结果 │
-│    (根据 question_id 匹配)         │             │
-└─────────────┘                    └─────────────┘
+POST /collections/<kb_name>/documents/<path:filename>/deprecate
 ```
 
-**Step 1: 接收学生答案**
-
-```python
-# 学生提交的答案
-student_answers = {
-    "exam_id": "exam-uuid",
-    "student_id": "student-uuid",
-    "answers": [
-        {"question_id": "q-001", "answer": "B"},
-        {"question_id": "q-002", "answer": ["A", "C"]},
-        {"question_id": "q-003", "answer": "三峡水库主要用于防洪..."}
-    ]
+**请求体**:
+```json
+{
+  "reason": "制度已更新"
 }
 ```
 
-**Step 2: 从数据库查询题目信息**
+### 12.2 恢复文档
 
-```python
-def get_questions_for_grading(exam_id, answer_list):
-    """根据 question_id 批量查询题目信息"""
-    question_ids = [a['question_id'] for a in answer_list]
-
-    questions = db.query("""
-        SELECT question_id, question_type, content, score
-        FROM questions
-        WHERE question_id IN (?)
-    """, question_ids)
-
-    # 转为字典方便查找
-    return {q.question_id: q for q in questions}
+```
+POST /collections/<kb_name>/documents/<path:filename>/restore
 ```
 
-**Step 3: 组装批卷请求**
+### 12.3 版本历史
 
-```python
-def build_grade_request(answer_list, questions_map):
-    """组装 RAG 批卷接口所需的请求格式"""
-    grade_answers = []
-
-    for ans in answer_list:
-        qid = ans['question_id']
-        question = questions_map.get(qid)
-
-        if not question:
-            continue
-
-        grade_answers.append({
-            "question_id": qid,
-            "question_type": question.question_type,
-            "question_content": question.content,  # 含正确答案
-            "student_answer": ans['answer'],
-            "max_score": question.score
-        })
-
-    return {"answers": grade_answers}
 ```
-
-**Step 4: 调用 RAG 批卷接口**
-
-```python
-def call_rag_grade(grade_request):
-    """调用 RAG 批卷接口"""
-    response = requests.post(
-        'http://rag-service:5001/exam/grade',
-        json=grade_request
-    )
-    return response.json()
+GET /collections/<kb_name>/documents/<path:filename>/versions
 ```
-
-**Step 5: 更新学生成绩**
-
-```python
-def update_student_scores(student_id, exam_id, grade_result):
-    """根据批卷结果更新学生成绩"""
-    for result in grade_result['results']:
-        qid = result['question_id']
-
-        db.execute("""
-            INSERT INTO student_answers (
-                student_id, exam_id, question_id,
-                score, max_score, details
-            ) VALUES (?, ?, ?, ?, ?, ?)
-        """,
-            student_id, exam_id, qid,
-            result['score'], result['max_score'],
-            json.dumps(result.get('details', {}))
-        )
-
-    # 更新总分
-    db.execute("""
-        UPDATE student_exams
-        SET total_score = ?, score_rate = ?, graded_at = NOW()
-        WHERE student_id = ? AND exam_id = ?
-    """,
-        grade_result['total_score'],
-        grade_result['score_rate'],
-        student_id, exam_id
-    )
-```
-
-**完整调用示例**
-
-```python
-def grade_student_exam(student_answers):
-    """批阅学生试卷完整流程"""
-
-    # 1. 查询题目信息
-    questions_map = get_questions_for_grading(
-        student_answers['exam_id'],
-        student_answers['answers']
-    )
-
-    # 2. 组装请求
-    grade_request = build_grade_request(
-        student_answers['answers'],
-        questions_map
-    )
-
-    # 3. 调用 RAG 批卷
-    grade_result = call_rag_grade(grade_request)
-
-    # 4. 更新成绩
-    update_student_scores(
-        student_answers['student_id'],
-        student_answers['exam_id'],
-        grade_result
-    )
-
-    return grade_result
-```
-
-#### 数据来源说明
-
-| 字段 | 来源 | 说明 |
-|------|------|------|
-| `question_id` | 后端数据库 | 用于匹配返回结果，更新成绩 |
-| `question_type` | 后端数据库 | 题型，决定批卷方式 |
-| `question_content.answer` | 后端数据库 | 正确答案（客观题直接比对，主观题作为参考） |
-| `question_content.data` | 后端数据库 | 题目附加数据（选项、评分标准等） |
-| `student_answer` | 学生提交 | 学生作答内容 |
-| `max_score` | 后端数据库 | 该题满分 |
 
 ---
 
-## 七点五、出题接口 - 后端对接指南
+## 十三、纲要生成接口
 
-### 7.5.1 后端需要做的事情
+### 13.1 生成纲要
 
-**Step 1: 权限校验**
-
-```python
-def check_exam_permission(user_id):
-    """检查用户是否有出题权限"""
-    user = get_user(user_id)
-    # 通常只有管理员和部门管理员有出题权限
-    return user.role in ['admin', 'manager']
+```
+POST /outline
 ```
 
-**Step 2: 获取用户可访问的向量库**
-
-```python
-def get_user_collections(user_id):
-    """获取用户有权限的向量库列表（按优先级排序）"""
-    permissions = db.query("""
-        SELECT kb_name, permission
-        FROM kb_permissions
-        WHERE user_id = ?
-        ORDER BY
-            CASE permission
-                WHEN 'admin' THEN 1
-                WHEN 'write' THEN 2
-                WHEN 'read' THEN 3
-            END
-    """, user_id)
-
-    return [p.kb_name for p in permissions]
+**请求体**:
+```json
+{
+  "document_id": "员工手册_v2.pdf",
+  "force": false
+}
 ```
 
-**Step 3: 调用 RAG 出题接口**
+### 13.2 获取纲要
 
+```
+GET /outline/<document_id>
+```
+
+### 13.3 导出纲要
+
+```
+GET /outline/<document_id>/export?format=markdown
+```
+
+### 13.4 纲要列表
+
+```
+GET /outline/list
+```
+
+---
+
+## 十四、关联推荐接口
+
+### 14.1 获取关联推荐
+
+```
+GET /recommend/<document_id>?top_k=5
+```
+
+---
+
+## 十五、用户接口
+
+### 15.1 当前用户信息
+
+```
+GET /auth/me
+```
+
+**响应**:
+```json
+{
+  "user_id": "admin001",
+  "username": "管理员",
+  "role": "admin",
+  "department": "技术部"
+}
+```
+
+### 15.2 系统统计
+
+```
+GET /stats
+```
+
+**响应**:
+```json
+{
+  "total_messages": 176,
+  "total_sessions": 25,
+  "total_users": 2
+}
+```
+
+---
+
+## 十七、企业文件系统集成
+
+### 17.1 概述
+
+RAG 服务支持从企业现有文件系统获取文件进行向量化，无需在本地存储重复文件。
+
+**当前对接模式**: 本地存储
+
+文件存储在 RAG 服务的 `documents/` 目录下，按知识库组织：
+
+```
+documents/
+├── public_kb/          # 公开知识库
+│   ├── 文档1.pdf
+│   └── 文档2.docx
+├── dept_finance/       # 财务部知识库
+│   └── 报销制度.pdf
+└── dept_hr/            # 人事部知识库
+    └── 员工手册.docx
+```
+
+### 17.2 文件上传流程
+
+**方式一: 直接上传到 RAG 服务**
+
+```http
+POST /documents/upload
+Content-Type: multipart/form-data
+
+file: (二进制文件)
+collection: public_kb
+```
+
+**响应**:
+```json
+{
+  "success": true,
+  "message": "文件上传成功",
+  "file": {
+    "filename": "文档名.pdf",
+    "collection": "public_kb",
+    "path": "public_kb/文档名.pdf",
+    "size": 1024000
+  },
+  "chunk_count": 15
+}
+```
+
+**方式二: 后端转发（推荐）**
+
+```
+前端 → 后端 → RAG服务
+              ↓
+         存储到 documents/
+              ↓
+         解析 + 向量化
+              ↓
+         返回 chunk_count
+              ↓
+    后端存储元数据到数据库
+```
+
+后端示例：
 ```python
-def generate_exam(user_id, file_path, question_types, difficulty=3):
-    # 1. 权限校验
-    if not check_exam_permission(user_id):
-        raise PermissionError("无出题权限")
+@app.route('/api/documents/upload', methods=['POST'])
+def upload_document():
+    file = request.files['file']
+    kb_name = request.form.get('kb_name', 'public_kb')
 
-    # 2. 获取向量库列表
-    collections = get_user_collections(user_id)
-
-    # 3. 调用 RAG 服务
+    # 转发到 RAG 服务
     response = requests.post(
-        'http://rag-service:5001/exam/generate',
-        json={
-            'file_path': file_path,
-            'collection': collections,  # 传入数组
-            'question_types': question_types,
-            'difficulty': difficulty
-        }
+        'http://rag-service:5001/documents/upload',
+        files={'file': file},
+        data={'collection': kb_name}
     )
 
     result = response.json()
-    if not result.get('success'):
-        raise Exception(result.get('error'))
 
-    return result['questions']
-```
-
-**Step 4: 入库存储**
-
-```python
-def save_questions_to_db(questions, exam_id, creator_id):
-    """将题目存入数据库"""
-    for q in questions:
-        # 生成 question_id
-        question_id = str(uuid.uuid4())
-
-        # 根据题型设置满分
-        score = get_default_score(q['question_type'])
-
-        # 存入数据库
+    # 存储元数据到后端数据库
+    if result.get('success'):
         db.execute("""
-            INSERT INTO questions (
-                question_id, exam_id, question_type, difficulty,
-                content, source_trace, score, tags, creator_id, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-        """,
-            question_id, exam_id, q['question_type'], q['difficulty'],
-            json.dumps(q['content']), json.dumps(q['source_trace']),
-            score, json.dumps([]), creator_id
-        )
+            INSERT INTO file_index (filename, kb_name, size, chunk_count, uploaded_by)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            result['file']['filename'],
+            kb_name,
+            result['file']['size'],
+            result.get('chunk_count', 0),
+            current_user.id
+        ))
+
+    return jsonify(result)
 ```
 
-**Step 5: 题型默认分值参考**
+### 17.3 文档目录结构
 
-```python
-def get_default_score(question_type):
-    """根据题型获取默认满分"""
-    score_map = {
-        'single_choice': 2.0,
-        'multiple_choice': 4.0,
-        'true_false': 2.0,
-        'fill_blank': 3.0,
-        'subjective': 10.0
-    }
-    return score_map.get(question_type, 2.0)
+后端需要了解 RAG 服务的文档目录结构：
+
+| 路径 | 说明 |
+|------|------|
+| `documents/public_kb/` | 公开知识库文件 |
+| `documents/dept_<name>/` | 部门知识库文件 |
+| `knowledge/vector_store/chroma/` | ChromaDB 向量数据 |
+| `knowledge/vector_store/bm25/` | BM25 索引 |
+
+### 17.4 后续扩展
+
+后续可切换到企业文件系统集成，配置方式：
+
+```bash
+# 切换存储类型
+STORAGE_TYPE=s3  # 或 smb / http
+
+# S3 配置
+STORAGE_S3_ENDPOINT=http://minio.example.com:9000
+STORAGE_S3_BUCKET=documents
+STORAGE_S3_ACCESS_KEY=xxx
+STORAGE_S3_SECRET_KEY=xxx
 ```
 
-### 7.5.2 数据库设计建议
-
-**题目表 (questions)**
-```sql
-CREATE TABLE questions (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    question_id VARCHAR(64) UNIQUE NOT NULL,  -- 后端生成的 UUID
-    exam_id VARCHAR(64),                       -- 所属试卷
-    question_type VARCHAR(32) NOT NULL,        -- 题型
-    difficulty INT DEFAULT 3,                  -- 难度
-    content JSON NOT NULL,                     -- 题目内容
-    source_trace JSON,                         -- 溯源信息
-    score DECIMAL(4,1) DEFAULT 2.0,           -- 满分（后端设置）
-    tags JSON,                                 -- 标签（后端设置）
-    creator_id VARCHAR(64),                    -- 创建人
-    status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    INDEX idx_exam_id (exam_id),
-    INDEX idx_question_type (question_type),
-    INDEX idx_status (status)
-);
-```
-
-**试卷表 (exams)**
-```sql
-CREATE TABLE exams (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    exam_id VARCHAR(64) UNIQUE NOT NULL,
-    title VARCHAR(255),
-    total_score DECIMAL(6,1),
-    question_count INT,
-    creator_id VARCHAR(64),
-    status ENUM('draft', 'published', 'archived') DEFAULT 'draft',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
+切换后，RAG 服务将从企业文件系统读取文件，无需本地存储。
 
 ---
 
-## 八、后端数据库设计建议
+## 十八、接口速查表
 
-### 8.1 会话表 (sessions)
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| GET | `/health` | ❌ | 健康检查 |
+| GET | `/auth/me` | Header | 当前用户信息 |
+| GET | `/stats` | Header | 系统统计 |
+| POST | `/chat` | - | 普通聊天（SSE） |
+| POST | `/rag` | - | 知识库问答（SSE） |
+| POST | `/search` | - | 混合检索 |
+| GET | `/collections` | - | 向量库列表 |
+| POST | `/collections` | - | 创建向量库 |
+| DELETE | `/collections/<name>` | - | 删除向量库 |
+| GET | `/collections/<name>/documents` | - | 向量库文档 |
+| GET | `/collections/<name>/chunks` | - | 向量库切片 |
+| POST | `/kb/route` | - | 知识库路由测试 |
+| POST | `/documents/upload` | - | 上传文档 |
+| POST | `/documents/batch-upload` | - | 批量上传 |
+| GET | `/documents/list` | - | 文档列表 |
+| DELETE | `/documents/<path>` | - | 删除文档 |
+| GET | `/documents/<path>/chunks` | - | 文档切片 |
+| GET | `/documents/<path>/status` | - | 文档状态 |
+| POST | `/chunks` | - | 新增切片 |
+| PUT | `/chunks/<id>` | - | 修改切片 |
+| DELETE | `/chunks/<id>` | - | 删除切片 |
+| GET | `/sync/status` | - | 同步状态 |
+| POST | `/sync` | - | 触发同步 |
+| GET | `/sync/history` | - | 同步历史 |
+| GET | `/sync/changes` | - | 变更日志 |
+| POST | `/sync/start` | - | 启动监控 |
+| POST | `/sync/stop` | - | 停止监控 |
+| GET | `/images/<id>` | - | 获取图片 |
+| GET | `/images/<id>/info` | - | 图片信息 |
+| GET | `/images/list` | - | 图片列表 |
+| GET | `/images/stats` | - | 图片统计 |
+| POST | `/feedback` | - | 提交反馈 |
+| GET | `/feedback/stats` | - | 反馈统计 |
+| GET | `/feedback/list` | - | 反馈列表 |
+| GET | `/reports/weekly` | - | 周报告 |
+| GET | `/reports/monthly` | - | 月报告 |
+| GET | `/faq` | - | FAQ 列表 |
+| POST | `/faq` | - | 新增 FAQ |
+| PUT | `/faq/<id>` | - | 更新 FAQ |
+| DELETE | `/faq/<id>` | - | 删除 FAQ |
+| GET | `/faq/suggestions` | - | FAQ 建议 |
+| POST | `/faq/suggestions/<id>/approve` | - | 批准建议 |
+| POST | `/faq/suggestions/<id>/reject` | - | 拒绝建议 |
+| GET | `/exam/health` | - | 出题系统健康检查 |
+| POST | `/exam/generate` | - | 生成题目 |
+| POST | `/exam/grade` | - | 批改答案 |
+| POST | `/collections/<kb>/documents/<file>/deprecate` | - | 废止文档 |
+| POST | `/collections/<kb>/documents/<file>/restore` | - | 恢复文档 |
+| GET | `/collections/<kb>/documents/<file>/versions` | - | 版本历史 |
+| POST | `/outline` | - | 生成纲要 |
+| GET | `/outline/<id>` | - | 获取纲要 |
+| GET | `/outline/<id>/export` | - | 导出纲要 |
+| DELETE | `/outline/<id>` | - | 删除纲要缓存 |
+| GET | `/outline/list` | - | 纲要列表 |
+| POST | `/outline/batch` | - | 批量生成纲要 |
+| GET | `/recommend/<id>` | - | 关联推荐 |
 
-```sql
-CREATE TABLE sessions (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    session_id VARCHAR(64) UNIQUE NOT NULL,
-    user_id VARCHAR(64) NOT NULL,
-    title VARCHAR(255),              -- 会话标题（可从首条消息生成）
-    last_message TEXT,               -- 最后一条消息摘要
-    message_count INT DEFAULT 0,     -- 消息数量
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-
-    INDEX idx_user_id (user_id),
-    INDEX idx_updated_at (updated_at)
-);
-```
-
-### 8.2 消息表 (messages)
-
-```sql
-CREATE TABLE messages (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    session_id VARCHAR(64) NOT NULL,
-    role ENUM('user', 'assistant') NOT NULL,
-    content TEXT NOT NULL,           -- 完整消息内容
-    sources JSON,                    -- AI 回答的来源（仅 assistant）
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    INDEX idx_session_id (session_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
-);
-```
-
-### 8.3 知识库权限表 (kb_permissions)
-
-```sql
-CREATE TABLE kb_permissions (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    user_id VARCHAR(64) NOT NULL,
-    kb_name VARCHAR(64) NOT NULL,    -- 知识库名称，如 'public_kb', 'dept_finance'
-    permission ENUM('read', 'write', 'admin') DEFAULT 'read',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    UNIQUE KEY uk_user_kb (user_id, kb_name),
-    INDEX idx_user_id (user_id)
-);
-```
-
-**权限判断逻辑：**
-```python
-def get_user_collections(user_id):
-    # 查询用户有权限的知识库
-    permissions = db.query(
-        "SELECT kb_name FROM kb_permissions WHERE user_id = ?",
-        user_id
-    )
-    return [p.kb_name for p in permissions]
-```
-
----
-
-## 九、完整调用流程示例
-
-### 9.1 用户发起问答
-
-```
-1. 前端发送请求到后端
-   POST /api/chat
-   {
-     "session_id": "xxx",
-     "message": "出差补助标准是什么？"
-   }
-
-2. 后端处理
-   a. 验证用户身份（JWT）
-   b. 查询用户知识库权限，生成 collections 列表
-   c. 查询会话历史（最近 5-10 条）
-   d. 调用 RAG 服务
-
-3. 后端调用 RAG
-   POST http://rag-service:5001/rag
-   {
-     "message": "出差补助标准是什么？",
-     "collections": ["public_kb", "dept_finance"],
-     "history": [
-       {"role": "user", "content": "之前的问题"},
-       {"role": "assistant", "content": "之前的回答"}
-     ]
-   }
-
-4. RAG 返回结果
-   {
-     "answer": "根据公司规定...",
-     "sources": [...],
-     "duration_ms": 1500
-   }
-
-5. 后端存储
-   a. 保存用户问题到 messages 表
-   b. 保存 AI 回答到 messages 表
-   c. 更新 sessions 表的 last_message、updated_at
-
-6. 后端返回前端
-   {
-     "answer": "根据公司规定...",
-     "sources": [...]
-   }
-```
-
-### 9.2 用户上传文档
-
-```
-1. 前端发送文件到后端
-   POST /api/documents/upload
-   Content-Type: multipart/form-data
-   file: document.pdf
-   kb_name: dept_finance
-
-2. 后端验证权限
-   - 检查用户是否有 dept_finance 的 write 权限
-
-3. 后端调用 RAG
-   POST http://rag-service:5001/documents/upload
-   Content-Type: multipart/form-data
-   file: document.pdf
-   collection: dept_finance
-
-4. RAG 返回结果
-   {
-     "success": true,
-     "file": {"filename": "document.pdf", "path": "finance/document.pdf"}
-   }
-
-5. 后端返回前端
-```
+> **说明**: 认证列 `Header` 表示需要传 X-User-ID/X-User-Role 等 Header（开发模式），`-` 表示生产模式不需要认证
 
 ---
 
-## 十、错误响应格式
+## 十七、错误响应格式
 
 所有错误响应遵循统一格式：
 
@@ -1468,2419 +1130,46 @@ def get_user_collections(user_id):
 }
 ```
 
-**常见 HTTP 状态码：**
+**常见 HTTP 状态码**:
 - `400` - 请求参数错误
-- `401` - 未认证（缺少 X-User-ID）
 - `404` - 资源不存在
 - `500` - 服务器内部错误
-- `503` - 服务不可用
 
 ---
 
-## 十一、向量库命名规范
+## 十八、后端对接检查清单
 
-ChromaDB 集合名称限制：
-- 只能包含 `[a-zA-Z0-9._-]`
-- 长度 3-63 字符
-- 必须以字母或数字开头和结尾
-
-**推荐命名：**
-- `public_kb` - 公开知识库
-- `dept_finance` - 财务部知识库
-- `dept_hr` - 人事部知识库
-- `dept_tech` - 技术部知识库
-
----
-
-## 十二、部署注意事项
-
-1. **环境变量**：
-   - `DEV_MODE=false` - 生产环境必须关闭开发模式
-   - `DOCUMENTS_PATH` - 文档存储路径
-
-2. **网络配置**：
-   - RAG 服务端口：5001（默认）
-   - 后端网关需要配置反向代理
-
-3. **文件存储**：
-   - 文档存储在 `documents/` 目录
-   - 向量库存储在 `vector_store/chroma/` 目录
-
-4. **资源要求**：
-   - 内存：建议 4GB+（向量检索占用）
-   - 磁盘：根据文档数量评估
-
----
-
-## 十三、文件管理服务（后端负责）
-
-### 13.1 功能概述
-
-用户询问"我能访问哪些文件"、"我的权限能查看什么文档"等**元问题**时，需要后端提供完整的文件列表服务。
-
-**职责划分：**
-
-| 层面 | 负责 | 说明 |
-|------|------|------|
-| **文件元数据管理** | 后端 | 维护文件索引表，记录文件路径、大小、上传时间、权限等 |
-| **文件目录展示** | 后端 | 根据用户权限返回可访问的文件列表 |
-| **文件内容检索** | RAG | 向量检索、关键词检索、内容问答 |
-
-**为什么不由 RAG 负责？**
-
-```
-RAG 向量库存储的是"文档切片"（chunks），不是"文件列表"
-    ↓
-向量库 metadata 只记录 source（文件名），不记录：
-    - 文件层级结构（目录/子目录）
-    - 上传时间、文件大小
-    - 用户权限关系
-    ↓
-用户问"有哪些文件"时，RAG 只能遍历 chunks 提取 source
-    ↓
-这种方式无法展示完整的文件目录结构
-```
-
-### 13.2 后端数据库设计
-
-**文件索引表 (file_index)：**
-
-```sql
-CREATE TABLE file_index (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    
-    -- 文件信息
-    file_path VARCHAR(512) NOT NULL,       -- 相对路径，如 "public/规章制度/考勤制度.docx"
-    file_name VARCHAR(255) NOT NULL,       -- 文件名，如 "考勤制度.docx"
-    file_type VARCHAR(50),                 -- 文件类型：pdf, docx, xlsx 等
-    file_size BIGINT,                      -- 文件大小（字节）
-    
-    -- 所属知识库
-    kb_name VARCHAR(64) NOT NULL,          -- 知识库名称，如 "public_kb", "dept_finance"
-    
-    -- 层级结构
-    parent_path VARCHAR(512),              -- 父目录路径，如 "public/规章制度"
-    level INT DEFAULT 1,                   -- 层级深度
-    
-    -- 状态
-    status ENUM('active', 'deleted', 'processing') DEFAULT 'active',
-    
-    -- 向量化状态
-    vectorized BOOLEAN DEFAULT FALSE,      -- 是否已向量化
-    chunk_count INT DEFAULT 0,             -- 切片数量
-    
-    -- 时间戳
-    uploaded_by VARCHAR(64),               -- 上传者用户ID
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-
-    INDEX idx_kb_name (kb_name),
-    INDEX idx_parent_path (parent_path),
-    INDEX idx_file_path (file_path),
-    UNIQUE KEY uk_file_path (file_path, kb_name)
-);
-```
-
-**文件权限表 (file_permissions)：**
-
-```sql
--- 方案 A：继承知识库权限（推荐）
--- 用户对知识库有权限 = 对知识库内所有文件有权限
--- 无需单独的文件权限表
-
--- 方案 B：细粒度文件权限（可选）
-CREATE TABLE file_permissions (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    file_id BIGINT NOT NULL,
-    user_id VARCHAR(64) NOT NULL,
-    permission ENUM('read', 'write', 'admin') DEFAULT 'read',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (file_id) REFERENCES file_index(id) ON DELETE CASCADE,
-    UNIQUE KEY uk_user_file (user_id, file_id)
-);
-```
-
-### 13.3 后端 API 设计
-
-**获取文件列表：**
-
-```http
-GET /api/files?kb_name=public_kb&parent_path=public
-```
-
-**响应：**
-```json
-{
-  "success": true,
-  "current_path": "public",
-  "files": [
-    {
-      "name": "规章制度",
-      "type": "folder",
-      "path": "public/规章制度"
-    },
-    {
-      "name": "考勤制度.docx",
-      "type": "file",
-      "path": "public/考勤制度.docx",
-      "size": 102400,
-      "uploaded_at": "2026-04-19T10:00:00",
-      "chunk_count": 15
-    }
-  ],
-  "breadcrumb": [
-    {"name": "根目录", "path": ""},
-    {"name": "public", "path": "public"}
-  ]
-}
-```
-
-**获取用户可访问的文件列表：**
-
-```http
-GET /api/files/accessible
-Authorization: Bearer <jwt_token>
-```
-
-**响应：**
-```json
-{
-  "success": true,
-  "knowledge_bases": [
-    {
-      "kb_name": "public_kb",
-      "display_name": "公开知识库",
-      "file_count": 25,
-      "total_size": 52428800,
-      "files": [
-        {
-          "path": "public/考勤制度.docx",
-          "name": "考勤制度.docx",
-          "size": 102400,
-          "uploaded_at": "2026-04-19T10:00:00"
-        }
-      ]
-    }
-  ],
-  "total_files": 50,
-  "total_size": 104857600
-}
-```
-
-### 13.4 与 RAG 服务配合
-
-**文件上传流程：**
-
-```
-┌─────────┐    ┌─────────┐    ┌─────────┐
-│  前端   │───▶│  后端   │───▶│   RAG   │
-└─────────┘    └─────────┘    └─────────┘
-                   │               │
-                   ▼               ▼
-           ┌──────────────┐  ┌──────────────┐
-           │ 1. 验证权限   │  │ 4. 解析文档   │
-           │ 2. 存储文件   │  │ 5. 切片向量化 │
-           │ 3. 写 file_index │ 6. 写入 ChromaDB │
-           └──────────────┘  └──────────────┘
-                                      │
-                                      ▼
-                              ┌──────────────┐
-                              │ 7. 返回 chunk_count │
-                              └──────────────┘
-                                      │
-                                      ▼
-                           ┌──────────────┐
-                           │ 8. 后端更新   │
-                           │ file_index.   │
-                           │ vectorized=true │
-                           └──────────────┘
-```
-
-**后端调用 RAG 上传文件后：**
-
-```python
-# 1. 调用 RAG 上传接口
-response = requests.post(
-    'http://rag-service:5001/documents/upload',
-    files={'file': file},
-    data={'collection': kb_name}
-)
-
-# 2. 写入文件索引表
-db.execute("""
-    INSERT INTO file_index (file_path, file_name, file_type, file_size, kb_name, parent_path, uploaded_by)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-""", (file_path, file_name, file_type, file_size, kb_name, parent_path, user_id))
-
-# 3. RAG 向量化完成后，更新状态
-# 可以通过回调或轮询实现
-db.execute("""
-    UPDATE file_index 
-    SET vectorized = TRUE, chunk_count = ?
-    WHERE file_path = ?
-""", (chunk_count, file_path))
-```
-
-### 13.5 RAG 服务配合要求
-
-**文档上传接口响应增强：**
-
-当 RAG 服务处理完文件后，应返回切片数量：
-
-```json
-{
-  "success": true,
-  "message": "文件上传成功，已添加到向量库",
-  "file": {
-    "filename": "考勤制度.docx",
-    "collection": "public_kb",
-    "path": "public/考勤制度.docx",
-    "size": 102400
-  },
-  "vectorization": {
-    "status": "completed",
-    "chunk_count": 15
-  }
-}
-```
-
-**文档删除接口：**
-
-删除文件时，RAG 服务需要同时：
-1. 删除物理文件
-2. 删除 ChromaDB 中的所有相关切片
-
-```http
-DELETE /documents/<path>
-```
-
-**响应：**
-```json
-{
-  "success": true,
-  "message": "文件已删除",
-  "deleted_chunks": 15
-}
-```
-
-### 13.6 元问题处理流程
-
-当用户询问"我能访问哪些文件"时：
-
-```
-1. RAG 服务识别为"元问题"
-    ↓
-2. RAG 服务检查是否有后端文件管理服务
-    ↓
-   有 → 调用后端 API 获取文件列表
-   无 → 从 ChromaDB metadata 中提取 source 列表（降级方案）
-    ↓
-3. 返回文件列表给用户
-```
-
-**后端提供的文件列表 API：**
-
-```http
-GET /api/files/list-for-rag?user_id=xxx&kb_names=public_kb,dept_finance
-Authorization: Bearer <service_token>
-```
-
-**响应：**
-```json
-{
-  "success": true,
-  "files": [
-    {
-      "name": "考勤制度.docx",
-      "path": "public/考勤制度.docx",
-      "kb_name": "public_kb",
-      "size": 102400,
-      "uploaded_at": "2026-04-19T10:00:00"
-    }
-  ],
-  "grouped_by_kb": {
-    "public_kb": {"count": 25, "files": [...]},
-    "dept_finance": {"count": 10, "files": [...]}
-  }
-}
-```
-
-### 13.7 RAG 服务配置
-
-在 `config.py` 中添加后端文件服务配置：
-
-```python
-# 后端文件管理服务（可选）
-BACKEND_FILE_SERVICE_URL = os.getenv('BACKEND_FILE_SERVICE_URL', '')
-BACKEND_SERVICE_TOKEN = os.getenv('BACKEND_SERVICE_TOKEN', '')
-```
-
-如果配置了后端文件服务，RAG 在回答元问题时会调用后端 API 获取完整文件列表。
-
----
-
-## 附录：元问题识别关键词
-
-RAG 服务会自动识别以下关键词，判断为"元问题"并返回文件列表：
-
-**权限相关：**
-- "我的权限"、"用户权限"、"查看权限"、"访问权限"
-- "权限能"、"权限可以"、"有什么权限"、"有哪些权限"
-
-**文件列表相关：**
-- "有哪些文件"、"什么文件"、"哪些文件"、"文件列表"
-- "能查看"、"可以查看"、"有权限查看"
-- "能访问"、"可以访问"、"有权限访问"
-- "我能看"、"我可以看"、"我能查"、"我可以查"
-- "能看到什么"、"能查到什么"、"可以看什么"、"可以查什么"
-
-**知识库相关：**
-- "知识库有哪些"、"库里有"、"文档有哪些"
-- "有什么文档"、"有什么文件"、"包含什么"
-
-后端可根据业务需求，要求 RAG 服务扩展此关键词列表。
-
----
-
-## 十四、生产环境部署与数据库适配
-
-### 14.1 职责划分总结
-
-**推荐方案：后端适配RAG服务（API契约模式）✅**
-
-| 服务 | 职责 | 数据存储 |
-|------|------|----------|
-| **后端** | 用户管理、会话管理、权限控制 | PostgreSQL/MySQL |
-| **RAG服务** | 知识库问答、向量检索、文档处理 | ChromaDB（向量）+ 反馈数据（SQLite） |
-
-**为什么推荐这种方案？**
-
-1. **服务解耦**：RAG服务保持无状态，专注核心功能
-2. **职责清晰**：后端管理用户/会话，RAG管理知识库
-3. **易于扩展**：未来可以独立扩展、替换任一服务
-4. **符合微服务原则**：避免跨服务数据库访问
-
-### 14.2 生产环境配置
-
-**RAG服务环境变量：**
-
-```bash
-# 环境标识（关键！）
-APP_ENV=prod
-
-# 功能开关
-ENABLE_SESSION=false      # 生产环境关闭会话管理
-ENABLE_FEEDBACK=true      # 反馈系统保留
-ENABLE_AUDIT_LOG=false    # 审计日志关闭
-
-# API密钥
-DASHSCOPE_API_KEY=your-api-key-here
-DASHSCOPE_MODEL=qwen3.5-plus
-```
-
-**生产环境特性：**
-
-| 功能 | 开发环境 | 生产环境 |
-|------|----------|----------|
-| 会话管理 | ✅ 本地SQLite | ❌ 由后端管理 |
-| 用户认证 | ✅ Mock Token | ❌ 不需要Header |
-| 审计日志 | ✅ 本地SQLite | ❌ 关闭 |
-| 反馈系统 | ✅ 本地SQLite | ✅ 本地SQLite（保留） |
-| chat_history | ❌ 可选 | ✅ 必须传入 |
-
-### 14.3 后端需要实现的功能
-
-#### 14.3.1 会话管理
-
-**数据库表结构（参考）：**
-
-```sql
--- 会话表
-CREATE TABLE sessions (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    session_id VARCHAR(64) UNIQUE NOT NULL,
-    user_id VARCHAR(64) NOT NULL,
-    title VARCHAR(255),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
-    INDEX idx_user_id (user_id),
-    INDEX idx_updated_at (updated_at)
-);
-
--- 消息表
-CREATE TABLE messages (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    session_id VARCHAR(64) NOT NULL,
-    role ENUM('user', 'assistant') NOT NULL,
-    content TEXT NOT NULL,
-    sources JSON,                    -- AI回答的来源
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    INDEX idx_session_id (session_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
-);
-```
-
-**后端实现参考（Python）：**
-
-```python
-def get_chat_history(session_id: str, limit: int = 10) -> List[Dict]:
-    """获取会话历史，用于传递给RAG服务"""
-    messages = db.query("""
-        SELECT role, content 
-        FROM messages 
-        WHERE session_id = ? 
-        ORDER BY created_at DESC 
-        LIMIT ?
-    """, session_id, limit)
-    
-    # 反转顺序（最早的在前）
-    return [{"role": m.role, "content": m.content} for m in reversed(messages)]
-
-def save_message(session_id: str, role: str, content: str, sources: List = None):
-    """保存消息到数据库"""
-    db.execute("""
-        INSERT INTO messages (session_id, role, content, sources, created_at)
-        VALUES (?, ?, ?, ?, NOW())
-    """, session_id, role, content, json.dumps(sources) if sources else None)
-    
-    # 更新会话的最后活跃时间
-    db.execute("""
-        UPDATE sessions 
-        SET updated_at = NOW() 
-        WHERE session_id = ?
-    """, session_id)
-```
-
-**后端实现参考（Java/Spring Boot）：**
-
-```java
-@Service
-public class ChatService {
-    
-    @Autowired
-    private MessageRepository messageRepository;
-    
-    @Autowired
-    private SessionRepository sessionRepository;
-    
-    @Autowired
-    private RagClient ragClient;
-    
-    /**
-     * 获取会话历史
-     */
-    public List<ChatMessage> getChatHistory(String sessionId, int limit) {
-        return messageRepository.findBySessionIdOrderByCreatedAtDesc(sessionId, limit)
-            .stream()
-            .sorted(Comparator.comparing(Message::getCreatedAt))  // 反转顺序
-            .map(m -> new ChatMessage(m.getRole(), m.getContent()))
-            .collect(Collectors.toList());
-    }
-    
-    /**
-     * 调用RAG服务并保存消息
-     */
-    public RagResponse chat(String userId, String sessionId, String message) {
-        // 1. 获取历史
-        List<ChatMessage> history = getChatHistory(sessionId, 10);
-        
-        // 2. 获取用户权限的知识库
-        List<String> collections = getUserCollections(userId);
-        
-        // 3. 调用RAG服务
-        RagResponse response = ragClient.query(message, collections, history);
-        
-        // 4. 保存消息
-        saveMessage(sessionId, "user", message, null);
-        saveMessage(sessionId, "assistant", response.getAnswer(), response.getSources());
-        
-        // 5. 更新会话
-        updateSessionActivity(sessionId);
-        
-        return response;
-    }
-    
-    private void saveMessage(String sessionId, String role, String content, List<Source> sources) {
-        Message msg = new Message();
-        msg.setSessionId(sessionId);
-        msg.setRole(role);
-        msg.setContent(content);
-        msg.setSources(sources);
-        messageRepository.save(msg);
-    }
-}
-```
-
-#### 14.3.2 权限管理
-
-**知识库权限表：**
-
-```sql
-CREATE TABLE kb_permissions (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    user_id VARCHAR(64) NOT NULL,
-    kb_name VARCHAR(64) NOT NULL,
-    permission ENUM('read', 'write', 'admin') DEFAULT 'read',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    UNIQUE KEY uk_user_kb (user_id, kb_name),
-    INDEX idx_user_id (user_id)
-);
-```
-
-**权限判断逻辑：**
-
-```python
-def get_user_collections(user_id: str) -> List[str]:
-    """获取用户有权限的知识库列表"""
-    permissions = db.query("""
-        SELECT kb_name 
-        FROM kb_permissions 
-        WHERE user_id = ?
-    """, user_id)
-    
-    return [p.kb_name for p in permissions]
-```
-
-```java
-@Service
-public class PermissionService {
-    
-    @Autowired
-    private KbPermissionRepository permissionRepository;
-    
-    /**
-     * 获取用户可访问的知识库列表
-     */
-    public List<String> getUserCollections(String userId) {
-        return permissionRepository.findByUserId(userId)
-            .stream()
-            .map(KbPermission::getKbName)
-            .collect(Collectors.toList());
-    }
-    
-    /**
-     * 检查用户是否有知识库访问权限
-     */
-    public boolean hasAccess(String userId, String kbName) {
-        return permissionRepository.existsByUserIdAndKbName(userId, kbName);
-    }
-}
-```
-
-### 14.4 完整调用流程（生产环境）
-
-```
-┌─────────┐    ┌─────────────────┐    ┌─────────────┐
-│  前端   │───▶│     后端        │───▶│  RAG服务    │
-└─────────┘    └─────────────────┘    └─────────────┘
-                      │                      │
-                      ▼                      ▼
-              ┌──────────────┐      ┌──────────────┐
-              │ 1. JWT验证   │      │ 4. 向量检索  │
-              │ 2. 查询历史  │      │ 5. 生成回答  │
-              │ 3. 权限判断  │      │ 6. 返回结果  │
-              └──────────────┘      └──────────────┘
-                      │
-                      ▼
-              ┌──────────────┐
-              │ 7. 保存消息  │
-              │ 8. 更新会话  │
-              └──────────────┘
-```
-
-**详细步骤：**
-
-```python
-# 后端接口实现
-@app.route('/api/chat', methods=['POST'])
-@jwt_required()
-def chat():
-    user_id = get_jwt_identity()
-    data = request.json
-    
-    session_id = data.get('session_id')
-    message = data.get('message')
-    
-    # 1. 获取会话历史
-    history = get_chat_history(session_id, limit=10)
-    
-    # 2. 获取用户权限的知识库
-    collections = get_user_collections(user_id)
-    
-    # 3. 调用RAG服务
-    response = requests.post(
-        'http://rag-service:5001/rag',
-        json={
-            'message': message,
-            'collections': collections,
-            'chat_history': history  # 必须传入
-        },
-        stream=True  # SSE流式响应
-    )
-    
-    # 4. 消费SSE流
-    full_answer = ''
-    sources = []
-    
-    for line in response.iter_lines():
-        if not line:
-            continue
-        
-        line = line.decode('utf-8')
-        if line.startswith('data: '):
-            event = json.loads(line[6:])
-            
-            if event['type'] == 'finish':
-                full_answer = event['answer']
-                sources = event['sources']
-                break
-    
-    # 5. 保存消息
-    save_message(session_id, 'user', message)
-    save_message(session_id, 'assistant', full_answer, sources)
-    
-    # 6. 返回结果
-    return jsonify({
-        'answer': full_answer,
-        'sources': sources
-    })
-```
-
-### 14.5 数据迁移（如果需要）
-
-**场景**：如果开发环境已经有测试数据，需要迁移到后端数据库。
-
-**迁移脚本（Python）：**
-
-```python
-import sqlite3
-import mysql.connector
-
-def migrate_sessions():
-    """迁移会话数据从SQLite到MySQL"""
-    
-    # 连接SQLite（RAG开发环境）
-    sqlite_conn = sqlite3.connect('data/rag_core.db')
-    sqlite_conn.row_factory = sqlite3.Row
-    
-    # 连接MySQL（后端生产环境）
-    mysql_conn = mysql.connector.connect(
-        host='localhost',
-        user='root',
-        password='password',
-        database='backend_db'
-    )
-    mysql_cursor = mysql_conn.cursor()
-    
-    # 迁移会话
-    sessions = sqlite_conn.execute("SELECT * FROM sessions").fetchall()
-    for session in sessions:
-        mysql_cursor.execute("""
-            INSERT INTO sessions (session_id, user_id, title, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (
-            session['session_id'],
-            session['user_id'],
-            session.get('title', ''),
-            session['created_at'],
-            session.get('last_active', session['created_at'])
-        ))
-    
-    # 迁移消息
-    messages = sqlite_conn.execute("SELECT * FROM messages").fetchall()
-    for msg in messages:
-        mysql_cursor.execute("""
-            INSERT INTO messages (session_id, role, content, created_at)
-            VALUES (%s, %s, %s, %s)
-        """, (
-            msg['session_id'],
-            msg['role'],
-            msg['content'],
-            msg['created_at']
-        ))
-    
-    mysql_conn.commit()
-    print(f"迁移完成：{len(sessions)} 个会话，{len(messages)} 条消息")
-```
-
-### 14.6 部署检查清单
-
-**RAG服务部署前：**
+**RAG服务部署前**:
 
 - [ ] 设置 `APP_ENV=prod`
-- [ ] 设置 `ENABLE_SESSION=false`
 - [ ] 配置 `DASHSCOPE_API_KEY`
 - [ ] 确认向量模型已下载到 `models/` 目录
 - [ ] 确认 `knowledge/vector_store/` 目录已创建
 
-**后端部署前：**
+**后端开发前**:
 
 - [ ] 创建会话表（sessions）
 - [ ] 创建消息表（messages）
 - [ ] 创建知识库权限表（kb_permissions）
-- [ ] 实现会话历史查询接口
-- [ ] 实现权限判断逻辑
-- [ ] 配置RAG服务地址（如 `http://rag-service:5001`）
+- [ ] 实现会话历史查询逻辑
+- [ ] 实现权限判断逻辑（生成 collections 列表）
+- [ ] 实现 SSE 流式响应消费
 
-**集成测试：**
+**集成测试**:
 
-- [ ] 测试后端调用RAG服务（无Header）
+- [ ] 测试 `/health` 端点
+- [ ] 测试 `/rag` SSE 流式响应
 - [ ] 测试会话历史传递
-- [ ] 测试权限控制（collections参数）
-- [ ] 测试SSE流式响应消费
-- [ ] 测试消息保存
-
-### 14.7 常见问题
-
-**Q1: 生产环境RAG服务还需要数据库吗？**
-
-A: 需要，但仅用于反馈系统。会话、审计等数据由后端管理。
-
-**Q2: 如何处理历史会话数据？**
-
-A: 开发环境的测试数据可以通过迁移脚本导入后端数据库，或直接丢弃。
-
-**Q3: 后端如何知道用户有哪些知识库权限？**
-
-A: 后端维护 `kb_permissions` 表，记录用户与知识库的权限关系。
-
-**Q4: RAG服务如何验证用户身份？**
-
-A: 生产环境不验证。后端已经验证过用户身份，通过 `collections` 参数控制访问权限。
-
-**Q5: 如果后端不想管理会话怎么办？**
-
-A: 可以保持 `ENABLE_SESSION=true`，让RAG服务继续管理会话。但这样会增加RAG服务的状态管理复杂度，不推荐。
-
----
-
-## 十五、总结
-
-### 15.1 核心要点
-
-1. **职责分离**：后端管理用户/会话/权限，RAG管理知识库/检索
-2. **无状态设计**：生产环境RAG服务不存储会话，完全无状态
-3. **API契约**：通过 `collections` 和 `chat_history` 参数实现解耦
-4. **环境自适应**：同一套代码，通过 `APP_ENV` 切换开发/生产模式
-
-### 15.2 推荐架构
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    生产环境架构                          │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  前端 → 后端网关 → 后端服务 → RAG服务                    │
-│           │          │           │                      │
-│           ▼          ▼           ▼                      │
-│         JWT验证   PostgreSQL  ChromaDB                  │
-│                   (用户/会话)  (向量库)                  │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-```
-
-### 15.3 后端开发优先级
-
-| 优先级 | 功能 | 说明 |
-|--------|------|------|
-| P0 | 会话管理 | 创建会话、保存消息、查询历史 |
-| P0 | 权限管理 | 知识库权限表、权限判断逻辑 |
-| P0 | RAG调用 | 调用RAG服务、消费SSE流 |
-| P1 | 文件管理 | 文件索引表、文件列表API |
-| P2 | 出题系统 | 题库管理、批卷结果存储 |
-
----
-
-**文档版本**: v2.0  
-**最后更新**: 2026-04-20  
-**维护者**: RAG服务开发组
-
-
-
----
-
-## 十六、进阶系统API接口 (提取自原API文档)
-
-## 2. 基础设施
-
-### 2.1 `GET /health` — 健康检查
-
-> **认证**: ❌ 不需要
-
-**curl 示例**:
-```bash
-curl http://localhost:5001/health
-```
-
-**返回** (200):
-```json
-{
-  "status": "ok",
-  "knowledge_base": "多向量库模式 (按集合提供服务)",
-  "bm25_index": "动态按需加载",
-  "mode": "Agentic RAG"
-}
-```
-
----
-
-### 2.2 `GET /auth/me` — 获取当前用户信息
-
-> **认证**: ✅ 需要
-
-**curl 示例**:
-```bash
-curl http://localhost:5001/auth/me \
-  -H "X-User-ID: admin001" \
-  -H "X-User-Name: 管理员" \
-  -H "X-User-Role: admin" \
-  -H "X-User-Department: 技术部"
-```
-
-**返回** (200):
-```json
-{
-  "user_id": "admin001",
-  "username": "管理员",
-  "role": "admin",
-  "department": "技术部",
-  "permissions": ["public", "internal", "confidential"]
-}
-```
-
----
-
-### 2.3 `GET /stats` — 系统统计信息
-
-> **认证**: ✅ 需要
-> **权限**: 仅 `admin`
-
-**curl 示例**:
-```bash
-curl http://localhost:5001/stats \
-  -H "X-User-ID: admin001" \
-  -H "X-User-Role: admin"
-```
-
-**返回** (200):
-```json
-{
-  "total_sessions": 42,
-  "active_sessions": 15,
-  "total_messages": 320,
-  "avg_messages_per_session": 7.6
-}
-```
-
----
-
-
-## 8. 订阅与通知
-
-### 8.1 `POST /subscribe` — 订阅文档变更
-
-> **认证**: ✅ 需要
-
-**请求体**:
-```json
-{
-  "document_id": "xxx.pdf",
-  "document_name": "xxx制度"
-}
-```
-
-| 字段 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `document_id` | string | ❌ | 文档 ID，不填则订阅所有文档 |
-| `document_name` | string | ❌ | 文档名称 |
-
-**curl 示例**:
-```bash
-# 订阅特定文档
-curl -X POST http://localhost:5001/subscribe \
-  -H "Content-Type: application/json" \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user" \
-  -d '{"document_id": "员工手册_v2.pdf"}'
-
-# 订阅所有文档
-curl -X POST http://localhost:5001/subscribe \
-  -H "Content-Type: application/json" \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user" \
-  -d '{}'
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "message": "已订阅文档: 员工手册_v2.pdf"
-}
-```
-
----
-
-### 8.2 `DELETE /subscribe` — 取消订阅
-
-> **认证**: ✅ 需要
-
-**请求体**:
-```json
-{
-  "document_id": "xxx.pdf"
-}
-```
-
-**curl 示例**:
-```bash
-curl -X DELETE http://localhost:5001/subscribe \
-  -H "Content-Type: application/json" \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user" \
-  -d '{"document_id": "员工手册_v2.pdf"}'
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "message": "已取消订阅"
-}
-```
-
----
-
-### 8.3 `GET /subscriptions` — 获取订阅列表
-
-> **认证**: ✅ 需要
-
-**curl 示例**:
-```bash
-curl http://localhost:5001/subscriptions \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user"
-```
-
-**返回** (200):
-```json
-{
-  "subscriptions": [
-    {
-      "document_id": "员工手册_v2.pdf",
-      "document_name": "员工手册",
-      "created_at": "2026-04-08T10:00:00"
-    },
-    {
-      "document_id": null,
-      "document_name": null,
-      "created_at": "2026-04-09T09:00:00"
-    }
-  ]
-}
-```
-
----
-
-### 8.4 `GET /notifications` — 获取通知
-
-> **认证**: ✅ 需要
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `unread_only` | string | ❌ | `true`/`false`，仅未读，默认 false |
-
-**curl 示例**:
-```bash
-curl "http://localhost:5001/notifications?unread_only=true" \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user"
-```
-
-**返回** (200):
-```json
-{
-  "notifications": [
-    {
-      "id": 1,
-      "message": "文档 '员工手册_v2.pdf' 已更新",
-      "document_id": "员工手册_v2.pdf",
-      "change_type": "modified",
-      "read": false,
-      "created_at": "2026-04-10T14:00:00"
-    }
-  ]
-}
-```
-
----
-
-### 8.5 `POST /notifications/<notification_id>/read` — 标记已读
-
-> **认证**: ✅ 需要
-
-**curl 示例**:
-```bash
-curl -X POST http://localhost:5001/notifications/1/read \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "message": "已标记为已读"
-}
-```
-
----
-
-### 8.6 `POST /notifications/read-all` — 全部标记已读
-
-> **认证**: ✅ 需要
-
-**curl 示例**:
-```bash
-curl -X POST http://localhost:5001/notifications/read-all \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "message": "所有通知已标记为已读"
-}
-```
-
----
-
-
-## 10. 题库维护
-
-### 10.1 `POST /questions/link-document` — 建立题目-制度关联
-
-> **认证**: ✅ Header 认证
-
-**请求体**:
-```json
-{
-  "question_id": "q001",
-  "question_type": "choice",
-  "exam_id": "e1a2b3c4-...",
-  "document_id": "安全管理制度.pdf",
-  "document_name": "安全管理制度",
-  "chapter": "第三章 安全生产",
-  "key_points": ["安全检查", "隐患排查"],
-  "relevance_score": 0.95
-}
-```
-
-| 字段 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `question_id` | string | ✅ | 题目 ID |
-| `question_type` | string | ✅ | `choice`/`blank`/`short_answer` |
-| `exam_id` | string | ✅ | 试卷 ID |
-| `document_id` | string | ✅ | 制度文档 ID |
-| `document_name` | string | ❌ | 文档名 |
-| `chapter` | string | ❌ | 章节 |
-| `key_points` | array | ❌ | 知识点列表 |
-| `relevance_score` | float | ❌ | 关联度，默认 1.0 |
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "link_id": 42,
-  "message": "题目-制度关联已建立"
-}
-```
-
----
-
-### 10.2 `POST /questions/link-knowledge` — 建立题目-知识点关联
-
-> **认证**: ✅ Header 认证
-
-**请求体**:
-```json
-{
-  "question_id": "q001",
-  "question_type": "choice",
-  "exam_id": "e1a2b3c4-...",
-  "knowledge_point": "消防安全基础知识",
-  "weight": 0.8
-}
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "link_id": 15,
-  "message": "题目-知识点关联已建立"
-}
-```
-
----
-
-### 10.3 `GET /questions/affected` — 获取受影响题目
-
-> **认证**: ✅ Header 认证
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `document_id` | string | ❌ | 文档 ID，不传返回所有受影响题目 |
-
-**curl 示例**:
-```bash
-curl "http://localhost:5001/questions/affected?document_id=安全管理制度.pdf" \
-  -H "X-User-ID: admin001" \
-  -H "X-User-Role: admin"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "affected_questions": [
-    {
-      "question_id": "q001",
-      "question_type": "choice",
-      "exam_id": "e1a2b3c4-...",
-      "document_id": "安全管理制度.pdf",
-      "impact_reason": "制度文档已更新",
-      "status": "pending_review"
-    }
-  ],
-  "total": 1
-}
-```
-
----
-
-### 10.4 `POST /questions/<question_id>/review` — 审核受影响题目
-
-> **认证**: ✅ Header 认证
-
-**请求体**:
-```json
-{
-  "question_type": "choice",
-  "exam_id": "e1a2b3c4-...",
-  "action": "confirm"
-}
-```
-
-| 字段 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `question_type` | string | ✅ | 题型 |
-| `exam_id` | string | ✅ | 试卷 ID |
-| `action` | string | ✅ | `confirm`（确认有效）/ `update`（标记需更新）/ `disable`（停用） |
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "question_id": "q001",
-  "action": "confirm",
-  "message": "题目已确认有效"
-}
-```
-
----
-
-### 10.5 `GET /documents/<document_id>/questions` — 获取制度关联题目
-
-> **认证**: ✅ Header 认证
-
-**curl 示例**:
-```bash
-curl http://localhost:5001/documents/安全管理制度.pdf/questions \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "document_id": "安全管理制度.pdf",
-  "questions": [...],
-  "total": 8
-}
-```
-
----
-
-### 10.6 `GET /documents/<document_id>/versions` — 获取制度版本历史
-
-> **认证**: ✅ Header 认证
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `limit` | int | ❌ | 返回数量，默认 10 |
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "document_id": "安全管理制度.pdf",
-  "versions": [...],
-  "total": 3
-}
-```
-
----
-
-### 10.7 `GET /knowledge-points` — 获取知识点列表
-
-> **认证**: ✅ Header 认证
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `category` | string | ❌ | 分类过滤 |
-
-**curl 示例**:
-```bash
-curl "http://localhost:5001/knowledge-points?category=安全" \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "knowledge_points": [
-    {
-      "id": 1,
-      "name": "消防安全基础知识",
-      "category": "安全",
-      "question_count": 12
-    }
-  ],
-  "total": 5
-}
-```
-
----
-
-### 10.8 `GET /questions/suggestions` — 获取新题建议
-
-> **认证**: ✅ Header 认证
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `document_id` | string | ❌ | 文档 ID 过滤 |
-| `status` | string | ❌ | 状态过滤 |
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "suggestions": [...],
-  "total": 3
-}
-```
-
----
-
-### 10.9 `GET /questions/<question_id>/knowledge-points` — 获取题目知识点
-
-> **认证**: ✅ Header 认证
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "question_id": "q001",
-  "knowledge_points": [
-    {
-      "id": 1,
-      "name": "消防安全基础知识",
-      "weight": 0.8
-    }
-  ],
-  "total": 2
-}
-```
-
----
-
-
-## 11. 整卷分析
-
-### 11.1 `POST /exam/<exam_id>/analyze` — 整卷分析
-
-> **认证**: ✅ Header 认证
-
-**请求体**:
-```json
-{
-  "grade_report": {
-    "total_score": 72,
-    "max_score": 100,
-    "questions": [
-      {"question_id": "q001", "score": 2, "max_score": 2, "is_correct": true},
-      {"question_id": "q002", "score": 0, "max_score": 2, "is_correct": false}
-    ]
-  },
-  "question_knowledge_map": {
-    "q001": ["消防安全"],
-    "q002": ["用电安全"]
-  }
-}
-```
-
-| 字段 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `grade_report` | object | ✅ | 批阅报告 |
-| `question_knowledge_map` | object | ❌ | 题目与知识点映射 |
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "report": {
-    "report_id": "ar001",
-    "exam_id": "e1a2b3c4-...",
-    "total_score": 72,
-    "max_score": 100,
-    "score_rate": 72.0,
-    "knowledge_analysis": [
-      {"point": "消防安全", "correct_rate": 1.0, "status": "掌握"},
-      {"point": "用电安全", "correct_rate": 0.0, "status": "薄弱"}
-    ],
-    "suggestions": ["建议加强用电安全相关知识的学习"],
-    "created_at": "2026-04-10T15:00:00"
-  }
-}
-```
-
----
-
-### 11.2 `GET /analysis/<report_id>` — 获取分析报告
-
-> **认证**: ✅ Header 认证
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "report": { ... }
-}
-```
-
-**错误返回** (404):
-```json
-{
-  "error": "报告不存在"
-}
-```
-
----
-
-### 11.3 `GET /analysis/list` — 分析报告列表
-
-> **认证**: ✅ Header 认证
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `exam_id` | string | ❌ | 按试卷过滤 |
-| `limit` | int | ❌ | 返回数量，默认 20 |
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "reports": [...],
-  "total": 5
-}
-```
-
----
-
-
-## 12. 版本管理
-
-### 12.1 `POST /documents/<collection>/<path:doc_path>/deprecate` — 废止文档
-
-> **认证**: ✅ Header 认证
-> **权限**: `admin` 或 `manager`（本部门）
-
-**请求体**:
-```json
-{
-  "reason": "制度已更新，新版本已发布"
-}
-```
-
-**curl 示例**:
-```bash
-curl -X POST http://localhost:5001/documents/public_kb/old_policy.pdf/deprecate \
-  -H "Content-Type: application/json" \
-  -H "X-User-ID: admin001" \
-  -H "X-User-Role: admin" \
-  -d '{"reason": "制度已更新"}'
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "document_id": "old_policy.pdf",
-  "collection": "public_kb",
-  "status": "deprecated",
-  "affected_questions": [...],
-  "deprecated_at": "2026-04-10T15:00:00"
-}
-```
-
----
-
-### 12.2 `POST /documents/<collection>/<path:doc_path>/restore` — 恢复文档
-
-> **认证**: ✅ Header 认证
-> **权限**: `admin` 或 `manager`（本部门）
-
-**curl 示例**:
-```bash
-curl -X POST http://localhost:5001/documents/public_kb/old_policy.pdf/restore \
-  -H "X-User-ID: admin001" \
-  -H "X-User-Role: admin"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "document_id": "old_policy.pdf",
-  "collection": "public_kb",
-  "status": "active",
-  "restored_at": "2026-04-10T15:05:00"
-}
-```
-
----
-
-### 12.3 `GET /documents/<collection>/<path:doc_path>/versions` — 版本历史
-
-> **认证**: ✅ Header 认证
-> **权限**: 需要读权限
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `limit` | int | ❌ | 返回数量，默认 10 |
-
-**curl 示例**:
-```bash
-curl "http://localhost:5001/documents/public_kb/员工手册_v2.pdf/versions?limit=5" \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "document_id": "员工手册_v2.pdf",
-  "collection": "public_kb",
-  "versions": [
-    {
-      "version": 2,
-      "status": "active",
-      "created_at": "2026-04-05T10:00:00",
-      "created_by": "admin001",
-      "changes": "更新了假期管理章节"
-    },
-    {
-      "version": 1,
-      "status": "deprecated",
-      "created_at": "2026-01-15T10:00:00",
-      "created_by": "admin001",
-      "changes": "初始版本"
-    }
-  ],
-  "total": 2
-}
-```
-
----
-
-### 12.4 `GET /documents/<collection>/<path:doc_path>/info` — 文档状态信息
-
-> **认证**: ✅ Header 认证
-> **权限**: 需要读权限
-
-**curl 示例**:
-```bash
-curl http://localhost:5001/documents/public_kb/员工手册_v2.pdf/info \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "document": {
-    "document_id": "员工手册_v2.pdf",
-    "collection": "public_kb",
-    "status": "active",
-    "chunk_count": 42,
-    "version": 2,
-    "last_updated": "2026-04-05T10:00:00"
-  }
-}
-```
-
----
-
-### 12.5 `GET /documents/deprecated` — 已废止文档列表
-
-> **认证**: ✅ Header 认证
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `collection` | string | ❌ | 过滤向量库 |
-| `limit` | int | ❌ | 返回数量，默认 50 |
-
-**curl 示例**:
-```bash
-curl "http://localhost:5001/documents/deprecated?collection=public_kb" \
-  -H "X-User-ID: admin001" \
-  -H "X-User-Role: admin"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "documents": [
-    {
-      "document_id": "old_policy.pdf",
-      "collection": "public_kb",
-      "status": "deprecated",
-      "deprecated_at": "2026-04-10T15:00:00",
-      "reason": "制度已更新"
-    }
-  ],
-  "total": 1
-}
-```
-
----
-
-### 12.6 `POST /search/version-aware` — 版本感知检索
-
-> **认证**: ✅ Header 认证
-> **说明**: 自动过滤废止版本，返回相关废止提示
-
-**请求体**:
-```json
-{
-  "query": "年假制度",
-  "top_k": 5,
-  "include_deprecated": false
-}
-```
-
-| 字段 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `query` | string | ✅ | 查询内容 |
-| `top_k` | int | ❌ | 返回数量，默认 5 |
-| `include_deprecated` | bool | ❌ | 是否包含废止文档，默认 false |
-
-**curl 示例**:
-```bash
-curl -X POST http://localhost:5001/search/version-aware \
-  -H "Content-Type: application/json" \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user" \
-  -H "X-User-Department: hr" \
-  -d '{"query": "年假制度", "top_k": 5}'
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "query": "年假制度",
-  "results": [
-    {
-      "content": "第五章 假期管理...",
-      "source": "员工手册_v2.pdf",
-      "score": 0.95
-    }
-  ],
-  "version_hints": [
-    {
-      "document": "员工手册_v1.pdf",
-      "status": "deprecated",
-      "reason": "已更新为 v2 版本"
-    }
-  ],
-  "target_collections": ["public_kb", "dept_hr"]
-}
-```
-
----
-
-### 12.7 `POST /documents/<collection>/<path:doc_path>/diff` — 版本差异对比
-
-> **认证**: ✅ Header 认证
-> **权限**: 需要读权限
-
-**请求体**:
-```json
-{
-  "old_chunks": null,
-  "new_chunks": [
-    {
-      "id": "chunk_1",
-      "content": "新版本的内容...",
-      "metadata": {"chapter": "第一章"}
-    }
-  ]
-}
-```
-
-| 字段 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `old_chunks` | array/null | ❌ | 旧版 chunks，不传则从向量库获取 |
-| `new_chunks` | array | ✅ | 新版 chunks |
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "document_id": "员工手册_v2.pdf",
-  "collection": "public_kb",
-  "diff": {
-    "added_chunks": [...],
-    "modified_chunks": [...],
-    "removed_chunks": [...],
-    "similarity_threshold": 0.8,
-    "total_changes": 5
-  }
-}
-```
-
----
-
-
-## 13. 纲要生成
-
-### 13.1 `POST /outline` — 生成文档纲要
-
-> **认证**: ✅ Header 认证
-
-**请求体**:
-```json
-{
-  "document_id": "员工手册_v2.pdf",
-  "force": false
-}
-```
-
-| 字段 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `document_id` | string | ✅ | 文档 ID |
-| `force` | bool | ❌ | 是否强制重新生成，默认 false |
-
-**curl 示例**:
-```bash
-curl -X POST http://localhost:5001/outline \
-  -H "Content-Type: application/json" \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user" \
-  -d '{"document_id": "员工手册_v2.pdf"}'
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "outline": {
-    "document_id": "员工手册_v2.pdf",
-    "title": "员工手册",
-    "sections": [
-      {
-        "title": "第一章 总则",
-        "level": 1,
-        "children": [
-          {"title": "1.1 适用范围", "level": 2, "summary": "..."},
-          {"title": "1.2 基本原则", "level": 2, "summary": "..."}
-        ]
-      }
-    ],
-    "generated_at": "2026-04-10T15:00:00"
-  }
-}
-```
-
----
-
-### 13.2 `GET /outline/<document_id>` — 获取已生成纲要
-
-> **认证**: ✅ Header 认证
-
-**curl 示例**:
-```bash
-curl http://localhost:5001/outline/员工手册_v2.pdf \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user"
-```
-
-**返回** (200): 结构同 13.1
-
-**错误返回** (404):
-```json
-{
-  "error": "纲要不存在，请先生成"
-}
-```
-
----
-
-### 13.3 `GET /outline/<document_id>/export` — 导出纲要
-
-> **认证**: ✅ Header 认证
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `format` | string | ❌ | `json`/`markdown`/`markmap`，默认 json |
-
-**curl 示例**:
-```bash
-# JSON 格式
-curl "http://localhost:5001/outline/员工手册_v2.pdf/export?format=json" \
-  -H "X-User-ID: user001" -H "X-User-Role: user"
-
-# Markdown 格式
-curl "http://localhost:5001/outline/员工手册_v2.pdf/export?format=markdown" \
-  -H "X-User-ID: user001" -H "X-User-Role: user"
-```
-
-**返回**:
-- `format=json`: Content-Type `application/json; charset=utf-8`
-- `format=markdown`/`markmap`: Content-Type `text/plain; charset=utf-8`
-
----
-
-### 13.4 `DELETE /outline/<document_id>` — 删除纲要缓存
-
-> **认证**: ✅ Header 认证
-> **权限**: 仅 `admin`
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "message": "缓存已删除"
-}
-```
-
----
-
-### 13.5 `GET /outline/list` — 纲要列表
-
-> **认证**: ✅ Header 认证
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `limit` | int | ❌ | 返回数量，默认 50 |
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "outlines": [
-    {
-      "document_id": "员工手册_v2.pdf",
-      "title": "员工手册",
-      "generated_at": "2026-04-10T15:00:00"
-    }
-  ],
-  "total": 3
-}
-```
-
----
-
-### 13.6 `POST /outline/batch` — 批量生成纲要
-
-> **认证**: ✅ Header 认证
-
-**请求体**:
-```json
-{
-  "document_ids": ["员工手册_v2.pdf", "安全管理制度.pdf"],
-  "force": false
-}
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "results": {
-    "员工手册_v2.pdf": { ... },
-    "安全管理制度.pdf": { ... }
-  },
-  "total": 2
-}
-```
-
----
-
-
-## 14. 关联推荐
-
-### 14.1 `GET /recommend/<document_id>` — 获取关联推荐
-
-> **认证**: ✅ Header 认证
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `top_k` | int | ❌ | 返回数量，默认 5 |
-| `cache` | string | ❌ | 是否使用缓存，默认 `true` |
-
-**curl 示例**:
-```bash
-curl "http://localhost:5001/recommend/员工手册_v2.pdf?top_k=5" \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "document_id": "员工手册_v2.pdf",
-  "recommendations": [
-    {
-      "document_id": "考勤管理制度.docx",
-      "title": "考勤管理制度",
-      "similarity": 0.85,
-      "reason": "共同涉及假期管理、考勤规定"
-    },
-    {
-      "document_id": "薪酬管理制度.pdf",
-      "title": "薪酬管理制度",
-      "similarity": 0.72,
-      "reason": "共同涉及员工福利、薪酬计算"
-    }
-  ],
-  "total": 2
-}
-```
-
----
-
-### 14.2 `POST /recommend/compute-vectors` — 计算所有文档向量
-
-> **认证**: ✅ Header 认证
-> **权限**: 仅 `admin`
-
-**curl 示例**:
-```bash
-curl -X POST http://localhost:5001/recommend/compute-vectors \
-  -H "X-User-ID: admin001" \
-  -H "X-User-Role: admin"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "message": "计算了 28 个文档的向量"
-}
-```
-
----
-
-
-## 15. 问答质量反馈闭环
-
-### 15.1 `POST /feedback` — 提交反馈
-
-> **认证**: ✅ Header 认证
-
-**请求体**:
-```json
-{
-  "session_id": "a1b2c3d4-...",
-  "query": "公司的年假制度是什么？",
-  "answer": "根据公司制度...",
-  "rating": 1,
-  "sources": ["员工手册_v2.pdf"],
-  "reason": "回答准确且详细",
-  "user_id": "user001"
-}
-```
-
-| 字段 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `session_id` | string | ✅ | 会话 ID |
-| `query` | string | ✅ | 原始问题 |
-| `answer` | string | ❌ | 系统回答 |
-| `rating` | int | ✅ | `1`（赞）/ `-1`（踩） |
-| `sources` | array | ❌ | 来源文档 |
-| `reason` | string | ❌ | 反馈原因 |
-| `user_id` | string | ❌ | 用户 ID |
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "feedback_id": 42,
-  "faq_suggested": true,
-  "suggestion_id": 15
-}
-```
-
-**说明**: 如果正面反馈且问题出现多次，系统会自动建议沉淀为 FAQ。
-
----
-
-### 15.2 `GET /feedback/stats` — 反馈统计
-
-> **认证**: ✅ Header 认证
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `start_date` | string | ❌ | 起始日期 `YYYY-MM-DD` |
-| `end_date` | string | ❌ | 结束日期 `YYYY-MM-DD` |
-
-**curl 示例**:
-```bash
-curl "http://localhost:5001/feedback/stats?start_date=2026-04-01&end_date=2026-04-10" \
-  -H "X-User-ID: admin001" \
-  -H "X-User-Role: admin"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "stats": {
-    "total": 120,
-    "positive": 95,
-    "negative": 25,
-    "positive_rate": 79.2,
-    "top_negative_queries": [...]
-  }
-}
-```
-
----
-
-### 15.3 `GET /feedback/list` — 反馈列表
-
-> **认证**: ✅ Header 认证
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `rating` | int | ❌ | 评分过滤: `1` 或 `-1` |
-| `user_id` | string | ❌ | 用户过滤 |
-| `start_date` | string | ❌ | 起始日期 |
-| `end_date` | string | ❌ | 结束日期 |
-| `limit` | int | ❌ | 返回数量，默认 100 |
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "feedbacks": [
-    {
-      "feedback_id": 42,
-      "session_id": "abc123",
-      "query": "年假制度",
-      "answer": "...",
-      "rating": 1,
-      "reason": "回答准确",
-      "created_at": "2026-04-10T15:00:00"
-    }
-  ],
-  "total": 120
-}
-```
-
----
-
-### 15.4 `GET /reports/weekly` — 周报告
-
-> **认证**: ✅ Header 认证
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "report": {
-    "period": "weekly",
-    "start_date": "2026-04-03",
-    "end_date": "2026-04-10",
-    "total_queries": 250,
-    "positive_feedback": 200,
-    "negative_feedback": 20,
-    "satisfaction_rate": 90.9,
-    "top_queries": [...],
-    "improvement_areas": [...]
-  }
-}
-```
-
----
-
-### 15.5 `GET /reports/monthly` — 月报告
-
-> **认证**: ✅ Header 认证
-
-**返回** (200): 结构同周报告，`period` 为 `monthly`
-
----
-
-
-## 16. FAQ 管理
-
-### 16.1 `GET /faq` — FAQ 列表
-
-> **认证**: ✅ Header 认证
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `status` | string | ❌ | 状态过滤 |
-| `limit` | int | ❌ | 返回数量，默认 50 |
-
-**curl 示例**:
-```bash
-curl "http://localhost:5001/faq?limit=20" \
-  -H "X-User-ID: user001" \
-  -H "X-User-Role: user"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "faqs": [
-    {
-      "faq_id": 1,
-      "question": "公司年假制度是什么？",
-      "answer": "根据工龄计算...",
-      "source_documents": ["员工手册_v2.pdf"],
-      "status": "approved",
-      "created_at": "2026-04-01T10:00:00"
-    }
-  ],
-  "total": 15
-}
-```
-
----
-
-### 16.2 `POST /faq` — 新增 FAQ
-
-> **认证**: ✅ Header 认证
-> **权限**: 仅 `admin`
-
-**请求体**:
-```json
-{
-  "question": "如何申请年假？",
-  "answer": "通过 OA 系统提交年假申请...",
-  "source_documents": ["员工手册_v2.pdf"],
-  "status": "approved"
-}
-```
-
-| 字段 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `question` | string | ✅ | 问题 |
-| `answer` | string | ✅ | 答案 |
-| `source_documents` | array | ❌ | 来源文档 |
-| `status` | string | ❌ | 状态，默认 `approved` |
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "faq_id": 16,
-  "message": "FAQ创建成功"
-}
-```
-
----
-
-### 16.3 `PUT /faq/<faq_id>` — 更新 FAQ
-
-> **认证**: ✅ Header 认证
-> **权限**: 仅 `admin`
-
-**请求体** (部分更新):
-```json
-{
-  "answer": "更新后的答案...",
-  "status": "approved"
-}
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "message": "FAQ更新成功"
-}
-```
-
----
-
-### 16.4 `DELETE /faq/<faq_id>` — 删除 FAQ
-
-> **认证**: ✅ Header 认证
-> **权限**: 仅 `admin`
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "message": "FAQ删除成功"
-}
-```
-
----
-
-### 16.5 `GET /faq/suggestions` — FAQ 建议列表
-
-> **认证**: ✅ Header 认证
-> **权限**: 仅 `admin`
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `status` | string | ❌ | 状态过滤，默认 `pending` |
-| `limit` | int | ❌ | 返回数量，默认 50 |
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "suggestions": [
-    {
-      "suggestion_id": 15,
-      "question": "出差补贴标准是多少？",
-      "proposed_answer": "根据出差地区不同...",
-      "source_feedback_id": 42,
-      "status": "pending"
-    }
-  ],
-  "total": 3
-}
-```
-
----
-
-### 16.6 `POST /faq/suggestions/<suggestion_id>/approve` — 批准建议
-
-> **认证**: ✅ Header 认证
-> **权限**: 仅 `admin`
-
-**curl 示例**:
-```bash
-curl -X POST http://localhost:5001/faq/suggestions/15/approve \
-  -H "X-User-ID: admin001" \
-  -H "X-User-Role: admin"
-```
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "faq_id": 17,
-  "message": "FAQ建议已批准"
-}
-```
-
----
-
-### 16.7 `POST /faq/suggestions/<suggestion_id>/reject` — 拒绝建议
-
-> **认证**: ✅ Header 认证
-> **权限**: 仅 `admin`
-
-**返回** (200):
-```json
-{
-  "success": true,
-  "message": "FAQ建议已拒绝"
-}
-```
-
----
-
-
-## 17. 审计日志
-
-### 17.1 `GET /audit/logs` — 获取审计日志
-
-> **认证**: ✅ Header 认证
-> **权限**: 仅 `admin`
-
-| 参数 | 类型 | 必需 | 说明 |
-|---|---|---|---|
-| `user_id` | string | ❌ | 按用户过滤 |
-| `action` | string | ❌ | 按操作类型过滤（如 `rag_query`, `upload_document`, `delete_document`） |
-| `limit` | int | ❌ | 返回数量，默认 100 |
-| `days` | int | ❌ | 最近 N 天，默认 7 |
-
-**curl 示例**:
-```bash
-# 查看所有日志
-curl "http://localhost:5001/audit/logs?limit=20&days=7" \
-  -H "X-User-ID: admin001" \
-  -H "X-User-Role: admin"
-
-# 按用户过滤
-curl "http://localhost:5001/audit/logs?user_id=user001&limit=50" \
-  -H "X-User-ID: admin001" \
-  -H "X-User-Role: admin"
-
-# 按操作类型过滤
-curl "http://localhost:5001/audit/logs?action=rag_query&limit=50" \
-  -H "X-User-ID: admin001" \
-  -H "X-User-Role: admin"
-```
-
-**返回** (200):
-```json
-{
-  "logs": [
-    {
-      "id": 1,
-      "user_id": "user001",
-      "username": "李员工",
-      "role": "user",
-      "department": "finance",
-      "action": "rag_query",
-      "query": "年假制度",
-      "result_summary": "根据公司制度...",
-      "sources": ["员工手册_v2.pdf"],
-      "ip_address": "192.168.1.100",
-      "duration_ms": 1200,
-      "created_at": "2026-04-10T14:00:00"
-    }
-  ]
-}
-```
-
----
-
-## 附录：接口速查表
-
-| 方法 | 路径 | 认证 | 权限 | 说明 |
-|---|---|---|---|---|
-| `GET` | `/health` | ❌ | - | 健康检查 |
-| `GET` | `/auth/me` | ✅ | all | 当前用户信息 |
-| `GET` | `/stats` | ✅ | admin | 系统统计 |
-| `POST` | `/chat` | ✅ | all | 普通聊天 |
-| `POST` | `/rag` | ✅ | all | 知识库问答 |
-| `POST` | `/rag/stream` | ✅ | all | 知识库问答(SSE) |
-| `POST` | `/search` | ✅ | all | 混合检索 |
-| `GET` | `/sessions` | ✅ | all | 会话列表 |
-| `GET` | `/history/<id>` | ✅ | owner | 会话历史 |
-| `DELETE` | `/session/<id>` | ✅ | owner | 删除会话 |
-| `POST` | `/clear/<id>` | ✅ | owner | 清空历史 |
-| `GET` | `/collections` | ✅ | all | 向量库列表 |
-| `POST` | `/collections` | ✅ | admin | 创建向量库 |
-| `DELETE` | `/collections/<name>` | ✅ | admin | 删除向量库 |
-| `GET` | `/collections/<name>/documents` | ✅ | read | 向量库文档 |
-| `POST` | `/documents/sync` | ✅ | admin/mgr | 同步向量化 |
-| `POST` | `/kb/route` | ✅ | all | 路由测试 |
-| `POST` | `/documents/upload` | ✅ | admin/mgr | 上传文件 |
-| `GET` | `/documents/list` | ✅ | all | 文档列表 |
-| `DELETE` | `/documents/<path>` | ✅ | admin/mgr | 删除文档 |
-| `POST` | `/sync` | ✅ | admin | 手动同步 |
-| `GET` | `/sync/status` | ✅ | all | 同步状态 |
-| `GET` | `/sync/history` | ✅ | all | 同步历史 |
-| `GET` | `/sync/changes` | ✅ | all | 变更日志 |
-| `POST` | `/sync/start` | ✅ | admin | 启动监控 |
-| `POST` | `/sync/stop` | ✅ | admin | 停止监控 |
-| `POST` | `/subscribe` | ✅ | all | 订阅文档 |
-| `DELETE` | `/subscribe` | ✅ | all | 取消订阅 |
-| `GET` | `/subscriptions` | ✅ | all | 订阅列表 |
-| `GET` | `/notifications` | ✅ | all | 获取通知 |
-| `POST` | `/notifications/<id>/read` | ✅ | all | 标记已读 |
-| `POST` | `/notifications/read-all` | ✅ | all | 全部已读 |
-| `POST` | `/exam/generate` | JWT | all | 生成试卷 |
-| `GET` | `/exam/list` | JWT | all | 试卷列表 |
-| `GET` | `/exam/<id>` | JWT | all | 试卷详情 |
-| `PUT` | `/exam/<id>` | JWT | all | 更新试卷 |
-| `DELETE` | `/exam/<id>` | JWT | all | 删除试卷 |
-| `POST` | `/exam/<id>/submit` | JWT | all | 提交审核 |
-| `POST` | `/exam/<id>/review` | JWT | admin | 审核试卷 |
-| `POST` | `/exam/<id>/grade` | JWT | all | 批阅试卷 |
-| `GET` | `/exam/report/<id>` | JWT | all | 批阅报告 |
-| `GET` | `/exam/report/list` | JWT | all | 报告列表 |
-| `GET` | `/exam/questions/search` | JWT | all | 搜索题目 |
-| `POST` | `/questions/link-document` | ✅ | all | 题目-制度关联 |
-| `POST` | `/questions/link-knowledge` | ✅ | all | 题目-知识点关联 |
-| `GET` | `/questions/affected` | ✅ | all | 受影响题目 |
-| `POST` | `/questions/<id>/review` | ✅ | all | 审核受影响题目 |
-| `GET` | `/documents/<id>/questions` | ✅ | all | 制度关联题目 |
-| `GET` | `/documents/<id>/versions` | ✅ | all | 制度版本历史 |
-| `GET` | `/knowledge-points` | ✅ | all | 知识点列表 |
-| `GET` | `/questions/suggestions` | ✅ | all | 新题建议 |
-| `GET` | `/questions/<id>/knowledge-points` | ✅ | all | 题目知识点 |
-| `POST` | `/exam/<id>/analyze` | ✅ | all | 整卷分析 |
-| `GET` | `/analysis/<id>` | ✅ | all | 分析报告 |
-| `GET` | `/analysis/list` | ✅ | all | 报告列表 |
-| `POST` | `/documents/.../deprecate` | ✅ | admin/mgr | 废止文档 |
-| `POST` | `/documents/.../restore` | ✅ | admin/mgr | 恢复文档 |
-| `GET` | `/documents/.../versions` | ✅ | read | 版本历史 |
-| `GET` | `/documents/.../info` | ✅ | read | 文档状态 |
-| `GET` | `/documents/deprecated` | ✅ | all | 废止文档列表 |
-| `POST` | `/search/version-aware` | ✅ | all | 版本感知检索 |
-| `POST` | `/documents/.../diff` | ✅ | read | 版本差异对比 |
-| `POST` | `/outline` | ✅ | all | 生成纲要 |
-| `GET` | `/outline/<id>` | ✅ | all | 获取纲要 |
-| `GET` | `/outline/<id>/export` | ✅ | all | 导出纲要 |
-| `DELETE` | `/outline/<id>` | ✅ | admin | 删除纲要缓存 |
-| `GET` | `/outline/list` | ✅ | all | 纲要列表 |
-| `POST` | `/outline/batch` | ✅ | all | 批量生成 |
-| `GET` | `/recommend/<id>` | ✅ | all | 关联推荐 |
-| `POST` | `/recommend/compute-vectors` | ✅ | admin | 计算文档向量 |
-| `POST` | `/feedback` | ✅ | all | 提交反馈 |
-| `GET` | `/feedback/stats` | ✅ | all | 反馈统计 |
-| `GET` | `/feedback/list` | ✅ | all | 反馈列表 |
-| `GET` | `/reports/weekly` | ✅ | all | 周报告 |
-| `GET` | `/reports/monthly` | ✅ | all | 月报告 |
-| `GET` | `/faq` | ✅ | all | FAQ 列表 |
-| `POST` | `/faq` | ✅ | admin | 新增 FAQ |
-| `PUT` | `/faq/<id>` | ✅ | admin | 更新 FAQ |
-| `DELETE` | `/faq/<id>` | ✅ | admin | 删除 FAQ |
-| `GET` | `/faq/suggestions` | ✅ | admin | FAQ 建议列表 |
-| `POST` | `/faq/suggestions/<id>/approve` | ✅ | admin | 批准建议 |
-| `POST` | `/faq/suggestions/<id>/reject` | ✅ | admin | 拒绝建议 |
-| `GET` | `/audit/logs` | ✅ | admin | 审计日志 |
-
-> **说明**: ✅ = Header 认证, JWT = Bearer Token 认证, all = 所有已认证用户, owner = 仅会话所有者, read = 需要读权限, admin/mgr = admin 或 manager
+- [ ] 测试权限控制（collections 参数）
+- [ ] 测试文档上传
+- [ ] 测试反馈提交
 
 ---
 
 ## 更新日志
 
 | 日期 | 版本 | 更新内容 |
-|---|---|---|
-| 2026-04-13 | 3.0 | 合并 `api_documentation.md` 和 `API对接文档.md`，补充 SSE 事件类型详情和试卷状态流程说明 |
-| 2026-04-10 | 2.1 | 完善出题系统状态流程说明，明确 draft → pending_review → approved/rejected 流程 |
-| 2026-04-07 | 2.0 | 新增知识库同步、订阅通知、题库维护、整卷分析、纲要生成、关联推荐、问答质量闭环 API |
-| 2024-04-03 | 1.1 | 出题系统：添加试卷名称字段、完善审核流程说明 |
-| 2024-04-02 | 1.0 | 初始版本 |
-
+|------|------|----------|
+| 2026-04-26 | 3.1 | 根据实际测试结果精简文档，移除无效端点，确保准确性 |
+| 2026-04-20 | 3.0 | 合并文档，补充 SSE 详情 |
+| 2026-04-13 | 2.0 | 新增同步服务、版本管理等接口 |

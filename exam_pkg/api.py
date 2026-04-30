@@ -28,6 +28,10 @@ from auth.gateway import (
     require_gateway_auth, require_role, check_collection_permission, get_current_user
 )
 
+# 导入统一响应格式
+from core.status_codes import EXAM_SUCCESS, GRADE_SUCCESS, EXAM_ERROR, GRADE_ERROR, BAD_REQUEST, NO_CONTENT, LLM_ERROR
+from api.response_utils import success_response, error_response
+
 # 创建蓝图
 exam_bp = Blueprint('exam', __name__)
 
@@ -82,15 +86,15 @@ def api_generate_questions():
         question_types = data.get('question_types', {})
 
         if not file_path or not collection:
-            return jsonify({"error": "缺少 file_path 或 collection 参数"}), 400
+            return error_response("MISSING_PARAMS", BAD_REQUEST, "缺少 file_path 或 collection 参数", http_status=400)
 
         if not question_types:
-            return jsonify({"error": "缺少 question_types 参数"}), 400
+            return error_response("MISSING_PARAMS", BAD_REQUEST, "缺少 question_types 参数", http_status=400)
 
         # 获取当前用户
         user = get_current_user()
         if not user:
-            return jsonify({"error": "未认证"}), 401
+            return error_response("UNAUTHORIZED", BAD_REQUEST, "未认证", http_status=401)
 
         # 检查向量库访问权限
         if not check_collection_permission(
@@ -99,10 +103,7 @@ def api_generate_questions():
             collection_name=collection,
             operation="read"
         ):
-            return jsonify({
-                "error": "权限不足",
-                "message": f"您没有权限访问向量库 '{collection}'"
-            }), 403
+            return error_response("FORBIDDEN", BAD_REQUEST, "权限不足", http_status=403)
 
         # 调用新版出题接口
         result = generate_questions_from_file(
@@ -114,10 +115,10 @@ def api_generate_questions():
             request_id=data.get('request_id')
         )
 
-        return jsonify(result)
+        return success_response(data=result, status_code=EXAM_SUCCESS, message="出题成功")
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return error_response("EXAM_ERROR", EXAM_ERROR, str(e), http_status=500)
 
 
 # ==================== 批题 API ====================
@@ -175,7 +176,7 @@ def api_grade_answers():
 
         answers = data.get('answers', [])
         if not answers:
-            return jsonify({"error": "缺少答案数据"}), 400
+            return error_response("MISSING_PARAMS", BAD_REQUEST, "缺少答案数据", http_status=400)
 
         # 调用新版批题接口
         result = grade_answers(
@@ -183,10 +184,10 @@ def api_grade_answers():
             request_id=data.get('request_id')
         )
 
-        return jsonify(result)
+        return success_response(data=result, status_code=GRADE_SUCCESS, message="批阅完成")
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return error_response("GRADE_ERROR", GRADE_ERROR, str(e), http_status=500)
 
 
 # ==================== 健康检查 ====================

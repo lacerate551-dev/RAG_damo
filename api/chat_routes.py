@@ -183,39 +183,112 @@ def _build_citation(meta: dict, full_content: str = '') -> dict:
     return citation
 
 
-def score_image_relevance(query: str, meta: dict) -> float:
+def score_image_relevance(query: str, meta: dict, doc: str = '') -> float:
     """
-    图片相关性打分（Phase 5）
+    图片相关性打分（语义增强版）
 
     Args:
         query: 用户查询
         meta: 切片元数据
+        doc: document 字段（包含图片描述和上下文）
 
     Returns:
         相关性分数（>= 3.0 推荐展示）
     """
+    import re
     score = 0.0
 
-    # 1. 查询意图匹配（最重要）
-    intent_keywords = ["结构", "流程", "图", "示意", "图表", "展示", "架构", "拓扑", "图示"]
-    if any(kw in query for kw in intent_keywords):
-        score += 3.0
+    # 优先使用 doc 字段（包含完整描述和上下文）
+    search_text = doc or meta.get('caption', '')
+    section = meta.get('section', '') or meta.get('section_path', '')
+    source = meta.get('source', '')
 
-    # 2. 图片类型
+    # 1. 图片编号精确匹配（最高优先级）
+    figure_pattern = r'图\s*(\d+\.?\d*)'
+    figure_matches = re.findall(figure_pattern, query)
+
+    if figure_matches:
+        for fig_num in figure_matches:
+            # 在所有文本中查找图号
+            all_text = f"{search_text} {section} {source}"
+            if f"图{fig_num}" in all_text or f"图 {fig_num}" in all_text or f"见图{fig_num}" in all_text:
+                score += 10.0  # 精确匹配，直接返回
+                return score
+
+    # 1.5. 表格编号精确匹配（新增：支持表格图片）
+    table_pattern = r'表\s*(\d+\.?\d*)'
+    table_matches = re.findall(table_pattern, query)
+
+    if table_matches:
+        for table_num in table_matches:
+            # 在所有文本中查找表号
+            all_text = f"{search_text} {section} {source}"
+            if f"表{table_num}" in all_text or f"表 {table_num}" in all_text or f"见表{table_num}" in all_text:
+                score += 10.0  # 精确匹配，直接返回
+                return score
+
+    # 2. 查询词匹配（通用方式，不硬编码关键词）
+    # 从查询中提取有意义的词：中文词组、数字+单位、年份等
+    # 使用 jieba 分词（如果可用）或简单的正则提取
+    query_keywords = []
+
+    # 提取年份（如 "2003年"）
+    year_matches = re.findall(r'(\d{4})\s*年', query)
+    query_keywords.extend(year_matches)
+
+    # 提取数值+单位（如 "100亿"、"50万千瓦时"）
+    num_unit_matches = re.findall(r'(\d+\.?\d*\s*[亿万万千百吨米秒])', query)
+    query_keywords.extend(num_unit_matches)
+
+    # 提取中文词组（2个及以上连续汉字）
+    chinese_matches = re.findall(r'[一-龥]{2,}', query)
+    query_keywords.extend(chinese_matches)
+
+    # 过滤掉泛词（图、表、图片等）
+    stop_words = {'图', '表', '图片', '图表', '如图', '所示', '如下', '如下表', '如下图'}
+    query_keywords = [kw for kw in query_keywords if kw not in stop_words]
+
+    # 在图片描述中匹配关键词
+    keyword_match_score = 0.0
+    for kw in query_keywords:
+        if kw in search_text or kw in section:
+            keyword_match_score += 2.0
+
+    score += min(keyword_match_score, 8.0)  # 最多加 8 分
+
+    # 3. 整体文本相似度（字符级别）
+    if search_text:
+        # 检查查询的核心词是否在描述中
+        query_core = re.sub(r'[图表图片如图所示]', '', query)  # 去掉泛词
+        if query_core:
+            overlap = len(set(query_core) & set(search_text))
+            score += min(overlap * 0.2, 3.0)
+
+    # 4. 章节匹配
+    if section:
+        # 从查询中提取可能的章节关键词
+        section_keywords = re.findall(r'[一-龥]{2,}', query)
+        for kw in section_keywords:
+            if kw in section:
+                score += 1.5
+
+    # 5. 图片类型加分
     if meta.get('chunk_type') == 'chart':
         score += 2.0
     elif meta.get('chunk_type') == 'image':
         score += 1.0
 
-    # 3. 相似度
-    score += min(meta.get('score', 0), 1.0)
+    # 6. 检索相似度（如果有）
+    retrieval_score = meta.get('score', 0)
+    if retrieval_score > 0:
+        score += min(retrieval_score * 2, 2.0)
 
     return score
 
 
 def select_images(contexts: list, query: str) -> list:
     """
-    选择要展示的图片（打分排序 + 预算控制）（Phase 5）
+    选择要展示的图片（打分排序 + 预算控制）
 
     Args:
         contexts: 检索上下文列表
@@ -224,18 +297,182 @@ def select_images(contexts: list, query: str) -> list:
     Returns:
         精选图片列表（最多 2-5 张，根据查询意图动态调整）
     """
+    import re
+
     # 动态预算：列举型查询允许更多图片
     list_keywords = ["哪些", "有什么", "包含", "列出", "所有", "全部"]
     is_list_query = any(kw in query for kw in list_keywords)
 
-    MAX_IMAGES = 5 if is_list_query else 2
-    MIN_SCORE = 2.5  # 降低阈值，避免过滤掉相关图片
+    # 检测查询中的图片编号（如 "图2.1"）
+    figure_pattern = r'图\s*(\d+\.?\d*)'
+    figure_matches = re.findall(figure_pattern, query)
+    has_figure_query = bool(figure_matches)
+
+    # 新增：从检索文本中提取图表引用（见表2.2、见图2.5 等）
+    # 同时记录引用所在的文件来源
+    # 重要：只从语义相关的 top 5 文本块提取，避免不相关引用干扰
+    referenced_figures = {}  # {图号: set(文件来源)}
+    referenced_tables = {}   # {表号: set(文件来源)}
+
+    for ctx in contexts[:5]:  # 只从前5个最相关的文本块提取引用
+        doc_text = ctx.get('doc', '')
+        source = ctx.get('meta', {}).get('source', '')
+
+        # 提取 "见图X.X"、"如图X.X" 或单独的 "图X.X"
+        fig_refs = re.findall(r'(?:[见如])?图\s*(\d+\.?\d*)', doc_text)
+        for fig_num in fig_refs:
+            if fig_num not in referenced_figures:
+                referenced_figures[fig_num] = set()
+            if source:
+                referenced_figures[fig_num].add(source)
+
+        # 提取 "见表X.X"、"如表X.X" 或单独的 "表X.X"
+        table_refs = re.findall(r'(?:[见如])?表\s*(\d+\.?\d*)', doc_text)
+        for table_num in table_refs:
+            if table_num not in referenced_tables:
+                referenced_tables[table_num] = set()
+            if source:
+                referenced_tables[table_num].add(source)
+
+    has_referenced_figures = bool(referenced_figures or referenced_tables)
+
+    # 获取检索结果中涉及的主要文件来源
+    primary_sources = set()
+    for ctx in contexts[:5]:  # 只看前5个最相关的
+        source = ctx.get('meta', {}).get('source', '')
+        if source:
+            primary_sources.add(source)
+
+    # 图片意图检测：区分精确查图和泛指
+    strong_image_keywords = ["示意图", "流程图", "结构图", "过程线", "曲线图", "分布图", "图示", "看图", "显示图"]
+    weak_image_keywords = ["图片", "图表", "如图", "图", "统计"]
+
+    has_strong_image_intent = any(kw in query for kw in strong_image_keywords)
+    has_weak_image_intent = any(kw in query for kw in weak_image_keywords)
+
+    # 精确查图：用户指定了具体图号（如 "图2.3"），只返回最匹配的 1-2 张
+    if has_figure_query:
+        MAX_IMAGES = 2
+        MIN_SCORE = 5.0  # 精确匹配应该高分
+    # 强图片意图：明确要看某种图
+    elif has_strong_image_intent:
+        MAX_IMAGES = 3
+        MIN_SCORE = 5.0  # 提高阈值，避免不相关图片通过
+    # 列举型查询
+    elif is_list_query:
+        MAX_IMAGES = 5
+        MIN_SCORE = 3.0
+    # 有图表引用：检索文本中提到了图表
+    elif has_referenced_figures:
+        MAX_IMAGES = 3
+        MIN_SCORE = 2.0  # 降低阈值，让引用的图表能通过
+    # 弱图片意图：只是提到"图"字，可能是泛指（如 "发电量图"）
+    elif has_weak_image_intent:
+        MAX_IMAGES = 1  # 只返回最相关的一张
+        MIN_SCORE = 2.0  # 降低阈值，让语义相关的图片能通过
+    # 普通查询
+    else:
+        MAX_IMAGES = 2
+        MIN_SCORE = 3.0
+
+    # 获取检索结果中涉及的主要章节（只看前 3 个最相关的文本块）
+    primary_sections = set()
+    for ctx in contexts[:3]:
+        section = ctx.get('meta', {}).get('section', '') or ctx.get('meta', {}).get('section_path', '')
+        if section:
+            # 提取章节编号
+            # 优先匹配 X.X 格式（如 "2.3发电"），再匹配 第X章 格式
+            section_num = re.search(r'(\d+\.\d+)', section)
+            if not section_num:
+                # 尝试匹配 "第X章" 格式
+                chapter_match = re.search(r'第\s*(\d+)\s*章', section)
+                if chapter_match:
+                    section_num = chapter_match
+            if section_num:
+                primary_sections.add(section_num.group(1))
 
     scored_images = []
     for ctx in contexts:
         meta = ctx.get('meta', {})
-        if meta.get('chunk_type') in ('image', 'chart') and meta.get('image_path'):
-            s = score_image_relevance(query, meta)
+        chunk_type = meta.get('chunk_type', 'text')
+
+        # 处理图片类型和有关联图片的表格类型
+        if meta.get('image_path') and chunk_type in ('image', 'chart', 'table'):
+            # 传递 doc 字段（包含图片描述和上下文）
+            doc = ctx.get('doc', '')
+            s = score_image_relevance(query, meta, doc)
+
+            # 图片来源
+            img_source = meta.get('source', '')
+
+            # 图片章节
+            img_section = meta.get('section', '') or meta.get('section_path', '')
+            # 只匹配 X.X 格式的章节号，避免匹配年份
+            img_section_num = re.search(r'(\d+\.\d+)', img_section)
+            img_section_id = img_section_num.group(1) if img_section_num else None
+
+            # ========== 核心修复：图片必须与主要文本切片章节关联 ==========
+            # 如果有主要章节，且图片章节不在其中，大幅降低分数
+            section_penalty = 0.0
+            if primary_sections and img_section_id and img_section_id not in primary_sections:
+                # 图片章节与主要检索结果不匹配，惩罚
+                section_penalty = -5.0  # 大幅降低分数
+                # 除非图片被文本切片明确引用
+                is_referenced = False
+                for fig_num in referenced_figures:
+                    if f"图{fig_num}" in doc or f"图 {fig_num}" in doc:
+                        is_referenced = True
+                        break
+                if not is_referenced:
+                    for table_num in referenced_tables:
+                        if f"表{table_num}" in doc or f"表 {table_num}" in doc:
+                            is_referenced = True
+                            break
+                if is_referenced:
+                    section_penalty = 0.0  # 被引用则不惩罚
+
+            s += section_penalty
+
+            # 新增：如果图片描述中包含检索文本引用的图号，大幅加分
+            # 前提：图片章节与主要检索结果的章节相关
+            if referenced_figures:
+                for fig_num, sources in referenced_figures.items():
+                    # 只检查 doc 字段，不检查 meta（避免 section 中的误匹配）
+                    if f"图{fig_num}" in doc or f"图 {fig_num}" in doc:
+                        # 检查图片章节是否与主要章节匹配
+                        section_match = img_section_id and img_section_id in primary_sections
+
+                        # P2：只有章节匹配才加分，移除"s >= 5.0"漏洞
+                        if section_match:
+                            # 图号匹配加分
+                            s += 8.0
+                            # 如果图片来源与引用来源一致，额外加分
+                            if img_source in sources:
+                                s += 5.0  # 文件匹配额外加分
+                        break
+
+            # 新增：如果表格描述中包含检索文本引用的表号，大幅加分
+            # 同样要求章节相关性
+            if referenced_tables:
+                for table_num, sources in referenced_tables.items():
+                    # 只检查 doc 字段
+                    if f"表{table_num}" in doc or f"表 {table_num}" in doc:
+                        # 检查图片章节是否与主要章节匹配
+                        section_match = img_section_id and img_section_id in primary_sections
+
+                        # P2：只有章节匹配才加分，移除"s >= 5.0"漏洞
+                        if section_match:
+                            # 表号匹配加分
+                            s += 8.0
+                            # 如果图片来源与引用来源一致，额外加分
+                            if img_source in sources:
+                                s += 5.0  # 文件匹配额外加分
+                        break
+
+            # 新增：如果图片来源在主要检索结果中，加分
+            if img_source in primary_sources:
+                s += 2.0
+
             if s >= MIN_SCORE:
                 scored_images.append({
                     'score': s,
@@ -244,8 +481,54 @@ def select_images(contexts: list, query: str) -> list:
                     'type': meta['chunk_type'],
                     'source': meta.get('source'),
                     'page': meta.get('page'),
-                    'description': ctx.get('doc', '')[:100]
+                    'description': doc[:100],  # 短描述用于 UI 展示
+                    'full_description': doc     # Bug 6b 修复：完整描述用于 LLM 上下文
                 })
+
+    # ========== P2：通过文本切片的 referenced_images 补充图片 ==========
+    # 检查 top 5 文本切片的 referenced_images，补充未选中的关联图片
+    existing_image_ids = {img['id'] for img in scored_images}
+
+    for ctx in contexts[:5]:
+        meta = ctx.get('meta', {})
+        if meta.get('chunk_type') != 'text':
+            continue
+
+        referenced = meta.get('referenced_images', [])
+        if not referenced:
+            continue
+
+        # 查找对应的图片切片
+        for fig_num in referenced:
+            # 在所有 contexts 中查找匹配的图片
+            for img_ctx in contexts:
+                img_meta = img_ctx.get('meta', {})
+                if img_meta.get('chunk_type') not in ('image', 'chart', 'table'):
+                    continue
+
+                img_path = img_meta.get('image_path', '')
+                img_id = os.path.basename(img_path)
+
+                # 检查是否已存在
+                if img_id in existing_image_ids:
+                    continue
+
+                # 检查图号/表号是否匹配
+                img_doc = img_ctx.get('doc', '')
+                if f"图{fig_num}" in img_doc or f"表{fig_num}" in img_doc:
+                    # 添加到结果中
+                    scored_images.append({
+                        'score': 8.0,  # 基础分
+                        'id': img_id,
+                        'url': f"/images/{img_id}",
+                        'type': img_meta.get('chunk_type'),
+                        'source': img_meta.get('source'),
+                        'page': img_meta.get('page'),
+                        'description': img_doc[:100],  # 短描述用于 UI 展示
+                        'full_description': img_doc     # Bug 6b 修复：完整描述用于 LLM 上下文
+                    })
+                    existing_image_ids.add(img_id)
+                    break
 
     scored_images.sort(key=lambda x: x['score'], reverse=True)
     return scored_images[:MAX_IMAGES]
@@ -630,14 +913,95 @@ def rag():
         full_answer = []
 
         try:
+            # 0. 意图分析（改写 + 双层判断）
+            context_images = []
+            if history:
+                # 从历史中提取图片信息
+                for msg in reversed(history[-4:]):  # 最近2轮
+                    metadata = msg.get("metadata", {})
+                    if isinstance(metadata, dict):
+                        images = metadata.get("images", [])
+                        if images:
+                            context_images.extend(images[:3])
+
+            try:
+                from core.intent_analyzer import analyze_intent
+                intent = analyze_intent(message, history or [], context_images)
+
+                import logging
+                logging.info(f"[意图分析] use_context={intent.use_context}, need_retrieval={intent.need_retrieval}, reason={intent.reason}")
+
+                # 如果不需要检索，直接使用上下文回答
+                if not intent.need_retrieval and intent.use_context:
+                    yield f"data: {json.dumps({'type': 'start', 'message': '正在分析...'}, ensure_ascii=False)}\n\n"
+
+                    # 构建上下文
+                    context_text = ""
+                    if history:
+                        # 提取最近的助手回答
+                        for msg in reversed(history):
+                            if msg.get("role") == "assistant":
+                                context_text = msg.get("content", "")
+                                break
+
+                    # 构建图片上下文
+                    image_context = ""
+                    if context_images:
+                        image_context = "\n\n【上下文中的图片】\n"
+                        for img in context_images[:5]:
+                            if isinstance(img, dict):
+                                desc = img.get("description", "")
+                                img_type = img.get("type", "图片")
+                                image_context += f"- {img_type}: {desc}\n"
+
+                    # 直接调用 LLM
+                    from config import get_llm_client, DASHSCOPE_MODEL
+                    client = get_llm_client()
+
+                    system_prompt = f"""你是一个专业的知识库问答助手。请根据对话历史和上下文回答用户问题。
+
+如果用户问题是关于图片的，请根据上下文中的图片描述进行分析。
+
+{image_context}"""
+
+                    user_prompt = f"""对话历史：
+{context_text[:2000] if context_text else '（无历史上下文）'}
+
+用户问题：{intent.rewritten_query}
+
+请直接回答用户问题。"""
+
+                    # 流式生成回答
+                    for token in client.chat.completions.create(
+                        model=DASHSCOPE_MODEL,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        temperature=0.7,
+                        stream=True
+                    ):
+                        if token.choices and token.choices[0].delta.content:
+                            content = token.choices[0].delta.content
+                            full_answer.append(content)
+                            yield f"data: {json.dumps({'type': 'chunk', 'content': content}, ensure_ascii=False)}\n\n"
+
+                    # 发送完成事件
+                    yield f"data: {json.dumps({'type': 'finish', 'answer': ''.join(full_answer), 'sources': []}, ensure_ascii=False)}\n\n"
+                    return  # 直接返回，不执行后续检索
+
+            except Exception as e:
+                import logging
+                logging.warning(f"意图分析失败: {e}，继续执行检索流程")
+
             # 1. 发送开始事件
             yield f"data: {json.dumps({'type': 'start', 'message': '正在检索知识库...'}, ensure_ascii=False)}\n\n"
 
-            # 2. 执行混合检索
+            # 2. 执行混合检索（扩大召回数量，确保图片切片有机会被召回）
             search_result = search_hybrid(
                 message,
-                top_k=5,
-                candidates=15,
+                top_k=15,  # 扩大返回数量
+                candidates=100,  # 大幅扩大候选池，让图片切片有机会被召回
                 allowed_collections=collections
             )
 
@@ -649,6 +1013,45 @@ def rag():
                 docs = search_result['documents'][0]
                 metas = search_result.get('metadatas', [[]])[0]
                 scores = search_result.get('scores', [[]])[0]
+
+                # 图片相关性提升：检测图片编号或强意图
+                import re
+                figure_pattern = r'图\s*(\d+\.?\d*)'
+                figure_matches = re.findall(figure_pattern, message)
+                has_figure_query = bool(figure_matches)
+
+                # Bug 4 修复：缩小 strong_image_keywords，移除歧义词
+                # "过程线" 是水文术语不是图片意图，"图片"/"图表"/"如图" 太泛
+                strong_image_keywords = ["示意图", "流程图", "结构图", "曲线图", "分布图", "图示", "看图", "显示图", "给我看"]
+                has_image_intent = has_figure_query or any(kw in message for kw in strong_image_keywords)
+
+                # Bug 2 修复：不重排 contexts，只在 meta 里打标记给后续的 select_images 用
+                if has_image_intent:
+                    for i, (doc, meta, score) in enumerate(zip(docs, metas, scores)):
+                        if meta.get('chunk_type') in ('image', 'chart'):
+                            # 检查 caption 是否与查询相关
+                            caption = meta.get('caption', '') or ''
+                            should_boost = False
+                            boost_factor = 1.0
+
+                            # 如果查询包含图片编号，检查 caption 是否匹配
+                            if has_figure_query:
+                                for fig_num in figure_matches:
+                                    if f"图{fig_num}" in caption or f"图 {fig_num}" in caption:
+                                        should_boost = True
+                                        boost_factor = 2.0  # 强提升
+                                        break
+
+                            # 或者 caption 与查询有足够重叠
+                            if not should_boost:
+                                overlap = len(set(message) & set(caption))
+                                if overlap >= 3 or any(word in caption for word in message if len(word) >= 3):
+                                    should_boost = True
+                                    boost_factor = 1.5  # 提升 50%
+
+                            if should_boost:
+                                meta['_image_boost'] = boost_factor  # 打标记，不重排
+                    # 不做 sort！保持检索引擎的原始排序
 
                 # 按 source 去重，保留最高分
                 seen_sources = {}
@@ -674,24 +1077,169 @@ def rag():
                             'section_chunk_id': meta.get('section_chunk_id'),  # 章节内序号
                             'score': round(score, 3) if isinstance(score, float) else score
                         }
+                    # ========== P1：图片使用 full_description ==========
+                    # 图片切片使用完整描述（用于 LLM 上下文），而非短摘要
+                    display_doc = doc
+                    if meta.get('chunk_type') in ('image', 'chart', 'table'):
+                        full_desc = meta.get('full_description', '')
+                        if full_desc:
+                            display_doc = full_desc
+
                     # contexts 仍然保留所有结果用于生成答案
-                    contexts.append({'doc': doc, 'meta': meta})
+                    contexts.append({'doc': display_doc, 'meta': meta})
 
                 sources = list(seen_sources.values())
+
+                # 补充检索：从文本切片中提取图号/表号引用，补充检索对应的图片
+                # 重要：只从最相关的 top 5 文本切片提取引用，避免不相关引用干扰
+                import re
+                referenced_figures = set()
+                referenced_tables = set()
+
+                # 只检查 top 5 文本切片（与 select_images 逻辑一致）
+                text_contexts = [ctx for ctx in contexts if ctx.get('meta', {}).get('chunk_type') == 'text'][:5]
+                for ctx in text_contexts:
+                    doc_text = ctx.get('doc', '')
+                    fig_refs = re.findall(r'(?:[见如及和与])?图\s*(\d+\.?\d*)', doc_text)
+                    referenced_figures.update(fig_refs)
+                    table_refs = re.findall(r'(?:[见如及和与])?表\s*(\d+\.?\d*)', doc_text)
+                    referenced_tables.update(table_refs)
+
+                # 检查哪些图号/表号对应的图片不在 contexts 中
+                existing_figure_images = set()
+                existing_table_images = set()
+                for ctx in contexts:
+                    doc = ctx.get('doc', '')
+                    meta = ctx.get('meta', {})
+                    if meta.get('chunk_type') in ('image', 'chart'):
+                        for fig_num in referenced_figures:
+                            if f"图{fig_num}" in doc:
+                                existing_figure_images.add(fig_num)
+                        for table_num in referenced_tables:
+                            if f"表{table_num}" in doc:
+                                existing_table_images.add(table_num)
+
+                # 需要补充检索的图号/表号
+                missing_figures = referenced_figures - existing_figure_images
+                missing_tables = referenced_tables - existing_table_images
+
+                # 计算主要章节（用于补充检索过滤）
+                primary_sections_for_supplement = set()
+                for ctx in text_contexts[:3]:
+                    section = ctx.get('meta', {}).get('section', '') or ctx.get('meta', {}).get('section_path', '')
+                    if section:
+                        section_num = re.search(r'(\d+\.\d+)', section)
+                        if not section_num:
+                            chapter_match = re.search(r'第\s*(\d+)\s*章', section)
+                            if chapter_match:
+                                section_num = chapter_match
+                        if section_num:
+                            primary_sections_for_supplement.add(section_num.group(1))
+
+                if missing_figures or missing_tables:
+                    # 补充检索
+                    from knowledge.manager import get_kb_manager
+                    kb_manager = get_kb_manager()
+                    kb_name = collections[0] if collections else 'public_kb'
+                    collection = kb_manager.get_collection(kb_name)
+
+                    if collection:
+                        # 构建补充查询
+                        supplement_queries = []
+                        for fig_num in missing_figures:
+                            supplement_queries.append(f"图{fig_num}")
+                        for table_num in missing_tables:
+                            supplement_queries.append(f"表{table_num}")
+
+                        supplement_query = " ".join(supplement_queries)
+
+                        # 使用 embedding 检索
+                        # P4：复用 engine 的 embedding 模型，避免重复加载
+                        try:
+                            from core.engine import get_engine
+                            engine = get_engine()
+                            query_vector = engine.embedding_model.encode(supplement_query).tolist()
+                            if isinstance(query_vector[0], list):
+                                query_vector = query_vector[0]
+
+                            supplement_result = collection.query(
+                                query_embeddings=[query_vector],
+                                n_results=10,
+                                include=['documents', 'metadatas', 'distances']
+                            )
+
+                            # 添加匹配的图片切片
+                            for supp_doc, supp_meta, supp_dist in zip(
+                                supplement_result['documents'][0],
+                                supplement_result['metadatas'][0],
+                                supplement_result['distances'][0]
+                            ):
+                                chunk_type = supp_meta.get('chunk_type', '')
+                                if chunk_type in ('image', 'chart'):
+                                    # 检查是否匹配缺失的图号/表号
+                                    is_match = False
+                                    matched_fig = None
+                                    for fig_num in missing_figures:
+                                        if f"图{fig_num}" in supp_doc:
+                                            is_match = True
+                                            matched_fig = fig_num
+                                            break
+                                    for table_num in missing_tables:
+                                        if f"表{table_num}" in supp_doc:
+                                            is_match = True
+                                            break
+
+                                    if is_match:
+                                        # 额外检查：图片章节是否与主要章节匹配
+                                        # 避免补充检索到不相关的图片
+                                        supp_section = supp_meta.get('section', '') or supp_meta.get('section_path', '')
+                                        supp_section_num = re.search(r'(\d+\.\d+)', supp_section)
+                                        supp_section_id = supp_section_num.group(1) if supp_section_num else None
+
+                                        # 如果图片章节不在主要章节中，跳过
+                                        if primary_sections_for_supplement and supp_section_id and supp_section_id not in primary_sections_for_supplement:
+                                            # 不是主要章节的图片，跳过
+                                            continue
+
+                                        # Bug 6a 修复：补充检索的图片也要做 full_description 替换
+                                        # 与正常检索保持一致
+                                        display_doc = supp_doc
+                                        if supp_meta.get('chunk_type') in ('image', 'chart', 'table'):
+                                            full_desc = supp_meta.get('full_description', '')
+                                            if full_desc:
+                                                display_doc = full_desc
+
+                                        contexts.append({
+                                            'doc': display_doc,
+                                            'meta': supp_meta,
+                                            'score': 1.0 - supp_dist
+                                        })
+                                        import logging
+                                        logging.info(f"[补充检索] 添加图片: {supp_meta.get('image_path', '')}")
+                        except Exception as e:
+                            import logging
+                            logging.warning(f"补充检索失败: {e}")
 
             # 发送来源事件
             yield f"data: {json.dumps({'type': 'sources', 'sources': sources[:5]}, ensure_ascii=False)}\n\n"
 
+            # 调试：检查 contexts 中是否有图片切片
+            image_count = sum(1 for ctx in contexts if ctx.get('meta', {}).get('chunk_type') in ('image', 'chart'))
+            if image_count > 0:
+                import logging
+                logging.info(f"[图片检索] contexts 中包含 {image_count} 个图片/图表切片")
+                for ctx in contexts:
+                    meta = ctx.get('meta', {})
+                    if meta.get('chunk_type') in ('image', 'chart'):
+                        logging.info(f"  - 图片: {meta.get('caption', '')[:50]}, path: {meta.get('image_path', '')}")
+
             # 2.5. 懒加载增强（Phase 4）
-            # 对检索命中的图片/表格按需调用 VLM/LLM
+            # 暂时禁用：VLM 调用耗时过长，可能导致请求超时
+            # TODO: 后续可改为异步后台任务
             try:
                 import asyncio
                 from knowledge.lazy_enhance import enhance_retrieved_chunks
-
-                # 获取知识库名称（取第一个）
                 kb_name = collections[0] if collections else 'public_kb'
-
-                # 异步增强检索结果
                 asyncio.run(enhance_retrieved_chunks(contexts, message, kb_name))
             except Exception as e:
                 import logging
@@ -701,17 +1249,23 @@ def rag():
             selected_images = select_images(contexts, message)
 
             # 4. 构建 prompt（Phase 6：LLM 图片感知）
-            context_text = "\n\n".join([ctx.get('doc', '') for ctx in contexts[:5]])
+            # Bug 1 修复：文本切片用于 top 5 名额竞争，图片描述不参与竞争
+            text_contexts = [ctx for ctx in contexts if ctx.get('meta', {}).get('chunk_type') not in ('image', 'chart', 'table')]
+            context_text = "\n\n".join([ctx.get('doc', '') for ctx in text_contexts[:5]])
 
-            # 添加图片信息到 prompt
-            image_info = ""
+            # Bug 6b 优化：直接使用 selected_images 中的 full_description
+            # 这样 LLM 既能看到文本切片，也能知道图片内容
             if selected_images:
-                image_info = "\n\n【可用图片】\n你可以使用以下图片辅助回答：\n"
+                image_descriptions = []
                 for i, img in enumerate(selected_images, 1):
-                    image_info += f"[图片{i}] {img['description']}\n"
-                image_info += "\n如果图片有助于理解，请在回答中提及（如：如下图所示）。\n"
+                    # 直接使用 select_images 时带上的 full_description
+                    full_desc = img.get('full_description', '') or img.get('description', '')
+                    if full_desc:
+                        image_descriptions.append(f"【图片{i}】{full_desc}")
+                if image_descriptions:
+                    context_text += "\n\n【相关图片信息】\n" + "\n\n".join(image_descriptions)
 
-            enhanced_context = context_text + image_info
+            enhanced_context = context_text
 
             # 5. 流式生成回答
             from core.engine import get_engine
@@ -721,20 +1275,57 @@ def rag():
                 full_answer.append(token)
                 yield f"data: {json.dumps({'type': 'chunk', 'content': token}, ensure_ascii=False)}\n\n"
 
-            # 6. 提取富媒体信息（使用精选图片）
-            rich_media = _extract_rich_media(contexts)
-            # 替换为精选图片
-            if selected_images:
-                rich_media['images'] = selected_images
+            # 6. P0：答案对齐过滤器
+            # 从 LLM 回答中提取图号引用，过滤图片选择结果
+            full_answer_text = "".join(full_answer)
+
+            # 提取回答中引用的图号/表号
+            mentioned = set()
+            # 中文图号：图2.1、图 2-1、见图2.1 等
+            mentioned.update(re.findall(r'(?:[见如])?图\s*(\d+[\.\-]?\d*)', full_answer_text))
+            # 中文表号：表2.1、表 2-1、见表2.1 等
+            mentioned.update(re.findall(r'(?:[见如])?表\s*(\d+[\.\-]?\d*)', full_answer_text))
+            # 英文图号：Figure 2.1、Fig.2.1 等
+            mentioned.update(re.findall(r'(?:Fig(?:ure)?\.?\s*)(\d+[\.\-]?\d*)', full_answer_text, re.I))
+
+            # 根据回答中的引用过滤图片
+            if mentioned:
+                aligned_images = []
+                for img in selected_images:
+                    desc = img.get('description', '')
+                    # 标准化图号格式（将连字符转为点）
+                    for ref in mentioned:
+                        ref_normalized = ref.replace('-', '.')
+                        if (f"图{ref_normalized}" in desc or
+                            f"表{ref_normalized}" in desc or
+                            f"图 {ref_normalized}" in desc or
+                            f"表 {ref_normalized}" in desc):
+                            aligned_images.append(img)
+                            break
+                # 如果有匹配的图片，使用对齐后的结果
+                if aligned_images:
+                    selected_images = aligned_images
+                else:
+                    # 没有匹配到，保留 1 张（可能是正则未覆盖的情况）
+                    selected_images = selected_images[:1]
+            else:
+                # LLM 没有提图号，只保留得分最高的 1 张
+                selected_images = selected_images[:1]
+
+            rich_media = {'images': selected_images, 'tables': [], 'sections': []}
 
             # 7. 保存消息到会话（仅开发环境）
-            full_answer_text = "".join(full_answer)
             if session_id and session_repo_ref:
                 try:
                     # 保存用户消息
                     session_repo_ref.add_message(session_id, 'user', message)
-                    # 保存 AI 回答
-                    session_repo_ref.add_message(session_id, 'assistant', full_answer_text)
+                    # 保存 AI 回答（包含 metadata：图片、来源等）
+                    assistant_metadata = {}
+                    if rich_media.get('images'):
+                        assistant_metadata['images'] = rich_media['images']
+                    if sources:
+                        assistant_metadata['sources'] = sources
+                    session_repo_ref.add_message(session_id, 'assistant', full_answer_text, assistant_metadata if assistant_metadata else None)
                     # 更新会话最后活跃时间
                     if hasattr(session_repo_ref, 'update_last_active'):
                         session_repo_ref.update_last_active(session_id)

@@ -225,12 +225,9 @@ def _parse_with_pandas(filepath: Path, **kwargs) -> Dict[str, Any]:
 
 def _parse_txt(filepath: Path, **kwargs) -> Dict[str, Any]:
     """解析纯文本文件"""
-    if not TXT_AVAILABLE:
-        # 直接读取
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read()
-    else:
-        content = extract_text_from_txt(str(filepath))
+    # 直接读取文件内容
+    with open(filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
 
     # 简单分块
     chunk_size = kwargs.get('chunk_size', 1000)
@@ -326,8 +323,26 @@ def extract_text_from_xlsx(filepath, **kwargs):
 
 def extract_text_from_txt(filepath, **kwargs):
     """兼容旧接口：从 TXT 提取文本"""
-    result = parse_document(filepath, **kwargs)
-    return convert_to_rag_format(result)
+    # 直接读取文件，避免递归调用 parse_document
+    with open(filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    # 简单分块
+    chunk_size = kwargs.get('chunk_size', 1000)
+    chunks = []
+    for i in range(0, len(content), chunk_size):
+        chunks.append({
+            "content": content[i:i+chunk_size],
+            "chunk_type": "text",
+            "page": i // chunk_size + 1
+        })
+
+    return {
+        "chunks": chunks,
+        "markdown": content,
+        "tables": [],
+        "images": []
+    }
 
 
 # ========== 模块导出 ==========

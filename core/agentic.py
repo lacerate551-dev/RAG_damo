@@ -73,6 +73,22 @@ except ImportError:
     HAS_BUDGET = False
     CallType = None
 
+# 语义缓存
+try:
+    from config import SEMANTIC_CACHE_ENABLED, SEMANTIC_CACHE_THRESHOLD
+    HAS_SEMANTIC_CACHE_CONFIG = True
+except ImportError:
+    SEMANTIC_CACHE_ENABLED = False
+    SEMANTIC_CACHE_THRESHOLD = 0.92
+    HAS_SEMANTIC_CACHE_CONFIG = False
+
+try:
+    from core.semantic_cache import SemanticCache, get_semantic_cache
+    HAS_SEMANTIC_CACHE = True
+except ImportError:
+    HAS_SEMANTIC_CACHE = False
+    SemanticCache = None
+
 
 class AgenticRAG:
     """
@@ -155,6 +171,29 @@ class AgenticRAG:
             self.loop_guard = create_guard(max_iterations=max_iterations)
         except ImportError:
             self.loop_guard = None
+
+        # 初始化语义缓存
+        self.semantic_cache = None
+        self.embedding_model = None
+        if SEMANTIC_CACHE_ENABLED and HAS_SEMANTIC_CACHE:
+            try:
+                # 获取 embedding 模型用于计算查询向量
+                engine = get_engine()
+                if engine and hasattr(engine, 'embedding_model'):
+                    self.embedding_model = engine.embedding_model
+                    # 初始化语义缓存
+                    emb_dim = 768  # 默认维度
+                    if hasattr(self.embedding_model, 'get_sentence_embedding_dimension'):
+                        emb_dim = self.embedding_model.get_sentence_embedding_dimension()
+                    self.semantic_cache = SemanticCache(
+                        dim=emb_dim,
+                        threshold=SEMANTIC_CACHE_THRESHOLD,
+                        max_size=5000
+                    )
+                    print(f"[INFO] 语义缓存已启用，维度={emb_dim}，阈值={SEMANTIC_CACHE_THRESHOLD}")
+            except Exception as e:
+                print(f"[WARN] 语义缓存初始化失败: {e}")
+                self.semantic_cache = None
 
         # Context Compression 配置
         self.MAX_CONTEXT_TOKENS = 3500  # 最大上下文 token 数（模型窗口 * 0.35）
@@ -296,6 +335,24 @@ class AgenticRAG:
                 })
                 query = rewritten  # 使用重写后的查询
 
+        # ==================== 语义缓存检查 ====================
+        if self.semantic_cache and self.embedding_model:
+            try:
+                query_emb = self.embedding_model.encode(query)
+                cached_result = self.semantic_cache.get(query_emb)
+                if cached_result is not None:
+                    if verbose:
+                        print(f"\n[语义缓存命中] 相似度 > {SEMANTIC_CACHE_THRESHOLD}")
+                    emit_log("semantic_cache_hit", {
+                        "threshold": SEMANTIC_CACHE_THRESHOLD
+                    })
+                    # 返回缓存结果
+                    cached_result["cached"] = True
+                    cached_result["log_trace"] = log_trace
+                    return cached_result
+            except Exception as e:
+                logger.warning(f"语义缓存检查失败: {e}")
+
         # ==================== 新增：查询分类 ====================
         classified = None
         if self.query_classifier:
@@ -342,6 +399,35 @@ class AgenticRAG:
                 "classified": classified.to_dict() if classified else None
             }
 
+        # ==================== 图片引用 - 使用上一轮对话的图片 ====================
+        if classified and classified.query_type == QueryType.IMAGE_REFERENCE:
+            if verbose:
+                print("\n[图片引用] 检测到图片指代查询，从历史中获取图片信息")
+            emit_log("decision", {"action": "image_reference", "reason": "分类器识别为图片引用"})
+
+            # 从历史中提取图片上下文
+            image_context = self._extract_image_context_from_history(history)
+            if image_context:
+                # 构建新的查询，包含图片上下文
+                enhanced_query = f"{image_context}\n\n用户问题：{query}"
+
+                # 直接调用 LLM 回答，不进行向量检索
+                answer = self._answer_image_reference(enhanced_query, history)
+
+                return {
+                    "answer": answer,
+                    "iterations": 0,
+                    "reasoning": [{"type": "image_reference", "query": query, "images_found": True}],
+                    "contexts": [],
+                    "sources": [],
+                    "log_trace": log_trace,
+                    "classified": classified.to_dict() if classified else None
+                }
+            else:
+                # 没有找到图片上下文，回退到普通检索
+                if verbose:
+                    print("\n[图片引用] 未找到图片上下文，回退到普通检索")
+
         # ==================== 实时信息走网络搜索 ====================
         if classified and classified.query_type == QueryType.REALTIME:
             if verbose:
@@ -375,6 +461,13 @@ class AgenticRAG:
             search_config = classified.search_config
             max_iterations = search_config.get("max_iterations", self.max_iterations)
             top_k = search_config.get("top_k", 5)
+            # 传递 query_type 到 engine，用于 RRF 权重计算
+            try:
+                engine = get_engine()
+                if engine:
+                    engine._last_query_type = classified.query_type
+            except Exception:
+                pass
         else:
             max_iterations = self.max_iterations
             top_k = 5
@@ -855,7 +948,7 @@ class AgenticRAG:
             budget_stats = budget.end_query()
             emit_log("budget", budget_stats)
 
-        return {
+        result = {
             "answer": answer,
             "iterations": iteration,
             "reasoning": reasoning_trace,
@@ -868,6 +961,17 @@ class AgenticRAG:
             "tables": rich_media["tables"],
             "sections": rich_media["sections"]
         }
+
+        # 写入语义缓存
+        if self.semantic_cache and self.embedding_model:
+            try:
+                query_emb = self.embedding_model.encode(query)
+                self.semantic_cache.set(query_emb, result)
+                emit_log("semantic_cache_set", {"query_length": len(query)})
+            except Exception as e:
+                logger.warning(f"语义缓存写入失败: {e}")
+
+        return result
 
     def _web_search_flow(self, query: str, log_trace: list, emit_log, verbose: bool,
                          classified=None) -> dict:
@@ -2118,9 +2222,17 @@ class AgenticRAG:
         - 用户："标准是多少？"（缺少主语）
         - 上一轮："出差报销有什么规定？"
         - 补全后："出差报销标准是多少？"
+
+        特殊处理：
+        - 图片指代："这两张图片"、"上面的图片" → 从历史中提取图片上下文
         """
         if not history:
             return query
+
+        # ==================== 图片指代识别 ====================
+        image_reference = self._detect_image_reference(query, history)
+        if image_reference:
+            return image_reference
 
         # 获取最近用户消息
         last_user_msg = None
@@ -2155,6 +2267,190 @@ class AgenticRAG:
                 pass
 
         return query
+
+    def _detect_image_reference(self, query: str, history: list) -> str:
+        """
+        检测图片指代查询并重写
+
+        Args:
+            query: 用户查询
+            history: 对话历史（可能包含 metadata）
+
+        Returns:
+            str: 重写后的查询，如果不是图片指代则返回空字符串
+        """
+        import re
+
+        # 图片指代模式
+        IMAGE_REFERENCE_PATTERNS = [
+            r'这[张些]图片',
+            r'那[张些]图片',
+            r'上面的图片',
+            r'刚才的图片',
+            r'这[张些]图',
+            r'那[张些]图',
+            r'上面的图',
+            r'刚才的图',
+            r'解释一下这[张些]图',
+            r'说明一下这[张些]图',
+            r'这[张些]是什么图',
+            r'图[里内]是什么',
+            r'图片[里内]是什么',
+        ]
+
+        # 检测是否为图片指代查询
+        is_image_reference = False
+        for pattern in IMAGE_REFERENCE_PATTERNS:
+            if re.search(pattern, query):
+                is_image_reference = True
+                break
+
+        if not is_image_reference:
+            return ""
+
+        # 从历史中提取图片上下文
+        # 优先从 metadata 中获取图片信息，其次从内容中提取
+        last_images = []
+        image_sources = []
+
+        for msg in reversed(history):
+            if msg.get("role") == "assistant":
+                # 1. 优先从 metadata 获取图片信息
+                metadata = msg.get("metadata", {})
+                if isinstance(metadata, dict):
+                    images = metadata.get("images", [])
+                    if images:
+                        for img in images[:5]:  # 最多5张图片
+                            if isinstance(img, dict):
+                                # 构建图片描述
+                                desc = img.get("description", "")
+                                source = img.get("source", "")
+                                img_type = img.get("type", "图片")
+                                if desc:
+                                    last_images.append(f"{img_type}：{desc}")
+                                if source:
+                                    image_sources.append(source)
+                            elif isinstance(img, str):
+                                last_images.append(f"图片：{img}")
+
+                # 2. 如果 metadata 没有图片，尝试从内容中提取
+                if not last_images:
+                    content = msg.get("content", "")
+                    if "图片" in content or "图表" in content or "图" in content:
+                        sentences = content.split("。")
+                        for sentence in sentences:
+                            if "图片" in sentence or "图表" in sentence:
+                                last_images.append(sentence.strip())
+
+                if last_images:
+                    break  # 找到图片信息就停止
+
+        if last_images:
+            # 构建重写后的查询
+            image_context = " ".join(last_images[:3])
+            # 提取用户想问的内容
+            question_intent = re.sub(r'这[张些]图片?|那[张些]图片?|上面的图片?|刚才的图片?|解释一下|说明一下', '', query).strip()
+
+            if question_intent:
+                return f"{image_context} {question_intent}"
+            else:
+                return f"详细解释：{image_context}"
+
+        # 如果没有找到图片上下文，返回原查询
+        return query
+
+    def _extract_image_context_from_history(self, history: list) -> str:
+        """
+        从对话历史中提取图片上下文
+
+        Args:
+            history: 对话历史
+
+        Returns:
+            str: 图片上下文描述
+        """
+        if not history:
+            return ""
+
+        import re
+
+        # 从最近一条 assistant 消息中提取图片信息
+        for msg in reversed(history):
+            if msg.get("role") == "assistant":
+                metadata = msg.get("metadata", {})
+                images = metadata.get("images", [])
+                content = msg.get("content", "")
+
+                image_descriptions = []
+
+                # 优先从 metadata 获取图片信息
+                if images:
+                    for i, img in enumerate(images[:5], 1):
+                        if isinstance(img, dict):
+                            desc = img.get("description", "")
+                            img_type = img.get("type", "图片")
+                            source = img.get("source", "")
+                            page = img.get("page", "")
+
+                            img_info = f"图片{i}：{img_type}"
+                            if desc:
+                                img_info += f"，描述：{desc}"
+                            if source:
+                                img_info += f"，来源：{source}"
+                            if page:
+                                img_info += f"，第{page}页"
+                            image_descriptions.append(img_info)
+
+                # 如果没有 metadata 图片，从内容中提取
+                if not image_descriptions:
+                    if "图片" in content or "图表" in content:
+                        sentences = content.split("。")
+                        for sentence in sentences:
+                            if "图片" in sentence or "图表" in sentence:
+                                image_descriptions.append(sentence.strip())
+                                if len(image_descriptions) >= 3:
+                                    break
+
+                if image_descriptions:
+                    return "\n".join(image_descriptions)
+
+        return ""
+
+    def _answer_image_reference(self, enhanced_query: str, history: list) -> str:
+        """
+        回答图片引用问题
+
+        Args:
+            enhanced_query: 增强后的查询（包含图片上下文）
+            history: 对话历史
+
+        Returns:
+            str: AI 回答
+        """
+        # 构建消息
+        messages = [
+            {"role": "system", "content": "你是一个专业的助手，请根据提供的图片信息回答用户的问题。图片信息已包含在用户的问题中。"}
+        ]
+
+        # 添加历史上下文（最近几轮）
+        for h in history[-4:]:
+            if h.get("role") in ["user", "assistant"]:
+                messages.append({"role": h["role"], "content": h.get("content", "")})
+
+        # 添加当前问题
+        messages.append({"role": "user", "content": enhanced_query})
+
+        try:
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=1000
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"图片引用回答失败: {e}")
+            return f"抱歉，回答图片问题时出现错误：{str(e)}"
 
     def _llm_rewrite(self, query: str) -> str:
         """
@@ -2617,6 +2913,11 @@ class AgenticRAG:
    - **知识库来源格式**：[文件名 第X页] 或 [文件名]（无页码时）
    - **网络来源格式**：[网站名称] 或 [文章标题]
    - 示例："根据《管理制度汇编》第5页的规定..."、"百度百科显示..."
+
+5. **图片/图表说明**
+   - 如果参考资料中提到"见图X.X"或"如图所示"，说明相关图片会自动展示在回答下方
+   - 直接引用图片内容回答问题，不要说"无法展示图片"
+   - 示例："根据图2.3显示的数据..."、"如图2.4所示..."
 
 【回答格式】
 

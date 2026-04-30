@@ -44,9 +44,11 @@ def mock_login():
     }
 
     测试账号:
-    - admin / admin123 (管理员，可访问所有文档)
-    - testuser / test123 (普通用户，仅访问 public + internal)
-    - manager / manager123 (经理，可访问 confidential)
+    - admin / admin123 (管理员，管理部)
+    - admin2 / admin456 (管理员，技术部)
+    - admin3 / admin789 (管理员，运营部)
+    - manager / manager123 (经理，财务部)
+    - user / test123 (普通用户，技术部)
     """
     # 默认开启开发模式（生产环境需设置 DEV_MODE=false）
     if os.environ.get('DEV_MODE', 'true').lower() == 'false':

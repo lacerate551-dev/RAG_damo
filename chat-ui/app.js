@@ -1,6 +1,23 @@
 // ===== 配置 =====
-const DEFAULT_API_BASE = 'http://localhost:5001';
-let API_BASE = localStorage.getItem('rag_api_base') || DEFAULT_API_BASE;
+const DEFAULT_API_BASE = '';  // 空字符串 = 相对路径（前后端同源）
+
+// 优先级：URL参数 > localStorage > 默认值
+function getApiBase() {
+    // 1. 检查 URL 参数 ?api=xxx
+    const urlParams = new URLSearchParams(window.location.search);
+    const urlApi = urlParams.get('api');
+    if (urlApi) {
+        localStorage.setItem('rag_api_base', urlApi);
+        return urlApi;
+    }
+    // 2. 检查 localStorage
+    const storedApi = localStorage.getItem('rag_api_base');
+    if (storedApi) return storedApi;
+    // 3. 默认值（相对路径）
+    return DEFAULT_API_BASE;
+}
+
+let API_BASE = getApiBase();
 const TOKEN_KEY = 'rag_auth_token';
 const USER_KEY = 'rag_auth_user';
 const LOG_KEY = 'rag_chat_logs';
@@ -344,6 +361,19 @@ async function sendMessage() {
 }
 
 async function sendRagMessage(msg) {
+    // 构建对话历史（最近 10 轮）
+    const chatHistory = [];
+    const messages = document.querySelectorAll('#chatMessages .message');
+    messages.forEach(m => {
+        const role = m.classList.contains('user') ? 'user' : 'assistant';
+        const content = m.querySelector('.message-content')?.textContent || '';
+        if (content) {
+            chatHistory.push({ role, content });
+        }
+    });
+    // 只保留最近 10 轮（20 条消息）
+    const recentHistory = chatHistory.slice(-20);
+
     // 使用合并后的 /rag 端点（SSE 流式返回）
     const res = await fetch(`${API_BASE}/rag`, {
         method: 'POST',
@@ -354,7 +384,8 @@ async function sendRagMessage(msg) {
         body: JSON.stringify({
             message: msg,
             collections: ['public_kb'],
-            session_id: state.sessionId
+            session_id: state.sessionId,
+            chat_history: recentHistory  // 添加对话历史
         })
     });
 
@@ -649,19 +680,76 @@ function toggleCitationContent(contentId) {
 function renderMarkdown(text) {
     if (!text) return '';
 
-    // 先提取 <sup> 标签，避免被转义
+    // 1. 先保护 LaTeX 公式，避免被转义（必须在 escapeHtml 之前）
+    const latexBlocks = [];
+    let processedText = text.replace(/\$\$([\s\S]*?)\$\$/g, (match, latex) => {
+        latexBlocks.push({ type: 'block', latex: latex });
+        return `__LATEX_BLOCK_${latexBlocks.length - 1}__`;
+    });
+    processedText = processedText.replace(/\$([^\$\n]+?)\$/g, (match, latex) => {
+        latexBlocks.push({ type: 'inline', latex: latex });
+        return `__LATEX_INLINE_${latexBlocks.length - 1}__`;
+    });
+
+    // 2. 先提取 <sup> 标签，避免被转义
     const supPlaceholders = [];
-    let processedText = text.replace(/<sup class="citation-ref"[^>]*data-chunk-id="[^"]*"[^>]*>\[[^\]]+\]<\/sup>/g, (match) => {
+    processedText = processedText.replace(/<sup class="citation-ref"[^>]*data-chunk-id="[^"]*"[^>]*>\[[^\]]+\]<\/sup>/g, (match) => {
         supPlaceholders.push(match);
         return `__SUP_PLACEHOLDER_${supPlaceholders.length - 1}__`;
     });
 
-    // 转义 HTML（除了我们提取的 <sup> 标签）
+    // 3. 转义 HTML（保护 LaTeX 占位符和 <sup> 标签）
     let html = escapeHtml(processedText);
 
-    // 恢复 <sup> 标签
+    // 4. 恢复 <sup> 标签
     supPlaceholders.forEach((sup, i) => {
         html = html.replace(`__SUP_PLACEHOLDER_${i}__`, sup);
+    });
+
+    // 5. 恢复 LaTeX 公式并渲染（使用原始 latex 内容，不使用已转义的 html）
+    latexBlocks.forEach((block, i) => {
+        const placeholder = block.type === 'block'
+            ? `__LATEX_BLOCK_${i}__`
+            : `__LATEX_INLINE_${i}__`;
+        // 将 LaTeX 转换为更友好的显示格式
+        let displayLatex = block.latex;
+        // 处理常见 LaTeX 命令，转换为 HTML 显示
+        displayLatex = displayLatex
+            .replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, '<span class="latex-frac">($1)/($2)</span>')
+            .replace(/\\times/g, '×')
+            .replace(/\\div/g, '÷')
+            .replace(/\\cdot/g, '·')
+            .replace(/\\leq/g, '≤')
+            .replace(/\\geq/g, '≥')
+            .replace(/\\neq/g, '≠')
+            .replace(/\\pm/g, '±')
+            .replace(/\\sqrt\{([^}]+)\}/g, '√($1)')
+            .replace(/\\sum/g, '∑')
+            .replace(/\\prod/g, '∏')
+            .replace(/\\int/g, '∫')
+            .replace(/\\infty/g, '∞')
+            .replace(/\\alpha/g, 'α')
+            .replace(/\\beta/g, 'β')
+            .replace(/\\gamma/g, 'γ')
+            .replace(/\\delta/g, 'δ')
+            .replace(/\\Delta/g, 'Δ')
+            .replace(/\\pi/g, 'π')
+            .replace(/\\sigma/g, 'σ')
+            .replace(/\\theta/g, 'θ')
+            .replace(/\\lambda/g, 'λ')
+            .replace(/\\mu/g, 'μ')
+            .replace(/\\left\{/g, '{')
+            .replace(/\\right\}/g, '}')
+            .replace(/\\left\(/g, '(')
+            .replace(/\\right\)/g, ')')
+            .replace(/\\left\[/g, '[')
+            .replace(/\\right\]/g, ']')
+            .replace(/\\[a-zA-Z]+/g, ''); // 移除其他未识别的 LaTeX 命令
+
+        const rendered = block.type === 'block'
+            ? `<div class="latex-block">${displayLatex}</div>`
+            : `<span class="latex-inline">${displayLatex}</span>`;
+        html = html.replace(placeholder, rendered);
     });
 
     // 图片

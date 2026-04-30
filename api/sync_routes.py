@@ -16,6 +16,8 @@
 
 from flask import Blueprint, request, jsonify, current_app
 from auth.gateway import require_gateway_auth
+from core.status_codes import SYNC_SUCCESS, SYNC_ERROR, INTERNAL_ERROR
+from api.response_utils import success_response, error_response
 
 sync_bp = Blueprint('sync', __name__)
 
@@ -32,7 +34,12 @@ def _require_sync_service():
     """检查同步服务是否可用"""
     service = _get_sync_service()
     if not service:
-        return None, (jsonify({"error": "同步服务未启用"}), 503)
+        return None, error_response(
+            error="SERVICE_UNAVAILABLE",
+            error_code=INTERNAL_ERROR,
+            message="同步服务未启用",
+            http_status=503
+        )
     return service, None
 
 
@@ -56,13 +63,18 @@ def trigger_sync():
 
     try:
         result = service.sync_now()
-
-        return jsonify({
-            "success": True,
-            "result": result.to_dict() if hasattr(result, 'to_dict') else result
-        })
+        return success_response(
+            data={"result": result.to_dict() if hasattr(result, 'to_dict') else result},
+            status_code=SYNC_SUCCESS,
+            message="同步完成"
+        )
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return error_response(
+            error="SYNC_ERROR",
+            error_code=SYNC_ERROR,
+            message=str(e),
+            http_status=500
+        )
 
 
 @sync_bp.route('/sync/status', methods=['GET'])
@@ -72,6 +84,8 @@ def get_sync_status():
     service, err = _require_sync_service()
     if err:
         return jsonify({
+            "status": "failed",
+            "status_code": INTERNAL_ERROR,
             "enabled": False,
             "message": "同步服务未启用"
         })
@@ -92,6 +106,8 @@ def get_sync_status():
         return jsonify(status)
     except Exception as e:
         return jsonify({
+            "status": "failed",
+            "status_code": INTERNAL_ERROR,
             "enabled": True,
             "error": str(e)
         })
@@ -111,7 +127,12 @@ def get_sync_history():
         history = service.get_sync_history(limit=limit) if hasattr(service, 'get_sync_history') else []
         return jsonify({"history": history})
     except Exception as e:
-        return jsonify({"history": [], "error": str(e)})
+        return error_response(
+            error="SYNC_ERROR",
+            error_code=SYNC_ERROR,
+            message=str(e),
+            http_status=500
+        )
 
 
 @sync_bp.route('/sync/changes', methods=['GET'])
@@ -129,7 +150,12 @@ def get_change_logs():
         changes = service.get_change_logs(limit=limit, collection=collection) if hasattr(service, 'get_change_logs') else []
         return jsonify({"changes": changes})
     except Exception as e:
-        return jsonify({"changes": [], "error": str(e)})
+        return error_response(
+            error="SYNC_ERROR",
+            error_code=SYNC_ERROR,
+            message=str(e),
+            http_status=500
+        )
 
 
 @sync_bp.route('/sync/start', methods=['POST'])
@@ -142,18 +168,28 @@ def start_sync_monitor():
 
     try:
         if hasattr(service, 'is_running') and service.is_running():
-            return jsonify({"message": "文件监控已在运行"})
+            return jsonify({"status": "success", "status_code": SYNC_SUCCESS, "message": "文件监控已在运行"})
 
         if hasattr(service, 'start'):
             success = service.start()
             if success:
-                return jsonify({"message": "文件监控已启动"})
+                return jsonify({"status": "success", "status_code": SYNC_SUCCESS, "message": "文件监控已启动"})
             else:
-                return jsonify({"error": "启动文件监控失败"}), 500
+                return error_response(
+                    error="SYNC_ERROR",
+                    error_code=SYNC_ERROR,
+                    message="启动文件监控失败",
+                    http_status=500
+                )
         else:
-            return jsonify({"message": "文件监控功能不可用"})
+            return jsonify({"status": "success", "message": "文件监控功能不可用"})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return error_response(
+            error="SYNC_ERROR",
+            error_code=SYNC_ERROR,
+            message=str(e),
+            http_status=500
+        )
 
 
 @sync_bp.route('/sync/stop', methods=['POST'])
@@ -167,6 +203,11 @@ def stop_sync_monitor():
     try:
         if hasattr(service, 'stop'):
             service.stop()
-        return jsonify({"message": "文件监控已停止"})
+        return jsonify({"status": "success", "status_code": SYNC_SUCCESS, "message": "文件监控已停止"})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return error_response(
+            error="SYNC_ERROR",
+            error_code=SYNC_ERROR,
+            message=str(e),
+            http_status=500
+        )

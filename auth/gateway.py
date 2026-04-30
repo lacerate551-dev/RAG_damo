@@ -52,6 +52,18 @@ MOCK_USERS = {
         'role': 'admin',
         'department': '管理部'
     },
+    'admin2': {
+        'user_id': 'admin002',
+        'password': 'admin456',
+        'role': 'admin',
+        'department': '技术部'
+    },
+    'admin3': {
+        'user_id': 'admin003',
+        'password': 'admin789',
+        'role': 'admin',
+        'department': '运营部'
+    },
     'manager': {
         'user_id': 'manager001',
         'password': 'manager123',

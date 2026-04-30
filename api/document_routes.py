@@ -25,6 +25,12 @@ from datetime import datetime
 from flask import Blueprint, request, jsonify
 from werkzeug.utils import secure_filename
 from auth.gateway import require_gateway_auth
+from core.status_codes import (
+    UPLOAD_SUCCESS, BATCH_UPLOAD_SUCCESS, BAD_REQUEST,
+    NO_FILE, NO_FILE_SELECTED, NO_COLLECTION,
+    FILE_TOO_LARGE, UNSUPPORTED_FORMAT, INTERNAL_ERROR
+)
+from api.response_utils import success_response, error_response
 
 document_bp = Blueprint('document', __name__)
 
@@ -111,35 +117,36 @@ def upload_document():
 
     # 1. 检查文件
     if 'file' not in request.files:
-        return jsonify({"error": "没有上传文件"}), 400
+        return error_response("NO_FILE", NO_FILE, "没有上传文件", http_status=400)
 
     file = request.files['file']
     if file.filename == '':
-        return jsonify({"error": "没有选择文件"}), 400
+        return error_response("NO_FILE_SELECTED", NO_FILE_SELECTED, "没有选择文件", http_status=400)
 
     # 2. 获取目标向量库
     collection = request.form.get('collection') or request.form.get('kb_name')
     if not collection:
-        return jsonify({"error": "请指定目标向量库 (collection 参数)"}), 400
+        return error_response("NO_COLLECTION", NO_COLLECTION, "请指定目标向量库 (collection 参数)", http_status=400)
 
     # 3. 文件类型验证
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        return jsonify({"error": f"不支持的文件类型: {ext}，支持: pdf, docx, doc, xlsx, txt"}), 400
+        return error_response(
+            "UNSUPPORTED_FORMAT",
+            UNSUPPORTED_FORMAT,
+            f"不支持的文件类型: {ext}，支持: pdf, docx, doc, xlsx, txt",
+            http_status=400
+        )
 
     # 4. 文件大小验证
     file.seek(0, os.SEEK_END)
     file_size = file.tell()
     file.seek(0)
     if file_size > MAX_FILE_SIZE:
-        return jsonify({"error": f"文件大小超过限制 (最大 10MB)"}), 400
+        return error_response("FILE_TOO_LARGE", FILE_TOO_LARGE, "文件大小超过限制 (最大 10MB)", http_status=400)
 
-    # 5. 保存文件到对应目录
-    if collection == 'public_kb':
-        target_subdir = 'public'
-    else:
-        target_subdir = collection
-
+    # 5. 保存文件到对应目录（目录名 = 向量库名）
+    target_subdir = collection
     target_dir = os.path.join(DOCUMENTS_PATH, target_subdir)
     os.makedirs(target_dir, exist_ok=True)
 
@@ -178,16 +185,19 @@ def upload_document():
         except Exception as e:
             sync_status = f"已保存，向量化失败: {str(e)}"
 
-    return jsonify({
-        "success": True,
-        "message": f"文件上传成功，{sync_status}",
-        "file": {
-            "filename": filename,
-            "collection": collection,
-            "path": f"{target_subdir}/{filename}",
-            "size": file_size
-        }
-    })
+    return success_response(
+        data={
+            "file": {
+                "filename": filename,
+                "collection": collection,
+                "path": f"{target_subdir}/{filename}",
+                "size": file_size
+            },
+            "sync_status": sync_status
+        },
+        status_code=UPLOAD_SUCCESS,
+        message=f"文件上传成功，{sync_status}"
+    )
 
 
 @document_bp.route('/documents/batch-upload', methods=['POST'])
@@ -208,23 +218,19 @@ def batch_upload_documents():
 
     # 检查文件
     if 'files' not in request.files:
-        return jsonify({"error": "没有上传文件"}), 400
+        return error_response("NO_FILE", NO_FILE, "没有上传文件", http_status=400)
 
     files = request.files.getlist('files')
     if not files:
-        return jsonify({"error": "没有选择文件"}), 400
+        return error_response("NO_FILE_SELECTED", NO_FILE_SELECTED, "没有选择文件", http_status=400)
 
     # 获取目标向量库
     collection = request.form.get('collection') or request.form.get('kb_name')
     if not collection:
-        return jsonify({"error": "请指定目标向量库 (collection 参数)"}), 400
+        return error_response("NO_COLLECTION", NO_COLLECTION, "请指定目标向量库 (collection 参数)", http_status=400)
 
-    # 确定存储目录
-    if collection == 'public_kb':
-        target_subdir = 'public'
-    else:
-        target_subdir = collection
-
+    # 确定存储目录（目录名 = 向量库名）
+    target_subdir = collection
     target_dir = os.path.join(DOCUMENTS_PATH, target_subdir)
     os.makedirs(target_dir, exist_ok=True)
 
@@ -280,12 +286,15 @@ def batch_upload_documents():
         except Exception as e:
             print(f"批量同步失败: {e}")
 
-    return jsonify({
-        "success": True,
-        "total": len(results),
-        "success_count": len([r for r in results if r["status"] == "success"]),
-        "results": results
-    })
+    return success_response(
+        data={
+            "total": len(results),
+            "success_count": len([r for r in results if r["status"] == "success"]),
+            "results": results
+        },
+        status_code=BATCH_UPLOAD_SUCCESS,
+        message=f"批量上传完成，成功 {len([r for r in results if r['status'] == 'success'])}/{len(results)} 个文件"
+    )
 
 
 @document_bp.route('/documents/list', methods=['GET'])
@@ -301,12 +310,9 @@ def list_documents():
 
     collection = request.args.get('collection') or request.args.get('kb_name')
 
-    # 确定要扫描的目录
+    # 确定要扫描的目录（目录名 = 向量库名）
     if collection:
-        if collection == 'public_kb':
-            subdirs = ['public']
-        else:
-            subdirs = [collection]
+        subdirs = [collection]
     else:
         # 列出所有文档目录
         subdirs = []
@@ -323,11 +329,8 @@ def list_documents():
         if not os.path.exists(level_dir):
             continue
 
-        # 确定向量库名
-        if subdir == 'public':
-            coll_name = 'public_kb'
-        else:
-            coll_name = subdir
+        # 目录名即向量库名
+        coll_name = subdir
 
         for filename in os.listdir(level_dir):
             ext = os.path.splitext(filename)[1].lower()
@@ -372,11 +375,8 @@ def get_document_status(doc_path):
     subdir = parts[0]
     filename = '/'.join(parts[1:])
 
-    # 确定向量库
-    if subdir == 'public':
-        collection = 'public_kb'
-    else:
-        collection = subdir
+    # 目录名即向量库名
+    collection = subdir
 
     # 获取文档信息
     doc_info = kb_manager.get_document_info(collection, doc_path)
@@ -456,11 +456,8 @@ def delete_document(doc_path):
     subdir = parts[0]
     filename = '/'.join(parts[1:])
 
-    # 确定向量库
-    if subdir == 'public':
-        collection = 'public_kb'
-    else:
-        collection = subdir
+    # 目录名即向量库名
+    collection = subdir
 
     filepath = os.path.join(DOCUMENTS_PATH, doc_path)
     if not os.path.exists(filepath):
@@ -498,10 +495,8 @@ def list_document_chunks(doc_path):
         return jsonify({"error": "无效的文档路径"}), 400
 
     subdir = parts[0]
-    if subdir == 'public':
-        collection = 'public_kb'
-    else:
-        collection = subdir
+    # 目录名即向量库名
+    collection = subdir
 
     chunks = kb_manager.get_document_chunks(collection, os.path.basename(doc_path))
 

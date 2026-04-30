@@ -196,22 +196,89 @@ class RAGCacheManager:
     # ==================== Query Cache 方法 ====================
 
     @staticmethod
-    def _make_query_cache_key(query: str, kb_name: str, kb_version: int) -> str:
-        return hashlib.md5(
-            f"query:{query}:{kb_name}:{kb_version}".encode()
-        ).hexdigest()
+    def _make_query_cache_key(query: str, kb_name: str, kb_version: int, doc_hash: str = "") -> str:
+        """
+        生成查询缓存 key
 
-    def get_query_result(self, query: str, kb_name: str) -> Optional[Dict]:
-        """获取查询缓存结果"""
+        Args:
+            query: 查询文本
+            kb_name: 知识库名称
+            kb_version: 知识库版本号
+            doc_hash: 相关文档版本哈希（细粒度失效）
+
+        Returns:
+            缓存 key
+        """
+        if doc_hash:
+            # 细粒度：只失效相关文档的缓存
+            return hashlib.md5(
+                f"query:{query}:{kb_name}:{doc_hash}".encode()
+            ).hexdigest()
+        else:
+            # 粗粒度：整个知识库版本变化时失效
+            return hashlib.md5(
+                f"query:{query}:{kb_name}:{kb_version}".encode()
+            ).hexdigest()
+
+    def get_query_result(self, query: str, kb_name: str, doc_ids: List[str] = None) -> Optional[Dict]:
+        """
+        获取查询缓存结果
+
+        Args:
+            query: 查询文本
+            kb_name: 知识库名称
+            doc_ids: 相关文档 ID 列表（用于细粒度缓存 key）
+        """
         kb_version = self.get_kb_version(kb_name)
-        key = self._make_query_cache_key(query, kb_name, kb_version)
+
+        # 计算文档哈希（如果提供了 doc_ids）
+        doc_hash = ""
+        if doc_ids:
+            doc_hash = self._compute_doc_hash(kb_name, doc_ids)
+
+        key = self._make_query_cache_key(query, kb_name, kb_version, doc_hash)
         return self.query_cache.get(key)
 
-    def set_query_result(self, query: str, kb_name: str, result: Dict) -> None:
-        """设置查询缓存结果"""
+    def set_query_result(self, query: str, kb_name: str, result: Dict, doc_ids: List[str] = None) -> None:
+        """
+        设置查询缓存结果
+
+        Args:
+            query: 查询文本
+            kb_name: 知识库名称
+            result: 缓存结果
+            doc_ids: 相关文档 ID 列表（用于细粒度失效）
+        """
         kb_version = self.get_kb_version(kb_name)
-        key = self._make_query_cache_key(query, kb_name, kb_version)
+
+        # 计算相关文档的版本哈希（细粒度失效）
+        doc_hash = ""
+        if doc_ids:
+            doc_hash = self._compute_doc_hash(kb_name, doc_ids)
+
+        key = self._make_query_cache_key(query, kb_name, kb_version, doc_hash)
         self.query_cache.set(key, result, kb_version=kb_version)
+
+    def _compute_doc_hash(self, kb_name: str, doc_ids: List[str]) -> str:
+        """
+        计算文档版本哈希
+
+        用于细粒度缓存失效：只失效相关文档变化时的缓存
+        """
+        if not doc_ids:
+            return ""
+
+        # 从文档 ID 中提取 source（文件名）
+        sources = set()
+        for doc_id in doc_ids:
+            # doc_id 格式通常为 "filename_text_0" 或类似
+            parts = doc_id.split('_')
+            if parts:
+                sources.add(parts[0])
+
+        # 生成哈希
+        sources_str = ','.join(sorted(sources))
+        return hashlib.md5(f"docs:{sources_str}".encode()).hexdigest()
 
     # ==================== Embedding Cache 方法 ====================
 

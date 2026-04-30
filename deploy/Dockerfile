@@ -3,6 +3,10 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
+# 使用阿里云镜像源
+RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources \
+    && sed -i 's/security.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources
+
 # 系统依赖
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -11,10 +15,12 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Python依赖
+# Python依赖（使用阿里云 pip 镜像）
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install gunicorn>=21.0.0
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    && pip install gunicorn>=21.0.0 \
+    -i https://mirrors.aliyun.com/pypi/simple/
 
 # 应用代码
 COPY . .

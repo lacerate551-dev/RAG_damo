@@ -25,7 +25,7 @@ def compute_file_hash(file_path: str) -> str:
         return hashlib.md5(file_path.encode()).hexdigest()
 
 
-async def lazy_vlm_description(chunk_id: str, image_path: str, kb_name: str) -> str:
+async def lazy_vlm_description(chunk_id: str, image_path: str, kb_name: str, metadata: dict = None) -> str:
     """
     懒加载 VLM 描述
 
@@ -35,6 +35,7 @@ async def lazy_vlm_description(chunk_id: str, image_path: str, kb_name: str) -> 
         chunk_id: 切片 ID
         image_path: 图片路径（相对路径或绝对路径）
         kb_name: 知识库名称
+        metadata: 图片元数据（包含 section、page、caption、上下文等）
 
     Returns:
         VLM 生成的图片描述
@@ -55,28 +56,48 @@ async def lazy_vlm_description(chunk_id: str, image_path: str, kb_name: str) -> 
         logger.info(f"VLM 缓存命中: {image_path}")
         return cache_file.read_text(encoding='utf-8')
 
-    # 2. 调用 VLM
+    # 2. 调用 VLM（传入元数据）
     logger.info(f"VLM 懒加载: {image_path}")
     kb_manager = get_kb_manager()
-    description = kb_manager._generate_image_description(full_image_path)
+    description = kb_manager._generate_image_description(full_image_path, metadata=metadata)
 
     # 3. 写入缓存
     VLM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_file.write_text(description, encoding='utf-8')
 
-    # 4. 更新向量库（可选：后台更新）
+    # 4. 更新向量库（metadata + embedding）
     try:
         collection = kb_manager.get_collection(kb_name)
         result = collection.get(ids=[chunk_id], include=['metadatas'])
         if result['metadatas']:
-            collection.update(
-                ids=[chunk_id],
-                metadatas=[{
-                    **result['metadatas'][0],
-                    'has_vlm_desc': True,
-                    'vlm_desc': description
-                }]
-            )
+            # 更新 metadata
+            new_metadata = {
+                **result['metadatas'][0],
+                'has_vlm_desc': True,
+                'vlm_desc': description
+            }
+
+            # 更新 embedding（使用 VLM 描述重新计算向量）
+            # 这样 VLM 描述中的关键词（如"发电量"）才能参与相似度检索
+            embedding_model = kb_manager.embedding_model
+            if embedding_model:
+                new_vector = embedding_model.encode(description).tolist()
+                if isinstance(new_vector[0], list):
+                    new_vector = new_vector[0]
+
+                collection.update(
+                    ids=[chunk_id],
+                    metadatas=[new_metadata],
+                    embeddings=[new_vector],
+                    documents=[description]  # 同时更新 document 字段
+                )
+                logger.info(f"已更新向量库 embedding: {chunk_id}")
+            else:
+                # 无 embedding 模型时只更新 metadata
+                collection.update(
+                    ids=[chunk_id],
+                    metadatas=[new_metadata]
+                )
     except Exception as e:
         logger.warning(f"更新向量库失败: {e}")
 
@@ -159,35 +180,108 @@ async def enhance_retrieved_chunks(contexts: list, query: str, kb_name: str):
     for ctx in contexts:
         meta = ctx.get('meta', {})
         chunk_type = meta.get('chunk_type', 'text')
+        image_path = meta.get('image_path', '')
 
         # 图片切片：懒加载 VLM 描述
         if chunk_type in ('image', 'chart') and not meta.get('has_vlm_desc'):
-            image_path = meta.get('image_path', '')
             if image_path:
                 try:
+                    # 从 doc 字段中提取图号（上下文可能包含"见图2.5"等）
+                    doc_text = ctx.get('doc', '')
+                    import re
+
+                    # 提取图号（从前文/后文中）
+                    figure_number = ""
+                    # 匹配 "见图2.5"、"图2.5"、"见图 2.5" 等
+                    fig_match = re.search(r'[见如]?图\s*(\d+\.?\d*)', doc_text)
+                    if fig_match:
+                        figure_number = fig_match.group(1)
+
+                    # 如果 doc 中没有，尝试从 section 中提取
+                    section = meta.get('section') or meta.get('section_path', '')
+                    if not figure_number and section:
+                        fig_match = re.search(r'[见如]?图\s*(\d+\.?\d*)', section)
+                        if fig_match:
+                            figure_number = fig_match.group(1)
+
+                    # 传入图片元数据，增强 VLM 描述
+                    image_metadata = {
+                        'section': section,
+                        'page': meta.get('page'),
+                        'caption': meta.get('caption', ''),
+                        'source': meta.get('source', ''),
+                        'figure_number': figure_number,  # 添加提取的图号
+                        'doc_text': doc_text  # 添加完整文档文本
+                    }
                     vlm_desc = await lazy_vlm_description(
                         meta.get('id', ''),
                         image_path,
-                        kb_name
+                        kb_name,
+                        metadata=image_metadata
                     )
                     ctx['doc'] = vlm_desc
                     ctx['vlm_enhanced'] = True
                 except Exception as e:
                     logger.warning(f"VLM 懒加载失败: {e}")
 
-        # 表格切片：懒加载 LLM 摘要（可选，仅高分切片）
-        elif chunk_type == 'table' and not meta.get('has_summary'):
-            score = meta.get('score', 0)
-            if score > 0.7:  # 只对高相关表格生成摘要
+        # 表格切片：同时处理摘要和关联图片的 VLM 描述
+        elif chunk_type == 'table':
+            doc_text = ctx.get('doc', '')
+
+            # 1. 懒加载表格摘要（高分切片）
+            if not meta.get('has_summary'):
+                score = meta.get('score', 0)
+                if score > 0.7:  # 只对高相关表格生成摘要
+                    try:
+                        summary = await lazy_table_summary(
+                            meta.get('id', ''),
+                            doc_text,
+                            kb_name
+                        )
+                        # 摘要作为补充信息
+                        ctx['summary'] = summary
+                        ctx['llm_enhanced'] = True
+                    except Exception as e:
+                        logger.warning(f"表格摘要懒加载失败: {e}")
+
+            # 2. 表格有关联图片时，懒加载 VLM 描述
+            if image_path and not meta.get('has_vlm_desc'):
                 try:
-                    table_md = ctx.get('doc', '')
-                    summary = await lazy_table_summary(
+                    import re
+
+                    # 提取表号（如 "表2.2"、"见表2.1"）
+                    table_number = ""
+                    # 匹配 "表2.2"、"见表2.2"、"见表 2.2" 等
+                    table_match = re.search(r'[见如]?表\s*(\d+\.?\d*)', doc_text)
+                    if table_match:
+                        table_number = table_match.group(1)
+
+                    # 如果 doc 中没有，尝试从 section 中提取
+                    section = meta.get('section') or meta.get('section_path', '')
+                    if not table_number and section:
+                        table_match = re.search(r'[见如]?表\s*(\d+\.?\d*)', section)
+                        if table_match:
+                            table_number = table_match.group(1)
+
+                    # 构建表格图片元数据
+                    table_image_metadata = {
+                        'section': section,
+                        'page': meta.get('page'),
+                        'caption': meta.get('caption', ''),
+                        'source': meta.get('source', ''),
+                        'table_number': table_number,  # 表号
+                        'figure_number': table_number,  # 兼容字段
+                        'doc_text': doc_text,
+                        'is_table': True  # 标记为表格图片
+                    }
+                    vlm_desc = await lazy_vlm_description(
                         meta.get('id', ''),
-                        table_md,
-                        kb_name
+                        image_path,
+                        kb_name,
+                        metadata=table_image_metadata
                     )
-                    # 摘要作为补充信息
-                    ctx['summary'] = summary
-                    ctx['llm_enhanced'] = True
+                    # 表格图片描述作为补充信息
+                    ctx['image_description'] = vlm_desc
+                    ctx['vlm_enhanced'] = True
                 except Exception as e:
-                    logger.warning(f"表格摘要懒加载失败: {e}")
+                    logger.warning(f"表格图片 VLM 懒加载失败: {e}")

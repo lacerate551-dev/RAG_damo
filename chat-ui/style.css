@@ -2444,3 +2444,24 @@ body {
     margin: 12px 0 8px 0;
     color: var(--text-primary);
 }
+
+
+/* ===== LaTeX 公式样式 ===== */
+.latex-block {
+    margin: 12px 0;
+    padding: 12px 16px;
+    background: var(--surface-tertiary, #1a1a2e);
+    border-radius: var(--radius-sm, 6px);
+    text-align: center;
+    font-style: italic;
+    color: var(--text-primary, #f1f5f9);
+    border-left: 3px solid var(--primary-color, #6366f1);
+}
+
+.latex-inline {
+    font-style: italic;
+    color: var(--primary-light, #c7d2fe);
+    background: var(--surface-tertiary, #1a1a2e);
+    padding: 2px 6px;
+    border-radius: 4px;
+}

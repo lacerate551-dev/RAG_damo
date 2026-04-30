@@ -5,7 +5,7 @@
 """
 
 from .session_repo import BaseSessionRepo
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 
 class StatelessSessionRepo(BaseSessionRepo):
@@ -15,7 +15,7 @@ class StatelessSessionRepo(BaseSessionRepo):
         """生产环境：历史由后端传入，不查询"""
         return []
 
-    def add_message(self, session_id: str, role: str, content: str) -> None:
+    def add_message(self, session_id: str, role: str, content: str, metadata: Optional[Dict] = None) -> None:
         """生产环境：不存储消息"""
         pass
 

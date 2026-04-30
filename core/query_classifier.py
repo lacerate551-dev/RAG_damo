@@ -31,6 +31,7 @@ class QueryType(Enum):
     COMPARISON = "comparison"  # 比较分析：差异、对比
     PROCESS = "process"        # 流程指引：步骤、流程
     FILE_SPECIFIC = "file_specific"  # 特定文件内查询（如 "xxx.pdf中有哪些图片"）
+    IMAGE_REFERENCE = "image_reference"  # 图片指代查询（如 "解释一下这两张图片"）
 
 
 @dataclass
@@ -117,6 +118,16 @@ class QueryClassifier:
         "操作流程", "办理流程", "申请流程",
         "怎么做", "怎样", "操作步骤",
         "审批流程", "审批步骤", "办理手续"
+    ]
+
+    # 图片引用模式：指代上一轮对话中的图片
+    IMAGE_REFERENCE_PATTERNS = [
+        "这[张些]图片", "那[张些]图片", "上面的图片", "刚才的图片",
+        "这[张些]图", "那[张些]图", "上面的图", "刚才的图",
+        "分析一下这[张些]图", "解释一下这[张些]图", "说明一下这[张些]图",
+        "这几张图", "那几张图", "这两张图", "那两张图",
+        "图片里是什么", "图里是什么", "图片中是什么", "图中是什么",
+        "看下这[张些]图", "看下图片", "看下这几张"
     ]
 
     # 业务关键词（用于判断查询是否有明确主语）
@@ -277,6 +288,12 @@ class QueryClassifier:
         # 元问题 - 直接回答，跳过检索
         if any(p in query for p in self.META_PATTERNS):
             return QueryType.META, True
+
+        # 图片引用 - 使用上一轮对话的图片，跳过检索
+        # 使用正则匹配，因为模式包含可变字符
+        for pattern in self.IMAGE_REFERENCE_PATTERNS:
+            if re.search(pattern, query):
+                return QueryType.IMAGE_REFERENCE, True
 
         # 实时信息 - 网络搜索
         if any(p in query for p in self.REALTIME_PATTERNS):

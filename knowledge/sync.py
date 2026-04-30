@@ -661,23 +661,19 @@ class KnowledgeSyncService:
         从文档ID中解析目标向量库名称
 
         Args:
-            document_id: 文档ID，格式如 "public/filename.pdf" 或 "finance/filename.pdf"
+            document_id: 文档ID，格式如 "public_kb/filename.pdf" 或 "dept_hr/filename.pdf"
 
         Returns:
-            向量库名称，如 "public_kb" 或 "dept_finance"
+            向量库名称（目录名 = 向量库名）
         """
-        # 获取第一级目录名
-        parts = document_id.split('/')
+        # 统一路径分隔符（兼容 Windows 和 Linux）
+        normalized = document_id.replace('\\', '/')
+        # 获取第一级目录名（即向量库名）
+        parts = normalized.split('/')
         if len(parts) > 1:
-            subdir = parts[0]
+            return parts[0]  # 目录名即向量库名
         else:
-            subdir = 'public'
-
-        # 映射到向量库名称
-        if subdir == 'public':
-            return 'public_kb'
-        else:
-            return f'dept_{subdir}'
+            return 'public_kb'  # 默认公开库
 
     def _get_current_version(self, kb_name: str, filename: str) -> str:
         """

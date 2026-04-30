@@ -164,8 +164,8 @@ class ConfidenceGate:
             分数列表
         """
         if not self.reranker:
-            # 无 Reranker，使用简单关键词匹配降级
-            return self._keyword_fallback(query, documents)
+            # 无 Reranker，使用向量相似度降级
+            return self._vector_similarity_fallback(query, documents)
 
         try:
             import numpy as np
@@ -175,6 +175,57 @@ class ConfidenceGate:
             return [float(s) for s in scores]
         except Exception as e:
             print(f"[警告] Reranker 计算失败: {e}")
+            return self._vector_similarity_fallback(query, documents)
+
+    def _vector_similarity_fallback(self, query: str, documents: List[str]) -> List[float]:
+        """
+        向量相似度降级方案
+
+        当 Reranker 不可用时，使用向量相似度计算置信度。
+        比关键词匹配更可靠。
+
+        Args:
+            query: 用户查询
+            documents: 文档列表
+
+        Returns:
+            分数列表（归一化到 0-1 范围）
+        """
+        try:
+            import numpy as np
+            from core.engine import get_engine
+
+            engine = get_engine()
+            if not engine or not engine.embedding_model:
+                return self._keyword_fallback(query, documents)
+
+            # 计算查询向量
+            query_vec = np.array(engine.embedding_model.encode(query))
+            query_norm = np.linalg.norm(query_vec)
+
+            if query_norm == 0:
+                return self._keyword_fallback(query, documents)
+
+            scores = []
+            for doc in documents:
+                # 计算文档向量
+                doc_vec = np.array(engine.embedding_model.encode(doc))
+                doc_norm = np.linalg.norm(doc_vec)
+
+                # 余弦相似度
+                if doc_norm > 0:
+                    similarity = np.dot(query_vec, doc_vec) / (query_norm * doc_norm)
+                else:
+                    similarity = 0.0
+
+                # 归一化到 0-1 范围（余弦相似度在 -1 到 1）
+                normalized_score = (similarity + 1) / 2
+                scores.append(float(normalized_score))
+
+            return scores
+
+        except Exception as e:
+            print(f"[警告] 向量相似度降级失败: {e}")
             return self._keyword_fallback(query, documents)
 
     def _keyword_fallback(self, query: str, documents: List[str]) -> List[float]:

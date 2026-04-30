@@ -39,7 +39,9 @@ try:
         ADAPTIVE_TOPK_ENABLED, ADAPTIVE_LOW_CONFIDENCE, ADAPTIVE_HIGH_CONFIDENCE,
         ADAPTIVE_EXPAND_RATIO, ADAPTIVE_SHRINK_RATIO, ADAPTIVE_MIN_TOPK, ADAPTIVE_MAX_TOPK,
         # 切片配置
-        MIN_CHUNK_SIZE, MAX_CHUNK_SIZE, SECTION_FILTER_ENABLED
+        MIN_CHUNK_SIZE, MAX_CHUNK_SIZE, SECTION_FILTER_ENABLED,
+        # P3 优化配置
+        MMR_ENABLED, MMR_TOP_K, DYNAMIC_RRF_ENABLED
     )
 except ImportError:
     # 默认值
@@ -53,6 +55,10 @@ except ImportError:
     MIN_CHUNK_SIZE = 200
     MAX_CHUNK_SIZE = 1200
     SECTION_FILTER_ENABLED = True
+    # P3 优化默认值
+    MMR_ENABLED = True
+    MMR_TOP_K = 30
+    DYNAMIC_RRF_ENABLED = True
     EMBEDDING_DEVICE = "auto"
     RERANK_DEVICE = "auto"
 
@@ -235,6 +241,27 @@ class RAGEngine:
                     # 缓存命中，直接返回
                     return cached_result
 
+        # ==================== Query Expansion（P3-3）====================
+        # 查询扩展（可选）
+        try:
+            from config import QUERY_EXPANSION_ENABLED, QUERY_EXPANSION_THRESHOLD
+        except ImportError:
+            QUERY_EXPANSION_ENABLED = False
+            QUERY_EXPANSION_THRESHOLD = 0.8
+
+        expanded_queries = [query]
+        if QUERY_EXPANSION_ENABLED:
+            try:
+                from core.query_expansion import expand_query_safe
+                expanded_queries = expand_query_safe(
+                    query,
+                    embedding_model=self.embedding_model,
+                    threshold=QUERY_EXPANSION_THRESHOLD,
+                    max_expansions=3
+                )
+            except Exception as e:
+                pass  # 扩展失败时使用原查询
+
         if USE_MULTI_KB and self.kb_manager:
             result = self._search_multi_kb(query, top_k, role, department, collections, source_filter=source_filter)
             # 缓存多知识库结果
@@ -242,7 +269,9 @@ class RAGEngine:
                 top_dist = result['distances'][0][0] if result.get('distances') and result['distances'][0] else 1.0
                 top_score = 1.0 - top_dist
                 if top_score >= 0.3:
-                    cache.set_query_result(query, kb_name, result)
+                    # 传递 doc_ids 实现细粒度缓存失效
+                    doc_ids = result.get('ids', [[]])[0] if result.get('ids') else []
+                    cache.set_query_result(query, kb_name, result, doc_ids=doc_ids)
             return result
 
         # 构建 where 条件（支持多个过滤条件组合）
@@ -262,6 +291,10 @@ class RAGEngine:
         recall_k = RERANK_CANDIDATES if (USE_RERANK or USE_HYBRID_SEARCH) else top_k
         recall_k = max(recall_k, top_k * 3)  # 确保有足够的候选
 
+        # ========== P0：图片独立召回通道 ==========
+        # 图片切片独立检索，保证有足够的召回机会
+        image_recall_k = max(5, top_k // 2)  # 图片召回数量独立控制
+
         query_kwargs = {
             "query_embeddings": [query_vector],
             "n_results": recall_k
@@ -270,6 +303,12 @@ class RAGEngine:
             query_kwargs["where"] = where_filter
 
         vector_results = self.collection.query(**query_kwargs)
+
+        # 独立检索图片切片（新增）
+        image_results = self._search_image_chunks(query_vector, image_recall_k, where_filter)
+        if image_results and image_results.get('ids') and image_results['ids'][0]:
+            # 合并图片结果到主结果
+            vector_results = self._merge_results([vector_results, image_results])
 
         # ========== 独立查询 FAQ 集合 ==========
         faq_results = self._search_faq_collection(query_vector, top_k=3)
@@ -287,7 +326,14 @@ class RAGEngine:
                 # 过滤 BM25 结果
                 bm25_results = self._filter_results(bm25_results, lambda meta: meta.get('security_level', 'public') in allowed_set)
             results_list.append(bm25_results)
-            weights.append(BM25_WEIGHT)
+
+            # ========== 动态 RRF 权重（P3-1）==========
+            # 优先使用 QueryType 驱动权重，回退到查询长度
+            if hasattr(self, '_last_query_type') and self._last_query_type:
+                vector_w, bm25_w = self._get_rrf_weights_by_query_type(self._last_query_type)
+            else:
+                vector_w, bm25_w = self._get_dynamic_rrf_weights(query)
+            weights = [vector_w, bm25_w]
 
         if len(results_list) > 1:
             fused_results = self.reciprocal_rank_fusion(results_list, weights)
@@ -299,6 +345,10 @@ class RAGEngine:
 
         # 章节过滤（如果查询中提到了章节）
         fused_results = self._filter_by_section(fused_results, query)
+
+        # ========== MMR 去重（P3-2：前置到 rerank 前）==========
+        if MMR_ENABLED:
+            fused_results = self._apply_mmr(query, fused_results, top_k=MMR_TOP_K)
 
         if USE_RERANK and self.reranker:
             fused_results = self.rerank_results(query, fused_results, top_k)
@@ -325,7 +375,9 @@ class RAGEngine:
             top_dist = fused_results['distances'][0][0] if fused_results.get('distances') and fused_results['distances'][0] else 1.0
             top_score = 1.0 - top_dist  # 距离转相似度
             if top_score >= 0.3:  # 置信度阈值
-                cache.set_query_result(query, kb_name, fused_results)
+                # 传递 doc_ids 实现细粒度缓存失效
+                doc_ids = fused_results.get('ids', [[]])[0] if fused_results.get('ids') else []
+                cache.set_query_result(query, kb_name, fused_results, doc_ids=doc_ids)
 
         return fused_results
 
@@ -365,6 +417,76 @@ class RAGEngine:
 
         except Exception as e:
             print(f"FAQ 集合查询失败: {e}")
+            return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+
+    def _search_image_chunks(self, query_vector: list, top_k: int = 5, where_filter: dict = None) -> dict:
+        """
+        独立检索图片切片（P0：图片独立召回通道）
+
+        图片切片使用独立的召回通道，保证有足够的召回机会，
+        不被文本切片"淹没"在 MMR/Rerank 阶段。
+
+        Args:
+            query_vector: 查询向量
+            top_k: 返回的图片数量
+            where_filter: 额外的 where 过滤条件
+
+        Returns:
+            图片切片检索结果
+        """
+        try:
+            # 构建 where 条件：只检索图片类型
+            image_filter = {"chunk_type": {"$in": ["image", "chart", "table"]}}
+
+            # 合并额外的过滤条件
+            if where_filter:
+                image_filter = {"$and": [where_filter, image_filter]}
+
+            # 检索图片切片
+            results = self.collection.query(
+                query_embeddings=[query_vector],
+                n_results=top_k,
+                where=image_filter
+            )
+
+            return results
+
+        except Exception as e:
+            print(f"图片切片检索失败: {e}")
+            return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+
+    def _search_image_chunks_multi_kb(self, query_vector: list, top_k: int, collection, source_filter: str = None) -> dict:
+        """
+        多知识库模式下独立检索图片切片（P0）
+
+        Args:
+            query_vector: 查询向量
+            top_k: 返回的图片数量
+            collection: 向量库集合
+            source_filter: 文件名过滤
+
+        Returns:
+            图片切片检索结果
+        """
+        try:
+            # 构建 where 条件：只检索图片类型
+            image_filter = {"chunk_type": {"$in": ["image", "chart", "table"]}}
+
+            # 合并文件来源过滤
+            if source_filter:
+                image_filter = {"$and": [{"source": source_filter}, image_filter]}
+
+            # 检索图片切片
+            results = collection.query(
+                query_embeddings=[query_vector],
+                n_results=top_k,
+                where=image_filter
+            )
+
+            return results
+
+        except Exception as e:
+            print(f"多知识库图片切片检索失败: {e}")
             return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
 
     def _merge_results(self, results_list: list) -> dict:
@@ -542,6 +664,9 @@ class RAGEngine:
         recall_k = RERANK_CANDIDATES if (USE_RERANK or USE_HYBRID_SEARCH) else top_k
         recall_k = max(recall_k, top_k * 3)  # 确保有足够的候选
 
+        # ========== P0：图片独立召回数量 ==========
+        image_recall_k = max(5, top_k // 2)
+
         all_results = []
         for coll_name in target_collections:
             try:
@@ -585,13 +710,31 @@ class RAGEngine:
                 meta['_collection'] = 'faq_kb'
             all_results.append(faq_results)
 
+        # ========== P0：图片独立检索（多知识库模式）==========
+        for coll_name in target_collections:
+            try:
+                coll = self.kb_manager.get_collection(coll_name)
+                if not coll: continue
+
+                image_results = self._search_image_chunks_multi_kb(
+                    query_vector, image_recall_k, coll, source_filter
+                )
+                if image_results and image_results.get('ids') and image_results['ids'][0]:
+                    for meta in image_results['metadatas'][0]:
+                        meta['_collection'] = coll_name
+                    all_results.append(image_results)
+            except Exception:
+                pass
+
         if not all_results:
             return {'ids': [[]], 'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
 
         if len(all_results) == 1:
             fused_results = all_results[0]
         else:
-            weights = [VECTOR_WEIGHT if i % 2 == 0 else BM25_WEIGHT for i in range(len(all_results))]
+            # 动态 RRF 权重（P3-1）
+            vector_w, bm25_w = self._get_dynamic_rrf_weights(query)
+            weights = [vector_w if i % 2 == 0 else bm25_w for i in range(len(all_results))]
             fused_results = self.reciprocal_rank_fusion(all_results, weights)
 
         # 过滤废止切片（status != "active" 或 status == "deprecated"）
@@ -599,6 +742,10 @@ class RAGEngine:
 
         # 章节过滤（如果查询中提到了章节）
         fused_results = self._filter_by_section(fused_results, query)
+
+        # ========== MMR 去重（P3-2：前置到 rerank 前）==========
+        if MMR_ENABLED:
+            fused_results = self._apply_mmr(query, fused_results, top_k=MMR_TOP_K)
 
         if USE_RERANK and self.reranker:
             fused_results = self.rerank_results(query, fused_results, top_k)
@@ -730,6 +877,189 @@ class RAGEngine:
         }
 
     # ---------------- 底层融合辅助算法 ----------------
+
+    def _get_dynamic_rrf_weights(self, query: str) -> tuple:
+        """
+        动态 RRF 权重计算（P3-1）
+
+        根据查询长度动态调整权重，不依赖分类：
+        - 短查询（< 15字）：偏向关键词检索（BM25优先）
+        - 中等查询（15-50字）：平衡权重
+        - 长查询（> 50字）：偏向语义检索（Vector优先）
+
+        Args:
+            query: 用户查询文本
+
+        Returns:
+            (vector_weight, bm25_weight): 权重元组
+        """
+        query_len = len(query)
+
+        # 连续权重函数
+        # alpha: 0 (短查询) → 1 (长查询)
+        alpha = min(1.0, max(0.0, (query_len - 15) / 35))
+
+        # vector_weight: 0.3 (短) → 0.7 (长)
+        vector_weight = 0.3 + 0.4 * alpha
+
+        # bm25_weight = 1 - vector_weight
+        bm25_weight = 1.0 - vector_weight
+
+        return (vector_weight, bm25_weight)
+
+    def _get_rrf_weights_by_query_type(self, query_type) -> tuple:
+        """
+        根据查询类型设置 RRF 权重
+
+        Args:
+            query_type: QueryType 枚举值
+
+        Returns:
+            (vector_weight, bm25_weight) 权重元组
+        """
+        try:
+            from core.query_classifier import QueryType
+
+            if query_type == QueryType.FACT:
+                # 事实查询：关键词精确匹配更重要
+                # 例："差旅补贴标准是多少" → 需要精确匹配"差旅补贴"
+                return (0.4, 0.6)  # (vector, bm25)
+
+            elif query_type == QueryType.PROCESS:
+                # 流程查询：语义理解更重要
+                # 例："如何申请调岗" → 需要理解流程语义
+                return (0.7, 0.3)
+
+            elif query_type == QueryType.COMPARISON:
+                # 比较查询：语义理解更重要
+                # 例："年假和调休有什么区别" → 需要理解概念关系
+                return (0.6, 0.4)
+
+            elif query_type == QueryType.SIMPLE:
+                # 简单查询：关键词可能够用
+                return (0.4, 0.6)
+
+            else:
+                # 默认：平衡权重
+                return (0.5, 0.5)
+
+        except ImportError:
+            return (0.5, 0.5)
+
+    def _apply_mmr(self, query: str, results: dict, top_k: int = 30) -> dict:
+        """
+        应用 MMR 去重（P3-2）
+
+        支持两种方案：
+        - 高精度版：基于语义向量，需要重新编码文档（MMR_USE_EMBEDDING=True）
+        - 轻量版：基于文本 Jaccard 相似度，零额外计算（MMR_USE_EMBEDDING=False）
+
+        Args:
+            query: 用户查询
+            results: 检索结果
+            top_k: MMR 保留数量
+
+        Returns:
+            去重后的结果
+        """
+        if not results.get('ids') or not results['ids'][0]:
+            return results
+
+        if len(results['ids'][0]) <= top_k:
+            return results
+
+        try:
+            # 获取 MMR 方案配置，默认使用高精度版
+            try:
+                from config import MMR_USE_EMBEDDING
+            except ImportError:
+                MMR_USE_EMBEDDING = True  # 默认使用高精度版
+
+            if MMR_USE_EMBEDDING:
+                # === 高精度版：基于语义向量 ===
+                from core.mmr import mmr_rerank
+
+                # 获取查询向量
+                query_emb = np.array(self.embedding_model.encode(query))
+
+                # 批量编码所有文档
+                docs_list = results['documents'][0]
+                all_embeddings = self.embedding_model.encode(docs_list)
+
+                # 构建候选列表
+                candidates = []
+                for i, (doc_id, doc, meta) in enumerate(zip(
+                    results['ids'][0],
+                    results['documents'][0],
+                    results['metadatas'][0]
+                )):
+                    doc_emb = all_embeddings[i]
+                    candidates.append({
+                        'id': doc_id,
+                        'content': doc,
+                        'embedding': doc_emb,
+                        'metadata': meta
+                    })
+
+                # MMR 去重
+                try:
+                    from config import MMR_LAMBDA
+                except ImportError:
+                    MMR_LAMBDA = 0.5
+
+                selected = mmr_rerank(
+                    query_emb,
+                    candidates,
+                    top_k=top_k,
+                    lambda_param=MMR_LAMBDA
+                )
+
+                return {
+                    'ids': [[c['id'] for c in selected]],
+                    'documents': [[c['content'] for c in selected]],
+                    'metadatas': [[c['metadata'] for c in selected]],
+                    'distances': [results.get('distances', [[0]])[0][:len(selected)]]
+                }
+            else:
+                # === 轻量版：基于文本相似度 ===
+                from core.mmr import mmr_filter_by_content
+
+                # 构建候选列表（无需 embedding）
+                candidates = []
+                for doc_id, doc, meta in zip(
+                    results['ids'][0],
+                    results['documents'][0],
+                    results['metadatas'][0]
+                ):
+                    candidates.append({
+                        'id': doc_id,
+                        'content': doc,
+                        'metadata': meta
+                    })
+
+                # 文本去重（Jaccard 相似度）
+                selected = mmr_filter_by_content(
+                    candidates,
+                    top_k=top_k,
+                    similarity_threshold=0.85
+                )
+
+                # 重建结果格式，保留对应的 distances
+                selected_ids = {c['id'] for c in selected}
+                orig_ids = results['ids'][0]
+                orig_dists = results.get('distances', [[0] * len(orig_ids)])[0]
+                id_to_dist = dict(zip(orig_ids, orig_dists))
+
+                return {
+                    'ids': [[c['id'] for c in selected]],
+                    'documents': [[c['content'] for c in selected]],
+                    'metadatas': [[c['metadata'] for c in selected]],
+                    'distances': [[id_to_dist.get(c['id'], 0) for c in selected]]
+                }
+
+        except Exception as e:
+            # MMR 失败时返回原结果
+            return results
 
     def reciprocal_rank_fusion(self, results_list, weights=None, k=60):
         if not results_list:
@@ -888,14 +1218,27 @@ class RAGEngine:
                     "content": h.get("content", "")
                 })
 
-        # 添加当前问题（带上下文）
+        # Bug 3 修复：添加 system prompt + 强化指令，避免 LLM 编造/忽略参考资料
+        messages.insert(0, {
+            "role": "system",
+            "content": (
+                "你是一个严谨的知识库问答助手。"
+                "你必须且只能根据用户提供的【参考资料】回答问题。"
+                "如果参考资料中有答案，必须引用对应内容回答，并在回答末尾标注引用编号（如[1]、[2]）。"
+                "如果参考资料中确实没有相关信息，简短说明即可，不要编造或补充资料外的内容。"
+                "禁止使用参考资料以外的知识进行补充或推测。"
+            )
+        })
+
+        # 添加当前问题（带上下文）- 强化指令
         if context:
-            user_message = f"""参考资料：
+            user_message = f"""【参考资料】
 {context}
 
-用户问题：{query}
+【用户问题】
+{query}
 
-请根据参考资料回答问题："""
+请仔细阅读以上全部参考资料后回答。如果参考资料中包含相关内容，必须引用回答并标注编号。如果资料中没有相关信息，请明确说明。"""
         else:
             user_message = query
 
